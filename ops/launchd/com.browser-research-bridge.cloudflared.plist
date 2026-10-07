@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Named Cloudflare Tunnel (stable hostname, for Claude) as a per-user LaunchAgent.
+  Template: ops/install-launchd.sh fills the placeholders (each NAME
+  below appears in the plist wrapped in double underscores) and installs the result to
+  ~/Library/LaunchAgents/com.browser-research-bridge.cloudflared.plist. See ops/README.md.
+
+  Use it only for a NAMED tunnel (README, "Path B, named tunnel"). A quick tunnel gets a new
+  trycloudflare.com URL at every start, which would need a PUBLIC_URL change and a bridge restart
+  each time, so it is not run under launchd. The tunnel credentials stay in ~/.cloudflared/.
+
+  CLOUDFLARED_BIN      absolute path of cloudflared
+  CF_TUNNEL            tunnel name or UUID (from `cloudflared tunnel create`)
+  PUBLIC_PORT          the bridge's public port (publicPort, default 8787)
+  PATH                 PATH for the daemon
+  LOG_DIR              absolute path of ~/Library/Logs/browser-research-bridge
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.browser-research-bridge.cloudflared</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>__CLOUDFLARED_BIN__</string>
+    <string>tunnel</string>
+    <string>--no-autoupdate</string>
+    <string>--metrics</string>
+    <string>127.0.0.1:20241</string>
+    <string>run</string>
+    <string>--url</string>
+    <string>http://127.0.0.1:__PUBLIC_PORT__</string>
+    <string>__CF_TUNNEL__</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>__PATH__</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+
+  <key>StandardOutPath</key>
+  <string>__LOG_DIR__/cloudflared.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>__LOG_DIR__/cloudflared.err.log</string>
+</dict>
+</plist>

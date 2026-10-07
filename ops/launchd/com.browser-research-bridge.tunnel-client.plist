@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  OpenAI Secure MCP Tunnel (tunnel-client) for ChatGPT as a per-user LaunchAgent.
+  Template: ops/install-launchd.sh fills the placeholders (each NAME
+  below appears in the plist wrapped in double underscores) and installs the result to
+  ~/Library/LaunchAgents/com.browser-research-bridge.tunnel-client.plist. See ops/README.md.
+
+  The profile must exist first (README, "Path A"): it lives in ~/.config/tunnel-client/ and refers
+  to the runtime API key by reference (file:/... or env:...), so no key is ever written here.
+
+  TUNNEL_CLIENT_BIN      absolute path of tunnel-client
+  TUNNEL_PROFILE         tunnel-client profile name (e.g. browser-research-bridge)
+  PATH                   PATH for the daemon
+  LOG_DIR                absolute path of ~/Library/Logs/browser-research-bridge
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.browser-research-bridge.tunnel-client</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>__TUNNEL_CLIENT_BIN__</string>
+    <string>run</string>
+    <string>--profile</string>
+    <string>__TUNNEL_PROFILE__</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>__PATH__</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+
+  <key>StandardOutPath</key>
+  <string>__LOG_DIR__/tunnel-client.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>__LOG_DIR__/tunnel-client.err.log</string>
+</dict>
+</plist>

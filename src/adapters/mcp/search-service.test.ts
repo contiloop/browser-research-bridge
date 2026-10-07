@@ -1,0 +1,394 @@
+import { afterEach, describe, expect, it } from "vitest";
+import {
+  addOnboarding,
+  item,
+  makeMcpWorld,
+  ok,
+  setDegraded,
+  setNeedsLogin,
+  sleep,
+} from "../../../test/support/mcp-fixtures.js";
+import type { FakeSiteSpec, McpWorld, WorldOptions } from "../../../test/support/mcp-fixtures.js";
+import { DATE_POST_FILTER_NOTE } from "../../core/merge.js";
+import type { AdapterSearchRequest } from "../../ports/adapter.js";
+import { SearchService } from "./search-service.js";
+
+let world: McpWorld | null = null;
+afterEach(async () => {
+  await world?.cleanup();
+  world = null;
+});
+
+async function make(sites: FakeSiteSpec[], extra: Omit<WorldOptions, "sites"> = {}): Promise<McpWorld> {
+  world = await makeMcpWorld({ sites, ...extra });
+  return world;
+}
+
+/** alpha: three results on one adapter page; beta: one result per adapter page, two pages. */
+const paged: FakeSiteSpec[] = [
+  {
+    key: "alpha",
+    search: async () =>
+      ok([item("alpha", 1, "2026-10-05"), item("alpha", 2, "2026-10-03"), item("alpha", 3, "2026-10-01")]),
+  },
+  {
+    key: "beta",
+    search: async (req) =>
+      req.cursor === null
+        ? ok([item("beta", 1, "2026-10-04")], "p2")
+        : ok([item("beta", 2, "2026-10-02")], null),
+  },
+];
+
+describe("SearchService: targets and statuses", () => {
+  it("searches every active site, merges by date, and reports every registered site", async () => {
+    const w = await make([
+      { key: "alpha", search: async () => ok([item("alpha", 1, "2026-10-01"), item("alpha", 2, null)]) },
+      { key: "beta", search: async () => ok([item("beta", 1, "2026-10-03")]) },
+      { key: "gamma", search: async () => ok([item("gamma", 1, "2026-10-04")]) },
+      { key: "delta", search: async () => ok([item("delta", 1, "2026-10-04")]) },
+    ]);
+    await setNeedsLogin(w, "gamma");
+    await setDegraded(w, "delta", "selector broke");
+    await addOnboarding(w, "epsilon");
+    await addOnboarding(w, "zeta", "no usable search surface");
+
+    const out = await w.search.search({ query: "election", mode: "search" });
+    expect(out.results.map((r) => r.id)).toEqual(["beta:1", "alpha:1", "alpha:2"]);
+    expect(out.results[0]).toMatchObject({
+      site: "beta",
+      title: "beta article 1",
+      url: "https://beta.example.com/articles/1",
+    });
+    expect(out.siteStatuses).toEqual([
+      { site: "alpha", status: "ok" },
+      { site: "beta", status: "ok" },
+      {
+        site: "delta",
+        status: "adapter_error",
+        message: "selector broke",
+        action: "Repair in the dashboard",
+      },
+      { site: "epsilon", status: "unsupported", message: "onboarding in progress" },
+      expect.objectContaining({
+        site: "gamma",
+        status: "auth_required",
+        action: expect.stringContaining("Log in") as string,
+      }),
+      { site: "zeta", status: "adapter_error", message: "no usable search surface" },
+    ]);
+    expect(w.count("gamma").search).toBe(0);
+    expect(w.count("delta").search).toBe(0);
+    expect(out.nextPage).toBeNull();
+    expect(w.calls.get("alpha")?.search[0]).toMatchObject({ text: "election", limit: 10, cursor: null });
+  });
+
+  it("an unknown site: value is reported unsupported and nothing else is searched", async () => {
+    const w = await make([{ key: "alpha", search: async () => ok([item("alpha", 1, "2026-10-01")]) }]);
+    const out = await w.search.search({ query: "q site:nope", mode: "search" });
+    expect(out.results).toEqual([]);
+    expect(out.siteStatuses).toEqual([
+      { site: "nope", status: "unsupported", message: "unknown site: nope" },
+    ]);
+    expect(w.count("alpha").search).toBe(0);
+
+    const mixed = await w.search.search({ query: "q site:alpha.example.com site:nope", mode: "search" });
+    expect(mixed.siteStatuses.map((s) => [s.site, s.status])).toEqual([
+      ["alpha", "ok"],
+      ["nope", "unsupported"],
+    ]);
+  });
+
+  it("a named non-active site is not searched and gets its lifecycle entry", async () => {
+    const w = await make([{ key: "alpha", search: async () => ok([item("alpha", 1, "2026-10-01")]) }]);
+    await setNeedsLogin(w, "alpha");
+    const out = await w.search.search({ query: "q site:alpha", mode: "search" });
+    expect(out.siteStatuses).toEqual([expect.objectContaining({ site: "alpha", status: "auth_required" })]);
+    expect(w.count("alpha").search).toBe(0);
+  });
+
+  it("no search terms → empty with 'no search terms', adapters not called", async () => {
+    const w = await make([{ key: "alpha", search: async () => ok([item("alpha", 1, "2026-10-01")]) }]);
+    const out = await w.search.search({ query: "site:alpha after:2026-01-01", mode: "search" });
+    expect(out.siteStatuses).toEqual([{ site: "alpha", status: "empty", message: "no search terms" }]);
+    expect(w.count("alpha").search).toBe(0);
+  });
+
+  it("an adapter's empty result is empty with a message", async () => {
+    const w = await make([{ key: "alpha", search: async () => ok([]) }]);
+    const out = await w.search.search({ query: "q", mode: "search" });
+    expect(out.siteStatuses).toEqual([{ site: "alpha", status: "empty", message: "no results" }]);
+  });
+});
+
+describe("SearchService: live outcomes feed the lifecycle", () => {
+  it("auth_required → status entry with action (never empty), site becomes needs_login", async () => {
+    const w = await make([
+      { key: "alpha", search: async () => ({ results: [], nextCursor: null, status: "auth_required" }) },
+      { key: "beta", search: async () => ok([item("beta", 1, "2026-10-01")]) },
+    ]);
+    const out = await w.search.search({ query: "q", mode: "search" });
+    expect(out.siteStatuses[0]).toEqual({
+      site: "alpha",
+      status: "auth_required",
+      message: "login required or session expired",
+      action: expect.stringContaining("Log in to alpha") as string,
+    });
+    expect(out.results.map((r) => r.site)).toEqual(["beta"]);
+    expect(w.registry.get("alpha")?.status).toBe("needs_login");
+
+    const again = await w.search.search({ query: "q2", mode: "search" });
+    expect(again.siteStatuses[0]).toMatchObject({ site: "alpha", status: "auth_required" });
+    expect(w.count("alpha").search).toBe(1);
+  });
+
+  it("blocked: true starts the cool-down; the next call is refused with rate_limited", async () => {
+    const w = await make([
+      {
+        key: "alpha",
+        search: async () => ({
+          results: [],
+          nextCursor: null,
+          status: "access_denied",
+          message: "captcha",
+          blocked: true,
+        }),
+      },
+    ]);
+    const out = await w.search.search({ query: "q", mode: "search" });
+    expect(out.siteStatuses).toEqual([
+      expect.objectContaining({
+        site: "alpha",
+        status: "access_denied",
+        message: "captcha",
+        action: expect.any(String) as string,
+      }),
+    ]);
+    expect(w.scheduler.cooldownUntil("alpha")).not.toBeNull();
+    expect(w.registry.get("alpha")?.status).toBe("active");
+
+    const next = await w.search.search({ query: "q other", mode: "search" });
+    expect(next.siteStatuses[0]).toMatchObject({ site: "alpha", status: "rate_limited" });
+    expect(w.count("alpha").search).toBe(1);
+  });
+
+  it("three consecutive adapter errors degrade the site; malformed data is an adapter_error", async () => {
+    const w = await make([{ key: "alpha", search: async () => ({ results: [{ title: 5 }], status: "ok" }) }]);
+    for (const q of ["a", "b", "c"]) {
+      const out = await w.search.search({ query: q, mode: "search" });
+      expect(out.siteStatuses[0]).toMatchObject({ site: "alpha", status: "adapter_error" });
+      expect(out.siteStatuses[0]?.message).toMatch(/malformed search results/);
+    }
+    expect(w.registry.get("alpha")?.status).toBe("degraded");
+  });
+
+  it("a throwing adapter contributes zero results and adapter_error; the search itself never throws", async () => {
+    const w = await make([
+      {
+        key: "alpha",
+        search: async () => {
+          throw new Error("selector .headline not found");
+        },
+      },
+      { key: "beta", search: async () => ok([item("beta", 1, "2026-10-01")]) },
+    ]);
+    const out = await w.search.search({ query: "q", mode: "search" });
+    expect(out.siteStatuses[0]).toEqual({
+      site: "alpha",
+      status: "adapter_error",
+      message: "selector .headline not found",
+    });
+    expect(out.results).toHaveLength(1);
+  });
+
+  it("the tool-call budget turns a slow site into timeout while the others answer", async () => {
+    const w = await make(
+      [
+        {
+          key: "alpha",
+          search: async (_req, ctx) => {
+            await sleep(2000, ctx.signal);
+            return ok([]);
+          },
+        },
+        { key: "beta", search: async () => ok([item("beta", 1, "2026-10-01")]) },
+      ],
+      { tunables: { toolCallBudgetMs: 150 } },
+    );
+    const started = Date.now();
+    const out = await w.search.search({ query: "q", mode: "search" });
+    expect(Date.now() - started).toBeLessThan(1500);
+    expect(out.siteStatuses).toEqual([
+      expect.objectContaining({ site: "alpha", status: "timeout" }),
+      { site: "beta", status: "ok" },
+    ]);
+    expect(w.registry.get("alpha")?.status).toBe("active");
+  });
+
+  it("an unexpected internal failure still returns a response", async () => {
+    const w = await make([{ key: "alpha" }]);
+    const broken = new SearchService({
+      ...w.deps,
+      registry: {
+        ...w.registry,
+        list: () => {
+          throw new Error("boom");
+        },
+        get: () => undefined,
+        load: async () => undefined,
+        recordOutcome: async () => undefined,
+      },
+    });
+    const out = await broken.search({ query: "q", mode: "search" });
+    expect(out).toMatchObject({ results: [], nextCursor: null, nextPage: null, siteStatuses: [] });
+  });
+});
+
+describe("SearchService: date filters", () => {
+  it("post-filters sites without dateFilter (with a note) and passes the window to native filters", async () => {
+    const w = await make([
+      {
+        key: "alpha",
+        search: async () =>
+          ok([item("alpha", 1, "2026-10-01"), item("alpha", 2, "2026-09-01"), item("alpha", 3, null)]),
+      },
+      {
+        key: "beta",
+        manifest: { capabilities: { search: true, read: true, dateFilter: true } },
+        search: async () => ok([item("beta", 1, "2026-09-20")]),
+      },
+    ]);
+    const out = await w.search.search({ query: "q after:2026-09-15", mode: "search" });
+    expect(out.results.map((r) => r.id)).toEqual(["alpha:1", "beta:1"]);
+    expect(out.siteStatuses).toEqual([
+      { site: "alpha", status: "ok", note: DATE_POST_FILTER_NOTE },
+      { site: "beta", status: "ok" },
+    ]);
+    expect(w.calls.get("alpha")?.search[0]).toMatchObject({ after: null, before: null });
+    expect(w.calls.get("beta")?.search[0]).toMatchObject({ after: "2026-09-15", before: null });
+  });
+
+  it("an ok site whose results all fall outside the window reports empty", async () => {
+    const w = await make([{ key: "alpha", search: async () => ok([item("alpha", 1, "2026-01-01")]) }]);
+    const out = await w.search.search({ query: "q after:2026-09-15", mode: "search" });
+    expect(out.siteStatuses).toEqual([
+      {
+        site: "alpha",
+        status: "empty",
+        message: "no results in the date window",
+        note: DATE_POST_FILTER_NOTE,
+      },
+    ]);
+  });
+});
+
+describe("SearchService: pagination", () => {
+  it("search_sites: the cursor resumes each site at its first unemitted result, without duplicates", async () => {
+    const w = await make(paged);
+    const p1 = await w.search.search({ query: "q", mode: "search_sites", fields: { limit: 2 } });
+    expect(p1.results.map((r) => r.id)).toEqual(["alpha:1", "beta:1"]);
+    expect(p1.nextCursor).toEqual(expect.any(String));
+    expect(p1.nextPage).toBeNull();
+
+    const p2 = await w.search.search({
+      query: "q",
+      mode: "search_sites",
+      fields: { limit: 2, cursor: p1.nextCursor! },
+    });
+    expect(p2.results.map((r) => r.id)).toEqual(["alpha:2", "beta:2"]);
+    expect(w.calls.get("beta")?.search.map((r: AdapterSearchRequest) => r.cursor)).toEqual([null, "p2"]);
+
+    const p3 = await w.search.search({
+      query: "q",
+      mode: "search_sites",
+      fields: { limit: 2, cursor: p2.nextCursor! },
+    });
+    expect(p3.results.map((r) => r.id)).toEqual(["alpha:3"]);
+    expect(p3.nextCursor).toBeNull();
+    expect(p3.siteStatuses).toEqual([
+      { site: "alpha", status: "ok" },
+      { site: "beta", status: "empty", message: "no more results for this query" },
+    ]);
+  });
+
+  it("an invalid cursor is reported per target site, not thrown", async () => {
+    const w = await make(paged);
+    const out = await w.search.search({
+      query: "q",
+      mode: "search_sites",
+      fields: { cursor: "!!not-a-cursor" },
+    });
+    expect(out.results).toEqual([]);
+    expect(out.siteStatuses.map((s) => [s.site, s.status])).toEqual([
+      ["alpha", "unsupported"],
+      ["beta", "unsupported"],
+    ]);
+    expect(out.siteStatuses[0]?.message).toMatch(/invalid cursor/);
+  });
+
+  it("search page:N walks pages 1..N-1 when the chain is missing, then uses the page chain", async () => {
+    const w = await make(paged);
+    const p2 = await w.search.search({ query: "q limit:2 page:2", mode: "search" });
+    expect(p2.results.map((r) => r.id)).toEqual(["alpha:2", "beta:2"]);
+    expect(p2.nextPage).toBe(3);
+    expect(p2.page).toBe(2);
+    expect(w.count("alpha").search).toBe(2);
+    expect(w.count("beta").search).toBe(2);
+
+    const again = await w.search.search({ query: "q limit:2 page:2", mode: "search" });
+    expect(again.cached).toBe(true);
+    expect(again.results.map((r) => r.id)).toEqual(["alpha:2", "beta:2"]);
+    expect(w.count("alpha").search).toBe(2);
+
+    const p3 = await w.search.search({ query: "q  limit:2 page:3", mode: "search" });
+    expect(p3.results.map((r) => r.id)).toEqual(["alpha:3"]);
+    expect(p3.nextPage).toBeNull();
+    expect(w.count("alpha").search).toBe(3);
+    expect(w.count("beta").search).toBe(2);
+
+    const beyond = await w.search.search({ query: "q limit:2 page:5", mode: "search" });
+    expect(beyond.results).toEqual([]);
+    expect(beyond.nextPage).toBeNull();
+    expect(beyond.siteStatuses.map((s) => [s.site, s.status, s.message])).toEqual([
+      ["alpha", "empty", "no more results for this query"],
+      ["beta", "empty", "no more results for this query"],
+    ]);
+  });
+
+  it("page:N without a cache walks every time and still returns the same page", async () => {
+    const w = await make(paged, { noCache: true });
+    const p2 = await w.search.search({ query: "q limit:2 page:2", mode: "search" });
+    expect(p2.results.map((r) => r.id)).toEqual(["alpha:2", "beta:2"]);
+    const p2b = await w.search.search({ query: "q limit:2 page:2", mode: "search" });
+    expect(p2b.results.map((r) => r.id)).toEqual(["alpha:2", "beta:2"]);
+    expect(w.count("alpha").search).toBe(4);
+  });
+});
+
+describe("SearchService: caching", () => {
+  it("serves a repeated page from the cache when every searched site was ok/empty", async () => {
+    const w = await make([
+      { key: "alpha", search: async () => ok([item("alpha", 1, "2026-10-01")]) },
+      { key: "beta", search: async () => ok([]) },
+    ]);
+    await setNeedsLogin(w, "beta");
+    const first = await w.search.search({ query: "Q   one", mode: "search" });
+    const second = await w.search.search({ query: "q one", mode: "search" });
+    expect(first.cached).toBe(false);
+    expect(second.cached).toBe(true);
+    expect(second.results).toEqual(first.results);
+    expect(second.siteStatuses).toEqual(first.siteStatuses);
+    expect(w.count("alpha").search).toBe(1);
+  });
+
+  it("does not cache a page in which a searched site failed", async () => {
+    const w = await make([
+      { key: "alpha", search: async () => ok([item("alpha", 1, "2026-10-01")]) },
+      { key: "beta", search: async () => ({ results: [], nextCursor: null, status: "timeout" }) },
+    ]);
+    await w.search.search({ query: "q", mode: "search" });
+    const second = await w.search.search({ query: "q", mode: "search" });
+    expect(second.cached).toBe(false);
+    expect(w.count("alpha").search).toBe(2);
+  });
+});

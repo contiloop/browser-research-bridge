@@ -1,0 +1,91 @@
+{
+  "version": 1,
+  "key": "reuters",
+  "form": "full",
+  "target": "live",
+  "passed": true,
+  "startedAt": "2026-10-06T03:57:55.600Z",
+  "finishedAt": "2026-10-06T03:58:52.269Z",
+  "durationMs": 56669,
+  "adapterHash": "67be9587ef8844d2f865d9b47029efff4ec0c48a1e098fd1f4f2121c6e6e1f45",
+  "manifestVersion": 1,
+  "gatedCheck": "passed",
+  "failure": null,
+  "steps": [
+    {
+      "name": "manifest",
+      "passed": true,
+      "status": null,
+      "message": "manifest is valid",
+      "durationMs": 0,
+      "details": {}
+    },
+    {
+      "name": "static",
+      "passed": true,
+      "status": null,
+      "message": "static check passed (1 files)",
+      "durationMs": 0,
+      "details": {
+        "files": 1
+      }
+    },
+    {
+      "name": "search",
+      "passed": true,
+      "status": "ok",
+      "message": "sample search returned 10 results",
+      "durationMs": 6665,
+      "details": {
+        "results": 10,
+        "nextCursor": true
+      }
+    },
+    {
+      "name": "second_page",
+      "passed": true,
+      "status": "ok",
+      "message": "second page returned 10 results (10 new)",
+      "durationMs": 6327,
+      "details": {
+        "results": 10,
+        "fresh": 10
+      }
+    },
+    {
+      "name": "read",
+      "passed": true,
+      "status": "ok",
+      "message": "sample read ok (4679 characters, subscriber)",
+      "durationMs": 11809,
+      "details": {
+        "textLength": 4679,
+        "accessLevel": "subscriber",
+        "hasTitle": true,
+        "source": "sampleReadUrl"
+      }
+    },
+    {
+      "name": "gated",
+      "passed": true,
+      "status": "ok",
+      "message": "gated page reads as subscriber; logged-out form classified auth_required (paid Reuters article without a signed-in session (the paywall is applied client-side))",
+      "durationMs": 14074,
+      "details": {
+        "textLength": 5031,
+        "accessLevel": "subscriber",
+        "hasTitle": true,
+        "loggedOutHttpStatus": 200,
+        "loggedOutVerdict": "auth_required"
+      }
+    },
+    {
+      "name": "smoke",
+      "passed": true,
+      "status": "ok",
+      "message": "smokeTest passed",
+      "durationMs": 17794,
+      "details": {}
+    }
+  ]
+}

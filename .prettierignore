@@ -1,0 +1,6 @@
+dist
+node_modules
+data
+package-lock.json
+sites/**/.staging
+sites/**/.previous

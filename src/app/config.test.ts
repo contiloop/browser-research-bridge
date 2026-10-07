@@ -1,0 +1,318 @@
+import { copyFileSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import {
+  ConfigError,
+  DEFAULT_REDIRECT_URI_ALLOWLIST,
+  DEFAULT_TUNABLES,
+  loadConfig,
+  loadConfigResult,
+  resolveSettingsPageLocation,
+} from "./config.js";
+
+const GOOD = "correct horse battery";
+
+describe("loadConfig", () => {
+  let root: string;
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "bridge-config-"));
+  });
+  afterEach(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  const writeJson = (value: unknown) => {
+    mkdirSync(join(root, "config"), { recursive: true });
+    writeFileSync(join(root, "config", "bridge.json"), JSON.stringify(value));
+  };
+
+  it("throws when the passphrase is missing or empty", () => {
+    expect(() => loadConfig({ rootDir: root, env: {} })).toThrow(ConfigError);
+    expect(() => loadConfig({ rootDir: root, env: { BRIDGE_PASSPHRASE: "" } })).toThrow(/BRIDGE_PASSPHRASE/);
+    expect(() => loadConfig({ rootDir: root, env: { BRIDGE_PASSPHRASE: "            " } })).toThrow(
+      ConfigError,
+    );
+  });
+
+  it("throws when the passphrase is shorter than 12 characters", () => {
+    expect(() => loadConfig({ rootDir: root, env: { BRIDGE_PASSPHRASE: "elevenchars" } })).toThrow(
+      /at least 12/,
+    );
+    expect(loadConfig({ rootDir: root, env: { BRIDGE_PASSPHRASE: "twelve_chars" } }).secrets.passphrase).toBe(
+      "twelve_chars",
+    );
+  });
+
+  it("uses built-in defaults without a config file", () => {
+    const config = loadConfig({ rootDir: root, env: { BRIDGE_PASSPHRASE: GOOD } });
+    expect(config.configFile).toBeNull();
+    expect(config.publicPort).toBe(8787);
+    expect(config.adminPort).toBe(8788);
+    expect(config.dataDir).toBe(join(root, "data"));
+    expect(config.trustedProxyHeader).toBeNull();
+    expect(config.redirectUriAllowlist).toContain("https://claude.ai/api/mcp/auth_callback");
+    expect(config.tunables).toEqual(DEFAULT_TUNABLES);
+    expect(config.publicUrl).toBe("http://localhost:8787");
+    expect(config.publicUrlConfigured).toBe(false);
+  });
+
+  it("applies env over config file over defaults", () => {
+    writeJson({
+      publicPort: 9000,
+      adminPort: 9001,
+      dataDir: "store",
+      trustedProxyHeader: "CF-Connecting-IP",
+      redirectUriAllowlist: ["https://example.com/cb"],
+      tunables: { accessTokenTtlSeconds: 120, bogus: 1 },
+    });
+    const config = loadConfig({
+      rootDir: root,
+      env: { BRIDGE_PASSPHRASE: GOOD, BRIDGE_PUBLIC_PORT: "9100", PUBLIC_URL: "https://bridge.example.com/" },
+    });
+    expect(config.publicPort).toBe(9100);
+    expect(config.adminPort).toBe(9001);
+    expect(config.dataDir).toBe(join(root, "store"));
+    expect(config.trustedProxyHeader).toBe("CF-Connecting-IP");
+    expect(config.redirectUriAllowlist).toEqual(["https://example.com/cb"]);
+    expect(config.tunables.accessTokenTtlSeconds).toBe(120);
+    expect(config.tunables.refreshTokenTtlSeconds).toBe(DEFAULT_TUNABLES.refreshTokenTtlSeconds);
+    expect(config.warnings).toEqual(['unknown tunable "bogus" ignored']);
+    expect(config.publicUrl).toBe("https://bridge.example.com");
+    expect(config.configFile).toBe(join(root, "config", "bridge.json"));
+  });
+
+  it("rejects invalid values", () => {
+    writeJson({ publicPort: "abc" });
+    expect(() => loadConfig({ rootDir: root, env: { BRIDGE_PASSPHRASE: GOOD } })).toThrow(/publicPort/);
+    writeJson({ tunables: { accessTokenTtlSeconds: -1 } });
+    expect(() => loadConfig({ rootDir: root, env: { BRIDGE_PASSPHRASE: GOOD } })).toThrow(
+      /accessTokenTtlSeconds/,
+    );
+    writeJson({});
+    expect(() =>
+      loadConfig({
+        rootDir: root,
+        env: { BRIDGE_PASSPHRASE: GOOD, PUBLIC_URL: "https://x.example.com/mcp" },
+      }),
+    ).toThrow(/origin only/);
+    writeFileSync(join(root, "config", "bridge.json"), "{ not json");
+    expect(() => loadConfig({ rootDir: root, env: { BRIDGE_PASSPHRASE: GOOD } })).toThrow(/not valid JSON/);
+  });
+
+  it("loads oauth.extraResources (default empty) and validates it", () => {
+    expect(loadConfig({ rootDir: root, env: { BRIDGE_PASSPHRASE: GOOD } }).oauth.extraResources).toEqual([]);
+    const extra = "https://tunnel-service.example.org/v1/mcp/tunnel_abc";
+    writeJson({ oauth: { extraResources: [extra] } });
+    expect(loadConfig({ rootDir: root, env: { BRIDGE_PASSPHRASE: GOOD } }).oauth.extraResources).toEqual([
+      extra,
+    ]);
+    writeJson({ oauth: { extraResources: ["not a url"] } });
+    expect(() => loadConfig({ rootDir: root, env: { BRIDGE_PASSPHRASE: GOOD } })).toThrow(/extraResources/);
+    writeJson({ oauth: { extraResources: "https://x.example/mcp" } });
+    expect(() => loadConfig({ rootDir: root, env: { BRIDGE_PASSPHRASE: GOOD } })).toThrow(/extraResources/);
+  });
+
+  it("matches config/bridge.example.json with the built-in defaults", () => {
+    mkdirSync(join(root, "config"), { recursive: true });
+    copyFileSync(
+      join(import.meta.dirname, "../../config/bridge.example.json"),
+      join(root, "config", "bridge.json"),
+    );
+    const fromExample = loadConfig({ rootDir: root, env: { BRIDGE_PASSPHRASE: GOOD } });
+    expect(fromExample.warnings).toEqual([]);
+    expect(fromExample.redirectUriAllowlist).toEqual([...DEFAULT_REDIRECT_URI_ALLOWLIST]);
+    expect(fromExample.redirectUriAllowlist).toContain("https://chatgpt.com/connector/oauth/*");
+    expect(fromExample.redirectUriAllowlist).toContain(
+      "https://chatgpt.com/connector_platform_oauth_redirect",
+    );
+    expect(fromExample.oauth.extraResources).toEqual([]);
+    expect(fromExample.tunables).toEqual(DEFAULT_TUNABLES);
+    expect(fromExample.chatgpt).toBeNull();
+    expect(fromExample.onboarding).toEqual({
+      model: "claude-opus-5-5",
+      effort: "high",
+      runtime: "auto",
+      codexModel: null,
+    });
+  });
+
+  it("loads the helper runtime, Codex model, and tool locations with defaults", () => {
+    const defaults = loadConfig({ rootDir: root, env: { BRIDGE_PASSPHRASE: GOOD } });
+    expect(defaults.onboarding.runtime).toBe("auto");
+    expect(defaults.onboarding.codexModel).toBeNull();
+    expect(defaults.chatgpt).toBeNull();
+    expect(defaults.executables).toEqual({ tunnelClient: "tunnel-client", codex: "codex" });
+    expect(Object.keys(defaults)).toContain("onboarding");
+
+    writeJson({ onboarding: { runtime: "codex", codexModel: "gpt-5.5-codex" } });
+    const set = loadConfig({
+      rootDir: root,
+      env: { BRIDGE_PASSPHRASE: GOOD, TUNNEL_CLIENT_BIN: "/opt/tc/tunnel-client", CODEX_BIN: " " },
+    });
+    expect(set.onboarding.runtime).toBe("codex");
+    expect(set.onboarding.codexModel).toBe("gpt-5.5-codex");
+    expect(set.executables).toEqual({ tunnelClient: "/opt/tc/tunnel-client", codex: "codex" });
+    expect(set.warnings).toEqual([]);
+    expect((JSON.parse(JSON.stringify(set)) as { onboarding: { runtime: string } }).onboarding.runtime).toBe(
+      "codex",
+    );
+
+    writeJson({ onboarding: { runtime: "gpt" } });
+    expect(() => loadConfig({ rootDir: root, env: { BRIDGE_PASSPHRASE: GOOD } })).toThrow(
+      /onboarding.runtime/,
+    );
+    writeJson({ onboarding: { codexModel: "" } });
+    expect(() => loadConfig({ rootDir: root, env: { BRIDGE_PASSPHRASE: GOOD } })).toThrow(/codexModel/);
+  });
+
+  it("loads the ChatGPT connection marker and validates it", () => {
+    const tunnelId = `tunnel_${"ab".repeat(16)}`;
+    writeJson({ chatgpt: { managed: true, tunnelId, profile: "browser-research-bridge" } });
+    const config = loadConfig({ rootDir: root, env: { BRIDGE_PASSPHRASE: GOOD } });
+    expect(config.chatgpt).toEqual({ managed: true, tunnelId, profile: "browser-research-bridge" });
+    expect(config.warnings).toEqual([]);
+    writeJson({ chatgpt: null });
+    expect(loadConfig({ rootDir: root, env: { BRIDGE_PASSPHRASE: GOOD } }).chatgpt).toBeNull();
+    for (const bad of [
+      "x",
+      { managed: "yes", tunnelId, profile: "p" },
+      { managed: true, tunnelId: "tunnel_123", profile: "p" },
+      { managed: true, tunnelId, profile: "" },
+      { managed: true, tunnelId },
+    ]) {
+      writeJson({ chatgpt: bad });
+      expect(() => loadConfig({ rootDir: root, env: { BRIDGE_PASSPHRASE: GOOD } })).toThrow(/chatgpt/);
+    }
+  });
+
+  it("keeps secrets out of serialization", () => {
+    const config = loadConfig({
+      rootDir: root,
+      env: { BRIDGE_PASSPHRASE: GOOD, ANTHROPIC_API_KEY: "sk-test" },
+    });
+    expect(config.secrets.anthropicApiKey).toBe("sk-test");
+    const text = JSON.stringify(config);
+    expect(text).not.toContain(GOOD);
+    expect(text).not.toContain("sk-test");
+  });
+});
+
+describe("loadConfigResult", () => {
+  let root: string;
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "bridge-config-"));
+  });
+  afterEach(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it("returns the config when it is valid", () => {
+    const result = loadConfigResult({ rootDir: root, env: { BRIDGE_PASSPHRASE: GOOD } });
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.config.secrets.passphrase).toBe(GOOD);
+  });
+
+  it("classifies the three configuration problems", () => {
+    expect(loadConfigResult({ rootDir: root, env: {} })).toEqual({
+      ok: false,
+      problem: {
+        code: "passphrase_missing",
+        message: expect.stringContaining("BRIDGE_PASSPHRASE") as string,
+      },
+    });
+    expect(loadConfigResult({ rootDir: root, env: { BRIDGE_PASSPHRASE: "   " } })).toMatchObject({
+      ok: false,
+      problem: { code: "passphrase_missing" },
+    });
+    expect(loadConfigResult({ rootDir: root, env: { BRIDGE_PASSPHRASE: "short" } })).toMatchObject({
+      ok: false,
+      problem: { code: "passphrase_too_short", message: expect.stringContaining("12") as string },
+    });
+    mkdirSync(join(root, "config"));
+    writeFileSync(join(root, "config", "bridge.json"), "{ broken");
+    const broken = loadConfigResult({ rootDir: root, env: { BRIDGE_PASSPHRASE: GOOD } });
+    expect(broken).toMatchObject({ ok: false, problem: { code: "config_invalid" } });
+    if (!broken.ok) expect(broken.problem.message).toContain(join(root, "config", "bridge.json"));
+    expect(
+      loadConfigResult({ rootDir: root, env: { BRIDGE_PASSPHRASE: GOOD, BRIDGE_ADMIN_PORT: "99999" } }),
+    ).toMatchObject({ ok: false, problem: { code: "config_invalid" } });
+  });
+
+  it("keeps ConfigError codes on the thrown errors", () => {
+    try {
+      loadConfig({ rootDir: root, env: { BRIDGE_PASSPHRASE: "short" } });
+      expect.unreachable();
+    } catch (error) {
+      expect(error).toBeInstanceOf(ConfigError);
+      expect((error as ConfigError).code).toBe("passphrase_too_short");
+    }
+  });
+
+  it("never puts the passphrase into a problem message", () => {
+    const secret = "tiny-secret";
+    const result = loadConfigResult({ rootDir: root, env: { BRIDGE_PASSPHRASE: secret } });
+    expect(JSON.stringify(result)).not.toContain(secret);
+  });
+});
+
+describe("resolveSettingsPageLocation", () => {
+  let root: string;
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "bridge-config-"));
+    mkdirSync(join(root, "config"));
+  });
+  afterEach(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+  const file = (text: string) => writeFileSync(join(root, "config", "bridge.json"), text);
+
+  it("uses the defaults without a file or environment", () => {
+    expect(resolveSettingsPageLocation({ rootDir: root, env: {} })).toEqual({
+      adminPort: 8788,
+      dataDir: join(root, "data"),
+    });
+  });
+
+  it("uses a readable file's valid values and falls back per value", () => {
+    file(JSON.stringify({ adminPort: 9100, dataDir: "/var/bridge-data" }));
+    expect(resolveSettingsPageLocation({ rootDir: root, env: {} })).toEqual({
+      adminPort: 9100,
+      dataDir: "/var/bridge-data",
+    });
+    file(JSON.stringify({ adminPort: "nope", dataDir: "store", publicPort: -1 }));
+    expect(resolveSettingsPageLocation({ rootDir: root, env: {} })).toEqual({
+      adminPort: 8788,
+      dataDir: join(root, "store"),
+    });
+  });
+
+  it("still yields a port and data folder when the file is malformed", () => {
+    file("{ this is not json");
+    expect(resolveSettingsPageLocation({ rootDir: root, env: {} })).toEqual({
+      adminPort: 8788,
+      dataDir: join(root, "data"),
+    });
+    expect(
+      resolveSettingsPageLocation({
+        rootDir: root,
+        env: { BRIDGE_ADMIN_PORT: "9200", BRIDGE_DATA_DIR: "d2" },
+      }),
+    ).toEqual({ adminPort: 9200, dataDir: join(root, "d2") });
+    file("[1, 2]");
+    expect(resolveSettingsPageLocation({ rootDir: root, env: {} }).adminPort).toBe(8788);
+  });
+
+  it("prefers a valid environment override and ignores an invalid one", () => {
+    file(JSON.stringify({ adminPort: 9100 }));
+    expect(resolveSettingsPageLocation({ rootDir: root, env: { BRIDGE_ADMIN_PORT: "9300" } }).adminPort).toBe(
+      9300,
+    );
+    expect(
+      resolveSettingsPageLocation({ rootDir: root, env: { BRIDGE_ADMIN_PORT: "70000" } }).adminPort,
+    ).toBe(9100);
+    expect(resolveSettingsPageLocation({ rootDir: root, env: { BRIDGE_ADMIN_PORT: "" } }).adminPort).toBe(
+      9100,
+    );
+  });
+});

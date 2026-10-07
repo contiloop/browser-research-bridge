@@ -1,0 +1,11 @@
+.dryforge/
+node_modules
+dist
+data
+.env
+config/bridge.json
+sites/*/.staging
+sites/*/.previous
+coverage
+*.log
+.DS_Store

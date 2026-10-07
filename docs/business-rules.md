@@ -1,0 +1,207 @@
+# Business rules
+
+## Terms
+
+- **Site**: a registered website with a key, owned hostnames, a login requirement, a time zone, and capabilities (`search`, `read`, `dateFilter`, `pagination`).
+- **Site key**: `[a-z0-9-]{2,32}`, unique, visible to research clients through `site:`. Default derivation: the hostname without `www.` and without its public suffix, dots turned into hyphens (`reuters.com` → `reuters`, `blog.naver.com` → `blog-naver`). The key the Add started with stays the key; `manifest.key` must equal the folder name.
+- **Owned hostname vs allowed host**: `hostnames` in the manifest are owned; a URL maps to a site only through an owned hostname (exact match, case- and `www.`-insensitive), and a hostname is owned by at most one site. `extraAllowedHosts` (login/SSO hosts, data APIs, CDNs) only widen where the site's browser session may load and request; they own nothing, so a URL on `nid.naver.com` maps to no site. For browsing, every entry also covers its subdomains; for ownership it does not.
+- **Status** means two different things:
+  - **outcome status**: the result of one search or read for one site (nine values, below);
+  - **lifecycle status**: the standing state of a registered site (five values, below). `list_sites` reports lifecycle statuses; `siteStatuses` and read errors report outcome statuses.
+- **Registered / loadable / serving**: registered = listed in `data/sites.json`; loadable = its folder has a manifest whose key matches the folder, an `adapter.ts`, and a `validation.json` recording a passed full validation; serving = loadable and in lifecycle status `active`, `needs_login`, or `degraded`.
+- **Result id**: `<siteKey>:<localId>`. `localId` is the site's own stable article id when the adapter supplies one (no whitespace, never starting with `u_`), otherwise `u_` + base64url of the article URL after the adapter's `canonicalize`. Ids never use the dedup-normalized URL, because normalization may change which page opens.
+- **Ref**: what read accepts: a result id, or any string starting with `http://`/`https://`.
+- **Document**: one article's text plus metadata (`id, site, title, url, publishedAt, datePrecision, author, text, truncated, accessLevel, fetchedAt, metadata`). `accessLevel` is `subscriber` when the full text appeared only because the user is logged in or subscribed, else `public`.
+
+## Run modes
+
+One process has two parts: the settings page, up for the life of the process, and the core (public side, registry, search and read, OAuth, jobs, health checks, browser port), which is started, stopped, and restarted (`src/app/run-mode.ts`).
+
+| `mode`       | Meaning                                                             | Public side         | Program-managed connection tool        |
+| ------------ | ------------------------------------------------------------------- | ------------------- | -------------------------------------- |
+| `setup`      | the core is off; `problem` says why                                 | not listening       | not started (ChatGPT state `stopped`)  |
+| `running`    | normal                                                              | listening           | started after the core when configured |
+| `restarting` | the core is being stopped and started (also before the first start) | closed for a moment | stopped for a moment                   |
+
+| `problem.code`         | Condition                                                                                          |
+| ---------------------- | -------------------------------------------------------------------------------------------------- |
+| `passphrase_missing`   | `BRIDGE_PASSPHRASE` unset or blank                                                                 |
+| `passphrase_too_short` | fewer than 12 characters                                                                           |
+| `config_invalid`       | any other configuration error (malformed file, invalid value); the message names the file or value |
+| `start_failed`         | the configuration is valid but the core failed to start (for example the public port is in use)    |
+
+- The rules are the same however the process is started (launchd agent, `npm start`). A configuration problem never ends the process; only a settings-page port that cannot be bound does (exit code 1).
+- The settings page's port and the data folder come from a valid environment override, else a valid value in a readable `config/bridge.json`, else 8788 and `data`, so a malformed file still leaves the page up.
+- Every core start reads the files again and builds a new core. One start or restart runs at a time; a save, restart, or ChatGPT setup during one is refused (`busy`).
+- Saving a setting on the page: validate → no change means no restart → refuse with `job_running` while a helper job is `running` unless confirmed → write → (optionally disconnect all apps) → restart. If the start fails, the mode is `setup` with the reason; saved values are not rolled back. A job interrupted by the restart fails "interrupted by shutdown; click Retry".
+- In `setup`, a corrected save starts the core; on success the mode is `running`.
+- The settings page's one-time link and cookie are created once per process start and survive core restarts.
+
+## Shipped sites
+
+- The repository ships exactly one site, `sites/reuters/`. It is also the helper's reference adapter: the helper's instructions, its reference allowlist, and `docs/ADAPTERS.md` point to it, and a unit test checks that its `validation.json` matches its files.
+- Other sites are added on the settings page. A site folder can be kept out of git on purpose (excluded locally in `.git/info/exclude`); it works on that Mac and is not in a fresh clone.
+- On an existing install, a registered site whose folder is gone is dropped from the registry at the next start.
+
+## Outcome statuses (exact set)
+
+| Status                | Means                                                                                                | Must not be used for                         |
+| --------------------- | ---------------------------------------------------------------------------------------------------- | -------------------------------------------- |
+| `ok`                  | results or a complete document came back                                                             | partial text, teaser, login wall             |
+| `empty`               | the site answered and has nothing (no hits, missing article)                                         | any login, access, block, or error condition |
+| `auth_required`       | login wall or expired session                                                                        | —                                            |
+| `unsupported`         | site not registered, capability absent, unknown `site:` value, invalid ref or cursor, site not ready | site failures                                |
+| `access_denied`       | paywall without entitlement, 403, block page, captcha                                                | an expired login (that is `auth_required`)   |
+| `rate_limited`        | the site is throttling                                                                               | —                                            |
+| `timeout`             | the call budget ran out or the site lock could not be acquired in time                               | —                                            |
+| `adapter_error`       | the adapter threw, returned malformed data, or a page script violated the shim                       | —                                            |
+| `browser_unavailable` | Aside unreachable, CLI signed out, or the REPL restarted under a running task                        | —                                            |
+
+- Every non-`ok` entry carries a human `message`; `auth_required` and `access_denied` always carry an `action`. Defaults when the adapter gives none: `auth_required` → "Log in to <loginUrl or site> in Aside, then click Check now in the dashboard"; `access_denied` → "Open <site> in Aside and check the subscription, captcha, or block page, then retry"; an expired Aside CLI login → `browser_unavailable` with "run `aside login`".
+- An adapter status outside the set becomes `adapter_error`. `ok` with zero results becomes `empty`, `empty` with results becomes `ok`; failure statuses pass through unchanged, so an error can never surface as `ok` or `empty`. Anything thrown maps to its typed status, to `timeout` for abort/timeout errors, else to `adapter_error`.
+
+## Query language (shared by `search` and `search_sites`)
+
+The query is split on whitespace. A token of the form `name:value` with `name` in `site`, `after`, `before`, `limit`, `page` (name case-insensitive) is a qualifier; every other token is search text.
+
+| Qualifier                               | Rule                                                                                           | Invalid value                                                            |
+| --------------------------------------- | ---------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
+| `site:<key, hostname, or URL>`          | repeatable; lowercased and de-duplicated; resolved by key first, then by owned hostname        | unresolved → status entry `unsupported` "unknown site: <value>", ignored |
+| `after:YYYY-MM-DD`, `before:YYYY-MM-DD` | inclusive published-date window                                                                | not a real calendar date → the token stays search text                   |
+| `limit:N`                               | results per page, clamped to 1–25, default 10                                                  | non-integer → search text                                                |
+| `page:N`                                | page number, clamped to 1–10, default 1; `search` only, consumed and ignored by `search_sites` | non-integer → search text                                                |
+
+- No search words left after stripping qualifiers → no site is called; every target gets `empty` "no search terms".
+- `search_sites` structured fields win over the matching qualifiers. `sites: []` counts as not given. An invalid structured `after`/`before` or a non-finite `limit` is ignored (the qualifier value, if any, applies) and named in the response's `ignoredFields`.
+
+## Search
+
+**Targets.** With `site:` values, the targets are the named sites; without, every `active` site. A site is searched only when it is `active` and declares `search`. Named sites that are not searchable get one status entry each:
+
+| Site state                | Entry                                                              |
+| ------------------------- | ------------------------------------------------------------------ |
+| `needs_login`             | `auth_required`, "login required or session expired", login action |
+| `degraded`                | `adapter_error`, last failure, action "Repair in the dashboard"    |
+| `failed`                  | `adapter_error`, failure reason (no action)                        |
+| `onboarding`              | `unsupported`, "onboarding in progress"                            |
+| `active` without `search` | `unsupported`, "search is not supported by this site"              |
+
+Without `site:`, `siteStatuses` holds one entry for every registered site; with `site:`, one entry per named site, then one per unknown value in input order. When the caller named sites and none resolved, nothing is searched.
+
+**Per-site call.** Each target's adapter is called once per page, concurrently, with `limit` and its own adapter cursor; it returns at most `limit` items. Sites with native `dateFilter` receive the window; for the others the core post-filters and adds `note: "date filter applied after retrieval"` to that site's entry. The post-filter compares the calendar date written in `publishedAt` (in the site's own offset) with the inclusive window; an undated result fails any window.
+
+**Merge.** Results are deduplicated by normalized URL (adapter `canonicalize` first; then lowercase scheme and host, strip `www.`, fragment, `utm_*`, `fbclid`, `gclid`, `ref`, `src`, sort remaining parameters, drop a trailing slash except at the root), against both this page and the hashes carried in the cursor. Each site contributes a prefix of its adapter page; the emitted page is ordered by `publishedAt` descending, undated last, ties by alphabetical site key, and cut to `limit`. Excerpts longer than 1,000 characters are cut.
+
+**Settling `ok`.** A site whose adapter said `ok` but contributed nothing and has nothing left reports `empty`, with "no results in the date window", "no new results (all were returned on earlier pages)", or "no results". A site that has nothing left on a later page reports `empty` "no more results for this query".
+
+**Never raise.** A failing site contributes zero results plus its status entry; an internal error yields statuses only (`adapter_error` "internal error: …" for every target). The tool itself never returns an MCP error.
+
+## Pagination
+
+- The cursor (`nextCursor`, `search_sites`) is self-contained: per site the adapter cursor that produced its current adapter page and the offset of its first unemitted result, the page number, and the hashes of the last 200 normalized URLs returned. The next page resumes each site from its first unemitted result before asking the adapter for a further page, so results cut by `limit` are not lost.
+- A cursor keeps working after restarts and cache expiry. A site in the cursor that is no longer registered is dropped. A malformed or oversized cursor (over 32,768 characters) → every target `unsupported` "invalid cursor: …". Exhausted and `empty` sites leave the cursor; failed sites keep their position. When no successfully searched site has anything left, `nextCursor` is null.
+- `nextPage` (`search`) is `page + 1` while more results exist, null at page 10 or when exhausted. For `page:N`, the server looks up the page chain `(normalized query + sites + window + limit, N) → cursor` (kept 30 minutes); without an entry it walks forward from the nearest lower chain entry or page 1, page by page, recording chain entries as it goes. Duplicates across pages of one chain are suppressed through the cursor's hash list.
+- Adapters must return the same page for the same adapter cursor; the core may re-request a page and skip what it already emitted.
+
+## Read
+
+1. A ref starting with `http(s)://` resolves to the site owning its hostname (no network). Otherwise it must be `<siteKey>:<localId>` with a valid key and no whitespace; a `u_` id must decode to an http(s) URL. Invalid refs → `unsupported` "invalid ref: …" with `availableSites`.
+2. No owning site, or an unregistered key → `unsupported` with `availableSites` (loadable, serving, read-capable keys). Registered `onboarding`/`failed` → `unsupported` "site not ready: <status>". No `read` capability → `unsupported`. `needs_login` and `degraded` sites are still read; the outcome is reported as it comes.
+3. The adapter receives `{ url }` for URL refs and `u_` ids, `{ localId }` for native ids. Its verdict is passed through: completeness is the adapter's decision, and a document attached to a non-`ok` verdict is discarded. `ok` without a valid document is `adapter_error`.
+4. The document's text is capped at 100,000 characters, cut at a paragraph boundary with `truncated: true`. When read by id, the returned `id` is the requested id.
+5. Tool budgets: `fetch` text ≤ 60,000 characters. `read_documents` takes 1–5 refs, reads them concurrently, answers in input order, and splits 120,000 characters across the documents that came back `ok`: each gets `max(10000, floor(120000 / okCount))`. A budget cut sets `truncated: true`.
+6. `fetch` failure is an error object `{ code, message, site, action?, availableSites? }`; `code` may be `empty` for a missing article. `read_documents` never fails as a whole.
+
+## Completeness
+
+- A read returns `ok` only when the adapter has confirmed the full article body is present (a positive body marker plus the absence of the site's wall markers). Login wall or lapsed session → `auth_required`; paywall teaser, block page, captcha → `access_denied`; throttling page → `rate_limited`; missing article → `empty`.
+- A block page or captcha is flagged `blocked: true` by the adapter, which starts a cool-down; a paywall is also `access_denied` but must not be flagged, so it does not pause the site.
+- Example dispositions in production: a Reuters Breakingviews (`premium`) article read with an account that has only a Reuters.com subscription is `access_denied`; a paid Reuters article read without the AccountButton marker is `auth_required`; a Naver neighbor-only post read logged out is expected to be `auth_required` (the marker set comes from Naver's notices and has not yet been observed on a live neighbor-only post).
+
+## Dates
+
+`publishedAt` is ISO 8601 with the site's own offset (from the manifest's `timezone`); `datePrecision` is `minute` with a time of day or a relative amount under a day, `day` for a calendar date, null without a date. Relative dates ("3시간 전", "5 hours ago") resolve against the request time in the site zone at request time and are never cached across calls by the adapter.
+
+## Caching
+
+| Entry                                                             | Lifetime   | Stored only when                                                                              | Removed by               |
+| ----------------------------------------------------------------- | ---------- | --------------------------------------------------------------------------------------------- | ------------------------ |
+| search page (key: normalized query, sites, window, limit, cursor) | 10 minutes | every searched site returned `ok` or `empty` (entries for non-searched sites do not block it) | expiry, site cache clear |
+| document (key: site and adapter ref)                              | 24 hours   | status `ok`                                                                                   | expiry, site cache clear |
+| page chain cursor                                                 | 30 minutes | the page has a next cursor and the next page ≤ 10                                             | expiry, site cache clear |
+
+A site's cache is cleared when a live `auth_required` moves it to `needs_login`, when a health check first reports `auth_required`, when a passing health check returns a `needs_login` site to `active`, on Remove, and from the dashboard (one site or all). Every cache lookup failure is a miss, never a tool failure.
+
+## Site lifecycle
+
+Statuses (exact set): `onboarding`, `active`, `needs_login`, `degraded`, `failed`.
+
+| From                                         | Event                                                                 | To                                          | Side effects                                                                                  |
+| -------------------------------------------- | --------------------------------------------------------------------- | ------------------------------------------- | --------------------------------------------------------------------------------------------- |
+| —                                            | Add with a URL/hostname                                               | `onboarding` (provisional key and hostname) | job queued                                                                                    |
+| `onboarding`                                 | job succeeds (promotion)                                              | `active`                                    | failures cleared, last check = now                                                            |
+| `onboarding`                                 | job fails, is cancelled, or is interrupted by a restart               | `failed` with the reason                    | —                                                                                             |
+| `failed`                                     | Retry                                                                 | `onboarding`                                | —                                                                                             |
+| `active`                                     | live `auth_required`                                                  | `needs_login`                               | cache cleared                                                                                 |
+| `active`                                     | 3rd consecutive live `adapter_error`                                  | `degraded` with the last message            | —                                                                                             |
+| `degraded`                                   | live `adapter_error`                                                  | `degraded`                                  | last failure updated                                                                          |
+| any serving                                  | live `ok`/`empty`                                                     | unchanged                                   | error count reset                                                                             |
+| any serving                                  | live `rate_limited` or `blocked`                                      | unchanged                                   | 10-minute cool-down                                                                           |
+| any serving                                  | live `access_denied`, `timeout`, `browser_unavailable`, `unsupported` | unchanged                                   | —                                                                                             |
+| any serving                                  | health check `ok`                                                     | `active`                                    | from `needs_login`: cache cleared, login confirmation recorded                                |
+| any serving                                  | health check `auth_required`                                          | `needs_login`                               | cache cleared unless already `needs_login`                                                    |
+| any serving                                  | health check `browser_unavailable`                                    | unchanged                                   | last check not updated, so it runs again at the next pass                                     |
+| any serving                                  | health check with any other non-`ok` status                           | `degraded`                                  | message; an `empty` sample search reads "health check: the sample search returned no results" |
+| `active`/`degraded`/`failed` with live files | Repair succeeds                                                       | `active`                                    | previous files kept in `.previous/`                                                           |
+| any                                          | Repair fails or is cancelled                                          | unchanged                                   | live adapter untouched                                                                        |
+| any                                          | Remove                                                                | gone                                        | folder, state, cache deleted; running job cancelled first                                     |
+
+Impossible by rule:
+
+- A live `ok` never returns a `needs_login` or `degraded` site to `active`; only a passing health check or a promotion does.
+- `onboarding` and `failed` sites never receive live outcomes or health checks, are never searched, and read as `unsupported`.
+- A `failed` site becomes `active` only through a promoted job.
+- Repair never changes the status while it runs.
+
+Startup reconciliation of `data/sites.json` with `sites/`:
+
+- a loadable folder with no state entry (fresh clone) → registered `active` with no last check, checked at the next health pass;
+- a state entry whose folder is missing → dropped;
+- a serving site whose folder is no longer loadable → `failed` "adapter folder is incomplete: …";
+- an `onboarding` site whose folder is loadable (stopped after the swap) → `active`;
+- a folder that is not loadable and has no state → ignored, never loaded;
+- a folder whose hostname another site owns → ignored.
+
+## Health checks
+
+- Run for loadable serving sites whose last check is missing or older than the interval (default 24 hours). The first pass runs 60 seconds after start, then the timer looks for due sites at most hourly and checks them one after another.
+- A site that holds its lock (a search, read, repair step) or is cooling down is skipped and stays due. "Check now" runs immediately when the site is idle and ignores the cool-down; it refuses non-serving sites.
+- The check is the light validation: sample search with limit 3 plus one read, within 60 seconds; it writes nothing to `validation.json`, so a failed check never makes a site unloadable.
+
+## Onboarding jobs
+
+States: `queued → running → succeeded | failed | cancelled`, and `running → awaiting_user`, from which Retry returns the same job (same id) to `queued`.
+
+- One job runs at a time across all sites; further jobs wait in FIFO order.
+- **Add** with a URL or hostname: rejected when the input is empty, longer than 500 characters, an IP address, `localhost`/`.localhost`/`.local`, or a single-label name; rejected with "already registered as <key>; use Repair or Remove" when any site owns the hostname; otherwise the site is registered `onboarding` and the job queued. **Add with a bare name** queues a job without a key; the agent's first step names the homepage and the ownership check runs then. The optional note is at most 2,000 characters and is passed to the agent as the user's words.
+- **Retry**: for the site's latest job in `awaiting_user` or `failed`, requeues that job; for a `failed` site with no folder that can load and no such job, starts a new Add job. A queued or running job → conflict. Retrying an Add job whose site is neither `failed` nor `onboarding` → conflict ("use Repair").
+- **Repair**: only for `active`, `degraded`, `failed` sites that have live `manifest.json` and `adapter.ts`, and only when no job is queued, paused, or running for the site. Staging starts as a copy of the live files.
+- **finish** is accepted only when the staged files carry a passed full validation whose hash matches them, they type-check, and every staged host is approved; the service then re-runs the full validation itself (ignoring a site cool-down, because the user started the job) and promotes only on a pass. The agent's own `run_validation` respects a cool-down, as does a scheduled health check; `npm run site:validate` and dashboard actions ignore it.
+- **Failure** (validation failed, the agent gave up or ended without `finish`, turn limit, error): an Add's site becomes `failed`; a Repair leaves the site and its live adapter untouched.
+- **Blocked**: a login wall, captcha, consent interstitial, or missing subscription pauses the job as `awaiting_user` with a reason and the smallest user action. A site without a usable search surface is onboarded read-only (`capabilities.search = false`); that is not a block. Reading still failing after the user's action fails the job.
+- **Remove** cancels the site's job first and waits for the agent to stop.
+- **Restart**: a job found `running` fails with "interrupted by restart; click Retry" and its Add site becomes `failed`; queued jobs run again; paused jobs stay paused; an `onboarding` site with no queued or paused job becomes `failed`. A graceful stop fails a running job with "interrupted by shutdown; click Retry".
+
+## Browser scheduling
+
+- One in-flight task per site (site lock), FIFO within a site, at most 4 sites active at once; across sites, work is admitted in arrival order. Tool calls, health checks, validation, and each onboarding or repair browser step all go through the same scheduler, so a repair interleaves with live reads step by step.
+- A tool call has 90 seconds in total (lock wait included); one browser step has 120 seconds. A call that cannot get the lock in time gets `timeout` naming the holder, for example "site busy: repair running".
+- Page loads, fetches, and in-script navigations on one site are spaced by the manifest's `minIntervalMs` (default 1,500 ms; Reuters uses 3,000), and the spacing carries across tasks.
+- A cooling-down site is refused with `rate_limited` for 10 minutes after a `rate_limited` outcome or a `blocked` page.
+- The bridge opens and closes its own tabs and never attaches to the user's tabs; one tab per site may stay open for 5 minutes for reuse.
+
+## Current scope limits
+
+- The bridge currently uses one Aside account at a time (`asideAccount`, default `u0`) and one browser engine (Aside).
+- Results are returned only through the five tools; there is currently no export format.
+- Every authenticated client currently sees all five tools; there is no per-client scoping.

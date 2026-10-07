@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Browser Research Bridge (npm start) as a per-user LaunchAgent.
+  Template: ops/install-launchd.sh fills the placeholders (each NAME
+  below appears in the plist wrapped in double underscores) and installs the result to
+  ~/Library/LaunchAgents/com.browser-research-bridge.plist. See ops/README.md.
+
+  REPO_DIR       absolute path of the repository (working directory; config/bridge.json and data/ live here)
+  NODE_BIN       absolute path of node (>= 24)
+  TSX_CLI        absolute path of tsx's CLI inside the repository (node_modules/tsx/dist/cli.mjs)
+  ENV_FILE       absolute path of the .env file (holds BRIDGE_PASSPHRASE, which may still be empty: the bridge
+                 then runs only its settings page; never copied into this plist)
+  PATH           PATH for the bridge and its children (node's, git's, and the found tools' directories)
+  OPTIONAL_ENV   a ready-made XML fragment: one key/string pair per tool found on this Mac, among
+                 ASIDE_CLI (Aside CLI), TUNNEL_CLIENT_BIN (OpenAI connection tool), CODEX_BIN (Codex CLI);
+                 a tool that is not installed is left out. launchd's PATH lacks ~/.local/bin and similar.
+  LOG_DIR        absolute path of ~/Library/Logs/browser-research-bridge
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.browser-research-bridge</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>__NODE_BIN__</string>
+    <string>__TSX_CLI__</string>
+    <string>--env-file=__ENV_FILE__</string>
+    <string>src/app/main.ts</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>__REPO_DIR__</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>__PATH__</string>__OPTIONAL_ENV__
+  </dict>
+
+  <!-- Start at login and restart after a crash; wait 30 s between restarts. -->
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+  <!-- Graceful shutdown (SIGTERM) gets 20 s before SIGKILL. -->
+  <key>ExitTimeOut</key>
+  <integer>20</integer>
+  <key>ProcessType</key>
+  <string>Interactive</string>
+
+  <!-- stdout holds the startup banner and the one-time dashboard link; stderr holds warnings and errors. -->
+  <key>StandardOutPath</key>
+  <string>__LOG_DIR__/bridge.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>__LOG_DIR__/bridge.err.log</string>
+</dict>
+</plist>

