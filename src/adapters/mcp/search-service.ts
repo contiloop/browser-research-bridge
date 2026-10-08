@@ -9,7 +9,10 @@
  * - pagination: `nextCursor` for `search_sites`; `nextPage` plus the server-side page chain
  *   `(normalized query, page) → cursor` for `search`'s `page:N` (walked sequentially when missing);
  * - caching of whole pages when every searched site returned `ok`/`empty`;
- * - every live outcome is fed back into the site lifecycle (incl. `blocked` → cool-down).
+ * - every live outcome is fed back into the site lifecycle (`rate_limited` → cool-down; `blocked` does not cool down);
+ * - a blocked site (block or captcha page) gets one challenge attempt per call, on the page the
+ *   adapter's session last showed (its search page; else the site's homepage), and one re-run
+ *   (`callWithChallenge`, ./live-call.ts).
  *
  * `search()` never throws: a failing site contributes zero results and its status entry.
  */
@@ -37,8 +40,8 @@ import { searchCacheKey } from "../storage/result-cache.js";
 import { adapterOutcome, normalizeSearchResponse } from "./adapter-output.js";
 import { DEFAULT_TOOL_TUNABLES, errorMessage } from "./deps.js";
 import type { ToolServiceDeps, ToolTunables } from "./deps.js";
-import { callSiteAdapter, finishOutcome, recordLiveOutcome } from "./live-call.js";
-import type { LiveCallContext } from "./live-call.js";
+import { callSiteAdapter, callWithChallenge, finishOutcome } from "./live-call.js";
+import type { LiveCallContext, SettledCall } from "./live-call.js";
 
 export type SearchMode = "search" | "search_sites";
 
@@ -98,6 +101,8 @@ interface CallContext {
   chainQuery: string;
   deadline: number;
   signal: AbortSignal | undefined;
+  /** Sites that already had a captcha attempt in this call (one per site and call). */
+  attempted: Set<string>;
 }
 
 interface SiteCall {
@@ -167,6 +172,7 @@ export class SearchService {
       runSiteTask: deps.runSiteTask,
       logger: deps.logger,
       clock: deps.clock ?? systemClock,
+      challenges: deps.challenges,
     };
   }
 
@@ -228,6 +234,7 @@ export class SearchService {
       chainQuery: searchCacheKey({ ...request, cursor: null }),
       deadline,
       signal: input.signal,
+      attempted: new Set(),
     };
 
     let start: PageStart;
@@ -353,56 +360,77 @@ export class SearchService {
     const { request } = ctx;
     const loginUrl = ctx.views.get(key)?.loginUrl ?? null;
     const window: DateWindow = { after: request.after, before: request.before };
-    const call = await callSiteAdapter(
-      this.live,
-      key,
-      { holder: "search", deadline: ctx.deadline, signal: ctx.signal },
-      async (loaded, actx) => {
-        const native = loaded.manifest.capabilities.dateFilter;
-        const raw = await loaded.adapter.search(
-          {
-            text: request.text,
-            after: native ? request.after : null,
-            before: native ? request.before : null,
-            limit: request.limit,
-            cursor: state.adapterCursor,
-          },
-          actx,
-        );
-        const response = normalizeSearchResponse(raw);
-        const adapter = loaded.adapter;
-        const canonicalize = adapter.canonicalize ? (url: string) => adapter.canonicalize!(url) : undefined;
-        const results = response.items.map((item) => capExcerpt(toSearchResult(key, item, canonicalize)));
+    const once = async (): Promise<SettledCall<SiteBatch>> => {
+      const call = await callSiteAdapter(
+        this.live,
+        key,
+        { holder: "search", deadline: ctx.deadline, signal: ctx.signal },
+        async (loaded, actx) => {
+          const native = loaded.manifest.capabilities.dateFilter;
+          const raw = await loaded.adapter.search(
+            {
+              text: request.text,
+              after: native ? request.after : null,
+              before: native ? request.before : null,
+              limit: request.limit,
+              cursor: state.adapterCursor,
+            },
+            actx,
+          );
+          const response = normalizeSearchResponse(raw);
+          const adapter = loaded.adapter;
+          const canonicalize = adapter.canonicalize ? (url: string) => adapter.canonicalize!(url) : undefined;
+          const results = response.items.map((item) => capExcerpt(toSearchResult(key, item, canonicalize)));
+          return {
+            response,
+            results,
+            canonicalize,
+            window: postFilterWindow(window, loaded.manifest.capabilities),
+          };
+        },
+      );
+      if (!call.ok) {
+        const outcome = finishOutcome(call.outcome, key, loginUrl);
         return {
-          response,
-          results,
-          canonicalize,
-          window: postFilterWindow(window, loaded.manifest.capabilities),
+          outcome,
+          blocked: false,
+          value: { site: key, state, status: outcome.status, results: [], nextCursor: null },
+          pageUrl: call.pageUrl,
         };
-      },
-    );
-
-    let outcome: Outcome;
-    let batch: SiteBatch;
-    let blocked = false;
-    if (call.ok) {
+      }
       const { response, results, canonicalize } = call.value;
-      outcome = finishOutcome(adapterOutcome(response), key, loginUrl);
-      blocked = response.blocked;
-      batch = {
-        site: key,
-        state,
-        status: outcome.status,
-        results,
-        nextCursor: response.nextCursor,
-        canonicalize,
-        dateWindow: call.value.window,
+      const outcome = finishOutcome(adapterOutcome(response), key, loginUrl);
+      return {
+        outcome,
+        blocked: response.blocked,
+        pageUrl: call.pageUrl,
+        value: {
+          site: key,
+          state,
+          status: outcome.status,
+          results,
+          nextCursor: response.nextCursor,
+          canonicalize,
+          dateWindow: call.value.window,
+        },
       };
-    } else {
-      outcome = finishOutcome(call.outcome, key, loginUrl);
-      batch = { site: key, state, status: outcome.status, results: [], nextCursor: null };
-    }
-    await recordLiveOutcome(this.live, key, outcome, blocked);
+    };
+
+    // A search failure has no URL of its own: the attempt targets the page the adapter's session last
+    // showed (the site's search page), else the site's homepage.
+    const settled = await callWithChallenge(
+      this.live,
+      {
+        key,
+        holder: "search",
+        deadline: ctx.deadline,
+        signal: ctx.signal,
+        url: null,
+        attempted: ctx.attempted,
+      },
+      once,
+    );
+    const { outcome, blocked, value: batch } = settled;
     if (outcome.status !== "ok") {
       this.deps.logger.info("site search outcome", {
         site: key,

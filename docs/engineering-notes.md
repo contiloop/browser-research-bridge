@@ -66,7 +66,7 @@
 
 - **Symptom**: a smoke test of startup, OAuth, or the dashboard opens tabs in the user's Aside window or competes with a running research session.
 - **Cause**: the browser port starts `aside mcp` lazily on the first browser step and probes it once at startup.
-- **Response**: start with `ASIDE_CLI=/nonexistent/aside` (and a separate `BRIDGE_DATA_DIR`, ports, and a test passphrase). The probe logs "browser not reachable", the dashboard shows Aside unreachable, and tools answer `browser_unavailable`, while OAuth, `/mcp`, `list_sites`, and the dashboard work normally.
+- **Response**: start with `ASIDE_CLI=/nonexistent/aside` (and a separate `BRIDGE_DATA_DIR`, ports, and a test passphrase). The probe logs "browser not reachable", the dashboard shows Aside unreachable, and tools answer `browser_unavailable`, while OAuth, `/mcp`, `list_sites`, and the dashboard work normally. A fresh data folder has no helper check recorded, so 30 seconds after the core starts the automatic helper check makes one real model call on the local Claude or Codex sign-in (Claude is always tried under `auto`, because its sign-in cannot be ruled out without a call); stop the instance within 30 seconds when no helper quota may be spent.
 
 ### An onboarding job fails at once with a usage-limit message
 
@@ -92,11 +92,41 @@
 - **Cause**: bridge-initiated requests and navigations, including server redirects, may only reach the site's `hostnames ∪ extraAllowedHosts` (subdomains included); requests the site's own scripts make to undeclared hosts are merely blocked and logged at debug level.
 - **Response**: declare login/SSO, API, and CDN hosts in `extraAllowedHosts`. Run with `BRIDGE_LOG_LEVEL=debug` and read the `requests blocked by the tab filter` lines to learn which hosts a site needs (Reuters needs `arcpublishing.com` for images and API data).
 
-### A paywall or captcha does not pause the site
+### A block page does not pause the site
 
-- **Symptom**: a site keeps being hit while it shows a block page.
-- **Cause**: the scheduler starts the 10-minute cool-down automatically only for `rate_limited`; `access_denied` is shared by paywalls and block pages.
-- **Response**: an adapter that recognizes a block or captcha page returns `access_denied` (or `rate_limited`) with `blocked: true` (`readFailure`/`searchFailure` take `{ blocked }`); a paywall never sets it.
+- **Symptom**: a site keeps being called while it shows a block or captcha page; the bridge log shows `captcha attempt` lines but no cool-down.
+- **Cause**: by design (decision 0015) only `rate_limited` starts the 10-minute cool-down. A `blocked: true` failure instead gets one challenge attempt and one re-run per tool call (with `captcha.auto` on), and the user is told to solve the captcha in Aside when that fails. Older documents, and the doc comments in `src/adapter-kit/completeness.ts` and `results.ts`, still say a block page cools the site down.
+- **Response**: report real throttling ("too many requests", HTTP 429) as `rate_limited`, which still pauses the site; report a block or captcha page as `access_denied` with `blocked: true` (`readFailure`/`searchFailure` take `{ blocked }`); a paywall never sets it. To stop attempts altogether, turn off Settings → Captchas (`captcha.auto: false`).
+
+### A challenge attempt sees no widget although the page shows one
+
+- **Symptom**: `browser_solve_captcha`, a live attempt, or `npm run browser:captcha-check` reports `kind: none` or `unknown` on a page where Aside visibly shows a captcha checkbox, or the widget's frame stays empty in the bridge tab.
+- **Cause**: a bridge tab's request filter (`Network.setBlockedURLs`) and guard CSP block every host outside the site's scope, so the vendor's widget frame (`google.com/recaptcha/…`, `hcaptcha.com`, `challenges.cloudflare.com`, `captcha-delivery.com`, `geetest.com`) was never loaded. Re-issuing the filter alone does not help: the guard's CSP `<meta>` and the init scripts belong to the already loaded document, and `Page.addScriptToEvaluateOnNewDocument` scripts apply only to the next one.
+- **Response**: the attempt widens the tab (filter re-issued, both guard init scripts removed by the identifiers kept in `__brbInit` and replaced with widened ones) and then reloads the challenge URL; a fresh tab is first opened normally and adopted, then widened and reloaded the same way. The tab is the attempt's target before the widening call goes out, so the restore (or the close) always covers it. Keep that order when changing `captcha.ts`/`repl-runtime.ts`; detection fixtures in `captcha.test.ts` describe pages as they look after the widened reload. A tab whose init scripts are unknown or cannot be removed must be closed, never reused.
+
+### DataDome's slider is reported `unknown`
+
+- **Symptom**: on Reuters (or another DataDome site) the attempt returns `kind: unknown` with the slider visible, and the read keeps failing with "The captcha could not be solved automatically. Open <url> in Aside, solve it, then retry".
+- **Cause**: detection runs in the main frame only and sees inside no cross-origin frame. DataDome draws its slider inside its own `captcha-delivery.com` iframe, so only the frame's box is visible to the bridge, and Aside's `captcha.drag` needs the handle and track coordinates.
+- **Response**: none yet; the user solves it in Aside. Confirm the behavior live with `npm run browser:captcha-check -- <reuters url>` (`docs/tracking/findings.md`). Do not reach into the frame with page scripts or CDP frame targets; that would bypass the shim's frame rules.
+
+### Parallel calls hit a site faster than `minIntervalMs`
+
+- **Symptom**: a site shows "too many requests" or a block page only when several calls run at once; the bridge log shows page loads of one site less than `minIntervalMs` apart.
+- **Cause**: politeness is per task since the per-site pool (decision 0015): each task spaces its own loads by `minIntervalMs`, and overlapping tasks of one site are separated only by `concurrentStaggerMs` (500 ms) between their starts. Up to `maxConcurrentPerSite` (3) tasks of a site run at once, so a burst can load 3 pages within about a second.
+- **Response**: lower `tunables.maxConcurrentPerSite` (1 restores one task per site; it applies to every site) or raise `concurrentStaggerMs` (0 turns the stagger off; it is the only tunable that may be 0). The adapter must report throttling as `rate_limited` so the site cools down.
+
+### Copy passphrase answers `unavailable`
+
+- **Symptom**: the Copy passphrase button (ChatGPT step f) says the clipboard could not be used; `POST /api/settings/passphrase/clipboard` answers 500 `unavailable`.
+- **Cause**: the program runs `/usr/bin/pbcopy` by absolute path (launchd's `PATH` is minimal, and a `PATH` entry must not be able to stand in for it), with no arguments and only `PATH`, `LANG`, `LC_ALL` in its environment, and gives up after 5 seconds. It fails when `pbcopy` is missing or fails, for example in a session without access to the user's pasteboard.
+- **Response**: run the bridge in the user's login session (the launchd agent does); copy the passphrase from the password manager instead. Tests inject a fake command through `startBridgeProcess({ clipboardCommand })`; never switch the production path to a `PATH` lookup or pass the value as an argument.
+
+### A process test waits for the automatic helper check
+
+- **Symptom**: a test that starts `startBridgeProcess` and expects the automatic helper check never sees it, or times out after vitest's 5-second limit.
+- **Cause**: the automatic check runs 30 seconds after each core start (`HELPER_AUTO_CHECK_DELAY_MS`), longer than a test's timeout; the core-stopping hook cancels a pending one.
+- **Response**: pass `helperAutoCheckDelayMs: 0` (as `settings-api.test.ts` does) and wait with `helperChecks.settled()`; never raise the test timeout to 30 seconds. Tests that do not care leave the default and stop the process, which cancels the timer.
 
 ### A page script cannot see `document`
 
@@ -110,10 +140,10 @@
 - **Cause**: the CLI and the running bridge would both manage `data/` (registry state, jobs) and race.
 - **Response**: stop the bridge or use the dashboard's Add; `--force` skips the check only when the listener is something else.
 
-### `browser:check` uses a different account than the bridge
+### `browser:check` or `browser:captcha-check` uses a different account than the bridge
 
-- **Symptom**: `npm run browser:check` passes while the bridge reports `browser_unavailable`, or the reverse.
-- **Cause**: `browser:check` takes the account from `--account`, then `ASIDE_ACCOUNT`, then `u0`; it ignores `asideAccount` in `config/bridge.json` and `BRIDGE_ASIDE_ACCOUNT`. `site:validate` does use the config.
+- **Symptom**: `npm run browser:check` passes while the bridge reports `browser_unavailable`, or the reverse; `npm run browser:captcha-check` meets a different login or captcha state than the bridge.
+- **Cause**: both CLIs take the account from `--account`, then `ASIDE_ACCOUNT`, then `u0`; they ignore `asideAccount` in `config/bridge.json` and `BRIDGE_ASIDE_ACCOUNT`. `site:validate` does use the config.
 - **Response**: pass `-- --account <id>` explicitly when the bridge uses an account other than `u0`.
 
 ### The bridge commits onto whatever branch is checked out
@@ -183,7 +213,7 @@
 ### Changing a tool or the query language
 
 1. Keep `search`/`fetch` ChatGPT-compatible and the status sets closed.
-2. Update the tool description strings in `src/adapters/mcp/tools.ts`, since the research models read them.
+2. Update the tool description strings and `INSTRUCTIONS` in `src/adapters/mcp/tools.ts` together, since the research models read them; `tools.test.ts` pins their key phrases (query typed unchanged into the site's search box, login articles read only through `fetch`/`read_documents`, any URL on a registered site, parallel calls). Do not reintroduce wording that sends the model to its own web search (`aff1f07`, reverted).
 3. Verify with unit tests and, for anything visible to clients, one real call from each client (ChatGPT `search` → `fetch`; Claude `search_sites` → `read_documents`) visible as `tool call` lines in the bridge log.
 
 ### Restarting with a Cloudflare quick tunnel

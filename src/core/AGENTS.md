@@ -2,7 +2,7 @@
 
 ## Scope
 
-Pure domain logic shared by every other module: the exact status sets and models (`models.ts`), query parsing (`query.ts`), result ids and refs (`ids.ts`), URL normalization and its hash (`url.ts`), the search cursor codec (`cursor.ts`), the cross-site merge (`merge.ts`), search targeting and the lifecycle → outcome mapping (`targets.ts`), outcome defaults and error mapping (`outcome.ts`), the lifecycle transition function (`lifecycle.ts`), site-key derivation (`site-key.ts`), the rules of the user-changeable settings (`settings.ts`: passphrase length counted in code points, helper runtime values, configuration problem codes, tunnel id format, the ChatGPT marker check), paragraph-boundary truncation (`text.ts`), id/document assembly (`assemble.ts`), and the default limits (`defaults.ts`). Barrel: `index.ts`.
+Pure domain logic shared by every other module: the exact status sets and models (`models.ts`), query parsing (`query.ts`), result ids and refs (`ids.ts`), URL normalization and its hash (`url.ts`), the search cursor codec (`cursor.ts`), the cross-site merge (`merge.ts`), search targeting and the lifecycle → outcome mapping (`targets.ts`), outcome defaults and error mapping (`outcome.ts`), the lifecycle transition function (`lifecycle.ts`), site-key derivation (`site-key.ts`), the rules of the user-changeable settings (`settings.ts`: passphrase length counted in code points, helper runtime values, `captcha.auto` (boolean, default true), configuration problem codes, tunnel id format, the ChatGPT marker check), paragraph-boundary truncation (`text.ts`), id/document assembly (`assemble.ts`), and the default limits (`defaults.ts`). Barrel: `index.ts`.
 
 Not in scope: I/O of any kind, clocks, logging, caching, scheduling, HTTP, MCP, OAuth, browser access, and anything site-specific. Functions take times and tunables as arguments.
 
@@ -20,7 +20,7 @@ Not in scope: I/O of any kind, clocks, logging, caching, scheduling, HTTP, MCP, 
 - `normalizeUrl` strips `www.`, fragment, `utm_*`, `fbclid`, `gclid`, `ref`, `src`, sorts parameters, and drops a non-root trailing slash; `hashUrlKey` is the first 12 base64url characters of its sha256.
 - The cursor wire format is version 1 (`{ v, p, s, h }`); unknown sites are dropped on decode, the seen list keeps the last 200 hashes, tokens over 32,768 characters are rejected.
 - `mergeSearchPage` consumes a prefix of each site's adapter page, keeps failed sites' cursor state, drops exhausted and `empty` sites, and sorts the emitted page by `publishedAt` desc, undated last, ties by site key.
-- `transitionSite` is pure: it returns the next state plus `clearCache`/`coolDown` effects and changes nothing for `onboarding`/`failed` sites on live outcomes and health checks.
+- `transitionSite` is pure: it returns the next state plus `clearCache`/`coolDown` effects and changes nothing for `onboarding`/`failed` sites on live outcomes and health checks. `coolDown` is set only for a live `rate_limited`; a `blocked` page does not cool the site down.
 - `planSearchTargets` searches only `active` sites with the search capability, and searches nothing when every named site is unknown.
 
 ## Patterns

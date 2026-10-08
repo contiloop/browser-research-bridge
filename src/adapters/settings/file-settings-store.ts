@@ -8,8 +8,10 @@ import { chmod, mkdir, rename, rm, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import {
   DEFAULT_ASIDE_ACCOUNT,
+  DEFAULT_CAPTCHA_AUTO,
   DEFAULT_HELPER_RUNTIME,
   checkChatgptSetting,
+  isCaptchaAutoSetting,
   isHelperRuntimeSetting,
   passphraseProblem,
   type ChatgptConnectionSetting,
@@ -98,6 +100,7 @@ export class FileSettingsStore<C> implements SettingsStore<C> {
         locked: this.startup.isOutside(ANTHROPIC_API_KEY),
       },
       helperRuntime: { value: json === null ? null : storedRuntime(json) },
+      captchaAuto: { value: json === null ? null : storedCaptchaAuto(json) },
       asideAccount: this.asideAccount(env, envRead, json),
       chatgpt: json === null ? null : storedChatgpt(json),
       oauthExtraResources: json === null ? null : storedExtraResources(json),
@@ -158,6 +161,7 @@ export class FileSettingsStore<C> implements SettingsStore<C> {
       change.helperRuntime !== undefined ||
       change.chatgpt !== undefined ||
       change.oauthExtraResources !== undefined ||
+      change.captchaAuto !== undefined ||
       (change.asideAccount !== undefined && !accountInEnv);
     // An unreadable .env cannot tell where the account lives, so it blocks an account change too.
     if ((needsEnv || change.asideAccount !== undefined) && envRead.text === null) {
@@ -204,6 +208,10 @@ export class FileSettingsStore<C> implements SettingsStore<C> {
         configText = setJsonValue(configText, ["oauth", "extraResources"], next);
         changed.push("oauthExtraResources");
       }
+    }
+    if (change.captchaAuto !== undefined && storedCaptchaAuto(json) !== change.captchaAuto) {
+      configText = setJsonValue(configText, ["captcha", "auto"], change.captchaAuto);
+      changed.push("captchaAuto");
     }
 
     if (envText !== (envRead.text ?? "")) await writeTextAtomic(this.envFile, envText, ENV_FILE_MODE);
@@ -316,6 +324,9 @@ function validate(change: SettingsChange): Partial<Record<SettingsField, Setting
       fields.oauthExtraResources = "bad_value";
     }
   }
+  if (change.captchaAuto !== undefined && !isCaptchaAutoSetting(change.captchaAuto)) {
+    fields.captchaAuto = "bad_value";
+  }
   return fields;
 }
 
@@ -326,6 +337,16 @@ function storedRuntime(json: JsonObject): HelperRuntimeSetting | null {
   const raw = (onboarding as JsonObject)["runtime"];
   if (raw === undefined) return DEFAULT_HELPER_RUNTIME;
   return isHelperRuntimeSetting(raw) ? raw : null;
+}
+
+/** `captcha.auto` as stored (absent → the default); null when the stored value is not a boolean. */
+function storedCaptchaAuto(json: JsonObject): boolean | null {
+  const captcha = json["captcha"];
+  if (captcha === undefined) return DEFAULT_CAPTCHA_AUTO;
+  if (typeof captcha !== "object" || captcha === null || Array.isArray(captcha)) return null;
+  const raw = (captcha as JsonObject)["auto"];
+  if (raw === undefined) return DEFAULT_CAPTCHA_AUTO;
+  return isCaptchaAutoSetting(raw) ? raw : null;
 }
 
 function storedChatgpt(json: JsonObject): ChatgptConnectionSetting | null {

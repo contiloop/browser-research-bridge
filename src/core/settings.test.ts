@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
   CONFIG_PROBLEM_CODES,
+  DEFAULT_CAPTCHA_AUTO,
   HELPER_RUNTIME_SETTINGS,
   MIN_PASSPHRASE_LENGTH,
+  isCaptchaAutoSetting,
   isHelperRuntimeSetting,
   isTunnelId,
   passphraseProblem,
@@ -25,6 +27,13 @@ describe("settings rules", () => {
     expect(isHelperRuntimeSetting("codex")).toBe(true);
     expect(isHelperRuntimeSetting("gpt")).toBe(false);
     expect(isHelperRuntimeSetting(1)).toBe(false);
+  });
+
+  it("has captcha.auto on by default and accepts only booleans for it", () => {
+    expect(DEFAULT_CAPTCHA_AUTO).toBe(true);
+    expect(isCaptchaAutoSetting(true)).toBe(true);
+    expect(isCaptchaAutoSetting(false)).toBe(true);
+    for (const bad of ["true", 1, 0, null, undefined, {}]) expect(isCaptchaAutoSetting(bad)).toBe(false);
   });
 
   it("knows exactly three configuration problem codes", () => {

@@ -10,7 +10,9 @@
  * `openTab`, `closeTab`, `fetch`, `snapshot`, `sleep`, and a silent `console`.
  */
 import type { JsonValue } from "../../ports/json.js";
-import type { BlockPattern } from "./hosts.js";
+import type { CaptchaStep } from "./captcha.js";
+import { CAPTCHA_PAGE_SOURCE, CAPTCHA_STEP_SOURCE, CAPTCHA_WIDGETS, solverWorldName } from "./captcha.js";
+import type { BlockPattern, ExtraHost } from "./hosts.js";
 import { blockedUrlPatterns } from "./hosts.js";
 import { REPL_RUNTIME_SOURCE } from "./repl-runtime.js";
 import type { ScanViolation } from "./script-scan.js";
@@ -232,27 +234,44 @@ export function guardEventName(instanceId: string): string {
 export const TAB_REGISTRY_KEY = `${INTERNAL_PREFIX}Tabs`;
 
 /**
+ * REPL global (non-enumerable, unreachable from scripts) mapping a bridge tab's target id to the
+ * identifiers of the guard init scripts the runtime registered on it, so a challenge attempt can remove
+ * and replace them (`Page.removeScriptToEvaluateOnNewDocument`).
+ */
+export const INIT_REGISTRY_KEY = `${INTERNAL_PREFIX}Init`;
+
+/**
  * CSP added to every bridge tab as a `<meta>` (in addition to any policy the site sends). It
  * restricts every fetch-like channel, frames, workers and subresources to the site's hostnames, so
  * a blocked attempt fires `securitypolicyviolation` and can be recorded. Inline scripts and eval
- * stay allowed so the site keeps working.
+ * stay allowed so the site keeps working. `extra` (only a challenge attempt passes it: the captcha
+ * vendor hosts) widens every subresource and frame directive, never `form-action` or `manifest-src`.
  */
-export function buildGuardCsp(hostnames: readonly string[]): string {
+export function buildGuardCsp(hostnames: readonly string[], extra: readonly ExtraHost[] = []): string {
   const src = hostnames.map((h) => `${h} *.${h}`).join(" ");
+  const wide = [
+    src,
+    ...extra.map((e) => `${e.host}${e.pathPrefix ?? ""} *.${e.host}${e.pathPrefix ?? ""}`),
+  ].join(" ");
   return [
-    `connect-src ${src}`,
-    `frame-src ${src} blob: data:`,
-    `child-src ${src} blob: data:`,
-    `worker-src ${src} blob:`,
-    `img-src ${src} data: blob:`,
-    `media-src ${src} data: blob:`,
-    `font-src ${src} data:`,
-    `style-src ${src} 'unsafe-inline'`,
-    `script-src ${src} 'unsafe-inline' 'unsafe-eval' blob: data:`,
+    `connect-src ${wide}`,
+    `frame-src ${wide} blob: data:`,
+    `child-src ${wide} blob: data:`,
+    `worker-src ${wide} blob:`,
+    `img-src ${wide} data: blob:`,
+    `media-src ${wide} data: blob:`,
+    `font-src ${wide} data:`,
+    `style-src ${wide} 'unsafe-inline'`,
+    `script-src ${wide} 'unsafe-inline' 'unsafe-eval' blob: data:`,
     `manifest-src ${src}`,
     `form-action ${src}`,
     "object-src 'none'",
   ].join("; ");
+}
+
+/** The guards' extra-host list (`V`): host or subdomain, under a path prefix. */
+function guardExtra(extra: readonly ExtraHost[]): string {
+  return JSON.stringify(extra.map((e) => ({ h: e.host, p: e.pathPrefix ?? "/" })));
 }
 
 const IN_SCOPE_FN = `(u) => {
@@ -261,7 +280,8 @@ const IN_SCOPE_FN = `(u) => {
       if (x.protocol === "about:" || x.protocol === "blob:" || x.protocol === "data:" || x.protocol === "javascript:") return true;
       if (!["http:", "https:", "ws:", "wss:"].includes(x.protocol)) return false;
       const h = x.hostname.toLowerCase();
-      return H.some((a) => h === a || h.endsWith("." + a));
+      if (H.some((a) => h === a || h.endsWith("." + a))) return true;
+      return V.some((v) => (h === v.h || h.endsWith("." + v.h)) && x.pathname.startsWith(v.p));
     } catch (e) { return false; }
   }`;
 
@@ -271,11 +291,16 @@ const IN_SCOPE_FN = `(u) => {
  * the CSP meta once the document has a head, and records every blocked attempt (host only) in a
  * store the shim drains after each step via `__bridgeDrain()`. A blocked request counts as the
  * script's when the violation has no source file (code injected through CDP, e.g. page.evaluate);
- * blocks caused by the site's own scripts are recorded as not attributed.
+ * blocks caused by the site's own scripts are recorded as not attributed. `extra`: see `buildGuardCsp`.
  */
-export function buildIsolatedGuard(hostnames: readonly string[], instanceId: string): string {
+export function buildIsolatedGuard(
+  hostnames: readonly string[],
+  instanceId: string,
+  extra: readonly ExtraHost[] = [],
+): string {
   return `(() => {
   const H = ${JSON.stringify(hostnames)};
+  const V = ${guardExtra(extra)};
   if (typeof __bridgeDrain === "function") return;
   const inScope = ${IN_SCOPE_FN};
   const store = [];
@@ -336,7 +361,7 @@ export function buildIsolatedGuard(hostnames: readonly string[], instanceId: str
     try {
       const m = document.createElement("meta");
       m.httpEquiv = "Content-Security-Policy";
-      m.content = ${JSON.stringify(buildGuardCsp(hostnames))};
+      m.content = ${JSON.stringify(buildGuardCsp(hostnames, extra))};
       (document.head || document.documentElement).prepend(m);
     } catch (e) {}
   };
@@ -351,9 +376,14 @@ export function buildIsolatedGuard(hostnames: readonly string[], instanceId: str
  * `frames[0].open(...)` is covered): `window.open` returns null and reports off-site attempts to the
  * isolated world; service workers and shared workers are unavailable to the page.
  */
-export function buildMainWorldGuard(hostnames: readonly string[], instanceId: string): string {
+export function buildMainWorldGuard(
+  hostnames: readonly string[],
+  instanceId: string,
+  extra: readonly ExtraHost[] = [],
+): string {
   return `(() => {
   const H = ${JSON.stringify(hostnames)};
+  const V = ${guardExtra(extra)};
   const inScope = ${IN_SCOPE_FN};
   const fire = EventTarget.prototype.dispatchEvent;
   const CE = CustomEvent;
@@ -435,7 +465,15 @@ export type ShimOp =
   | { kind: "snapshot"; targetId: string }
   | { kind: "screenshot"; targetId: string }
   | { kind: "fetch"; url: string; init: FetchInitWire }
-  | { kind: "script"; targetId: string | null; script: string; args: JsonValue; params: readonly string[] };
+  | { kind: "script"; targetId: string | null; script: string; args: JsonValue; params: readonly string[] }
+  /**
+   * Re-issues the tab's request filter and replaces its guard init scripts with the ones of this call's
+   * context (widened when the context has `extraHosts`, normal otherwise). `onSite`: only when the tab
+   * is still on the scope's hostnames. `closeIfStuck`: close the tab when its scripts cannot be replaced.
+   */
+  | { kind: "guard"; targetId: string; onSite: boolean; closeIfStuck: boolean }
+  /** A challenge-attempt step (captcha.ts), privileged bridge code run on a bridge tab. */
+  | { kind: "captcha"; targetId: string | null; step: CaptchaStep };
 
 export interface ShimContext {
   /** Random per call; marks the result line. */
@@ -448,13 +486,19 @@ export interface ShimContext {
   minIntervalMs: number;
   /** Random per port instance: names the guard's isolated world, event, and tab registry. */
   instanceId: string;
+  /**
+   * Hosts a tab installed or re-guarded by this call may also load from. Only challenge attempts pass
+   * it (the fixed `CAPTCHA_VENDOR_HOSTS`); navigation and fetch checks keep `hostnames` only.
+   */
+  extraHosts?: readonly ExtraHost[] | undefined;
 }
 
 export const RESULT_MARK = "@@BRB:";
 
 /** The code sent to the `repl` tool: one awaited async IIFE, no top-level declarations. */
 export function buildReplCode(op: ShimOp, ctx: ShimContext): string {
-  const blockPatterns: BlockPattern[] = blockedUrlPatterns(ctx.hostnames);
+  const extra = ctx.extraHosts ?? [];
+  const blockPatterns: BlockPattern[] = blockedUrlPatterns(ctx.hostnames, extra);
   const { script, params, ...opWire } =
     op.kind === "script" ? op : { ...op, script: undefined, params: undefined };
   const env = {
@@ -464,21 +508,32 @@ export function buildReplCode(op: ShimOp, ctx: ShimContext): string {
     notBefore: ctx.notBefore,
     minIntervalMs: ctx.minIntervalMs,
     blockPatterns,
-    isolatedGuard: buildIsolatedGuard(ctx.hostnames, ctx.instanceId),
-    mainGuard: buildMainWorldGuard(ctx.hostnames, ctx.instanceId),
+    isolatedGuard: buildIsolatedGuard(ctx.hostnames, ctx.instanceId, extra),
+    mainGuard: buildMainWorldGuard(ctx.hostnames, ctx.instanceId, extra),
     worldName: guardWorldName(ctx.instanceId),
     registryKey: TAB_REGISTRY_KEY,
+    initRegistryKey: INIT_REGISTRY_KEY,
     allow: STANDARD_GLOBALS,
     unshadowable: UNSHADOWABLE,
     // The bridge's own REPL globals (tab registries); scripts cannot name them (static scan).
     internalPrefix: INTERNAL_PREFIX,
     params: params ?? [],
     op: opWire,
+    captcha:
+      op.kind === "captcha"
+        ? {
+            worldName: solverWorldName(ctx.instanceId),
+            pageSource: CAPTCHA_PAGE_SOURCE,
+            table: CAPTCHA_WIDGETS,
+          }
+        : null,
   };
   const userFn =
-    script === undefined
-      ? "const __brbUser = undefined;"
-      : `const __brbUser = async function (${(params ?? []).join(", ")}) {\n"use strict";\n${script}\n};`;
+    op.kind === "captcha"
+      ? `const __brbUser = ${CAPTCHA_STEP_SOURCE};`
+      : script === undefined
+        ? "const __brbUser = undefined;"
+        : `const __brbUser = async function (${(params ?? []).join(", ")}) {\n"use strict";\n${script}\n};`;
   return [
     "await (async () => {",
     "const __brbConsole = console;",
@@ -497,7 +552,14 @@ export interface ShimViolationRecord {
 }
 
 export type ShimEnvelope =
-  | { ok: true; value: unknown; lastLoadAt: number | null; pageBlocked?: string[] }
+  | {
+      ok: true;
+      value: unknown;
+      lastLoadAt: number | null;
+      pageBlocked?: string[];
+      /** The last on-site main-frame URL a touched tab showed after the step. */
+      pageUrl?: string;
+    }
   | { ok: false; kind: "violation"; violations: ShimViolationRecord[]; lastLoadAt: number | null }
   | { ok: false; kind: "script" | "internal"; message: string; lastLoadAt?: number | null }
   | { ok: false; kind: "timeout"; lastLoadAt?: number | null }

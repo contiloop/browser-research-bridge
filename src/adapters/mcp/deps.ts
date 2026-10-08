@@ -9,6 +9,7 @@ import type { Clock } from "../../ports/clock.js";
 import type { Logger } from "../../ports/logger.js";
 import type { SiteManifest } from "../../ports/manifest.js";
 import type { SiteRegistry } from "../../ports/registry.js";
+import type { ChallengeGate } from "./challenge.js";
 
 /** Registry surface used by the tools (implemented by `SiteRegistryService`). */
 export type ToolRegistry = Pick<SiteRegistry, "list" | "get" | "load" | "recordOutcome">;
@@ -87,6 +88,11 @@ export interface ToolServiceDeps {
   tunables?: Partial<ToolTunables> | undefined;
   logger: Logger;
   clock?: Clock | undefined;
+  /**
+   * Captcha attempts after a blocked outcome (the challenge coordinator); absent: no attempts, as
+   * with `captcha.auto` off.
+   */
+  challenges?: ChallengeGate | undefined;
 }
 
 export function errorMessage(error: unknown): string {

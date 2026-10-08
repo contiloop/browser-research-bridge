@@ -1,14 +1,21 @@
 /**
  * Health-check runner: runs the light validation of each serving
  * site (`active`, `needs_login`, `degraded`) daily (tunable) and on demand ("Check now"), only when
- * the site is idle in the scheduler, and feeds the outcome into the lifecycle: `auth_required` →
+ * the site is idle in the scheduler (no running or waiting task; the check itself then holds the site
+ * alone, see the validator's light form), and feeds the outcome into the lifecycle: `auth_required` →
  * `needs_login` (with the login action), any other failure → `degraded` with the message, success →
  * `active` (clearing the site's cache when it recovers from `needs_login`). `browser_unavailable`
  * leaves the status alone; the check is retried at the next run.
+ *
+ * "Check now" only: when the light check meets a block or captcha page and captcha attempts are on,
+ * one challenge attempt runs (a pool task, after the check's exclusive task ended) and the light
+ * check runs once more; the second result sets the status (with the captcha action when it is still
+ * blocked, and the solver's fixed message added to the failure message, so the site card shows why).
+ * Scheduled checks never attempt.
  */
 import { isServingStatus } from "../core/lifecycle.js";
 import type { Outcome, SiteLifecycleStatus } from "../core/models.js";
-import { errorToOutcome } from "../core/outcome.js";
+import { errorToOutcome, isFailureStatus } from "../core/outcome.js";
 import type { Clock } from "../ports/clock.js";
 import { systemClock } from "../ports/clock.js";
 import type { Logger } from "../ports/logger.js";
@@ -22,15 +29,37 @@ export interface HealthRegistry {
   recordHealthCheck(key: string, outcome: Outcome): Promise<RegisteredSite>;
 }
 
+/** A light check's outcome; `blocked` when it failed on a block or captcha page. */
+export interface HealthCheckOutcome extends Outcome {
+  /**
+   * The page the block was met on: a read's URL, else the page the adapter's session last showed (a
+   * search page); null when unknown (the attempt then targets the homepage).
+   */
+  blocked?: { url: string | null } | undefined;
+}
+
 /** Runs the light validation of one site and returns its outcome (`ok` or a failure). */
 export type HealthCheckFn = (
   key: string,
   options: { signal?: AbortSignal | undefined; ignoreCooldown: boolean },
-) => Promise<Outcome>;
+) => Promise<HealthCheckOutcome>;
+
+/** The challenge coordinator as "Check now" uses it (src/adapters/mcp/challenge.ts). */
+export interface HealthChallenges {
+  readonly enabled: boolean;
+  /**
+   * One attempt (or the site's running one); `ran` false when nothing could be done. `message` is the
+   * solver's fixed text (never page content), absent when no solver ran.
+   */
+  attempt(
+    key: string,
+    url: string | null,
+  ): Promise<{ ran: boolean; result?: string; action: string; message?: string | undefined }>;
+}
 
 export interface HealthCheckerOptions {
   registry: HealthRegistry;
-  scheduler: Pick<Scheduler, "isIdle" | "currentHolder" | "cooldownUntil">;
+  scheduler: Pick<Scheduler, "isIdle" | "holders" | "cooldownUntil">;
   check: HealthCheckFn;
   /** Time between checks of one site (`healthCheckIntervalSeconds`, default daily). */
   intervalMs: number;
@@ -40,6 +69,8 @@ export interface HealthCheckerOptions {
   initialDelayMs?: number | undefined;
   clock?: Clock | undefined;
   logger?: Logger | undefined;
+  /** Captcha attempts for "Check now"; absent → none. */
+  challenges?: HealthChallenges | undefined;
 }
 
 export interface HealthRunResult {
@@ -126,11 +157,11 @@ export class HealthChecker {
     if (this.running.has(key))
       return { site: key, ran: false, skipped: "a check is already running", status: site.status };
     if (!scheduler.isIdle(key)) {
-      const holder = scheduler.currentHolder(key);
+      const holders = scheduler.holders(key);
       return {
         site: key,
         ran: false,
-        skipped: `site busy${holder ? `: ${holder}` : ""}`,
+        skipped: `site busy${holders.length > 0 ? `: ${holders.join(", ")}` : ""}`,
         status: site.status,
       };
     }
@@ -139,12 +170,38 @@ export class HealthChecker {
     }
     this.running.add(key);
     try {
-      let outcome: Outcome;
-      try {
-        outcome = await this.options.check(key, { ignoreCooldown: onDemand });
-      } catch (error) {
-        outcome = errorToOutcome(error);
+      const check = async (): Promise<HealthCheckOutcome> => {
+        try {
+          return await this.options.check(key, { ignoreCooldown: onDemand });
+        } catch (error) {
+          return errorToOutcome(error);
+        }
+      };
+      let checked = await check();
+      const challenges = this.options.challenges;
+      if (onDemand && challenges?.enabled === true && isChallenge(checked)) {
+        // The check's exclusive task has ended; the attempt is a pool task of the site.
+        const report = await challenges.attempt(key, checked.blocked?.url ?? null);
+        if (report.ran) checked = await check();
+        logger?.info("check now captcha attempt", {
+          site: key,
+          attempt: report.result ?? null,
+          rechecked: report.ran,
+          outcome: checked.status,
+          message: report.message ?? null,
+        });
+        if (!report.ran || isChallenge(checked)) {
+          const detail = report.result === "solved" ? undefined : report.message;
+          checked = {
+            ...checked,
+            action: report.action,
+            ...(detail !== undefined && detail !== ""
+              ? { message: `${checked.message ?? checked.status} (captcha attempt: ${detail})` }
+              : {}),
+          };
+        }
       }
+      const outcome = withoutBlocked(checked);
       const after = await registry.recordHealthCheck(key, outcome);
       logger?.info("health check finished", {
         site: key,
@@ -170,4 +227,16 @@ export class HealthChecker {
     }, delayMs);
     this.timer.unref?.();
   }
+}
+
+/** A blocked failure the solver may help with; a throttle page (`rate_limited`) is left alone. */
+function isChallenge(outcome: HealthCheckOutcome): boolean {
+  return (
+    outcome.blocked !== undefined && isFailureStatus(outcome.status) && outcome.status !== "rate_limited"
+  );
+}
+
+function withoutBlocked(outcome: HealthCheckOutcome): Outcome {
+  const { blocked: _blocked, ...rest } = outcome;
+  return rest;
 }

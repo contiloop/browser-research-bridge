@@ -13,7 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { inspect, parseEnv } from "node:util";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { createSettingsStore } from "./settings.js";
+import { copyPassphraseToClipboard, createSettingsStore, previewCaptchaAuto } from "./settings.js";
 
 const GOOD = "correct horse battery";
 const TUNNEL = `tunnel_${"0f".repeat(16)}`;
@@ -111,6 +111,148 @@ describe("settings store", () => {
       expect(s.read().helperRuntime.value).toBe("auto");
       writeConfig(JSON.stringify({ onboarding: { runtime: "claude" } }));
       expect(s.read().helperRuntime.value).toBe("claude");
+    });
+
+    it("reports captcha.auto as captchaAuto: the default true, the stored boolean, or null", () => {
+      const s = store();
+      expect(s.read().captchaAuto).toEqual({ value: true });
+      writeConfig(JSON.stringify({ captcha: {} }));
+      expect(s.read().captchaAuto).toEqual({ value: true });
+      writeConfig(JSON.stringify({ captcha: { auto: false } }));
+      expect(s.read().captchaAuto).toEqual({ value: false });
+      for (const bad of ['{ "captcha": { "auto": "false" } }', '{ "captcha": true }', "{ broken"]) {
+        writeConfig(bad);
+        expect(s.read().captchaAuto, bad).toEqual({ value: null });
+      }
+    });
+  });
+
+  describe("captchaAuto preview (PUT settings, before anything is written)", () => {
+    const base = { ok: true as const, changed: [] };
+
+    it("adds captchaAuto to the changed fields only when the stored value differs", () => {
+      const s = store();
+      expect(previewCaptchaAuto(s.read(), { captchaAuto: true }, base)).toEqual({ ok: true, changed: [] });
+      expect(previewCaptchaAuto(s.read(), { captchaAuto: false }, base)).toEqual({
+        ok: true,
+        changed: ["captchaAuto"],
+      });
+      writeConfig(JSON.stringify({ captcha: { auto: false } }));
+      expect(previewCaptchaAuto(s.read(), { captchaAuto: false }, base)).toEqual({ ok: true, changed: [] });
+      expect(
+        previewCaptchaAuto(s.read(), { captchaAuto: true }, { ok: true, changed: ["helperRuntime"] }),
+      ).toEqual({ ok: true, changed: ["helperRuntime", "captchaAuto"] });
+      // Without captchaAuto in the change, the base preview stands as it is.
+      expect(previewCaptchaAuto(s.read(), { helperRuntime: "claude" }, base)).toBe(base);
+    });
+
+    it("keeps an earlier refusal, refuses a non-boolean, and an unreadable config file", () => {
+      const s = store();
+      const locked = {
+        ok: false as const,
+        error: "locked" as const,
+        fields: { passphrase: "locked" as const },
+        message: "passphrase is set outside the settings files",
+      };
+      expect(previewCaptchaAuto(s.read(), { captchaAuto: false }, locked)).toBe(locked);
+      expect(previewCaptchaAuto(s.read(), { captchaAuto: "no" as unknown as boolean }, base)).toMatchObject({
+        ok: false,
+        error: "invalid",
+        fields: { captchaAuto: "bad_value" },
+      });
+      writeConfig("{ broken");
+      expect(previewCaptchaAuto(s.read(), { captchaAuto: false }, base)).toMatchObject({
+        ok: false,
+        error: "file_unreadable",
+        message: expect.stringContaining(configFile) as string,
+      });
+    });
+  });
+
+  describe("copyPassphraseToClipboard", () => {
+    /** A fake `pbcopy`: records its argument count, environment, and standard input. */
+    const fakePbcopy = (exitCode = 0): { command: string; out: string; args: string; env: string } => {
+      const dir = join(root, "clip");
+      mkdirSync(dir, { recursive: true });
+      const paths = {
+        command: join(dir, "pbcopy"),
+        out: join(dir, "out"),
+        args: join(dir, "args"),
+        env: join(dir, "env"),
+      };
+      writeFileSync(
+        paths.command,
+        [
+          "#!/bin/sh",
+          `printf '%s' "$#" > '${paths.args}'`,
+          `env > '${paths.env}'`,
+          `cat > '${paths.out}'`,
+          `exit ${exitCode}`,
+          "",
+        ].join("\n"),
+        { mode: 0o755 },
+      );
+      return paths;
+    };
+    const SECRET = `비밀 'quoted' "double" # passphrase ünï`;
+
+    it("pipes the .env passphrase to pbcopy's standard input, never as an argument or in its environment", async () => {
+      const writer = store();
+      expect(await writer.write({ passphrase: SECRET })).toMatchObject({ ok: true });
+      // As if started with --env-file: the process environment holds the file's value.
+      const s = store({ BRIDGE_PASSPHRASE: SECRET, ANTHROPIC_API_KEY: "sk-ant-x" });
+      const fake = fakePbcopy();
+      expect(await copyPassphraseToClipboard({ store: s, command: fake.command })).toBe("ok");
+      expect(readFileSync(fake.out, "utf8")).toBe(SECRET);
+      expect(readFileSync(fake.args, "utf8")).toBe("0");
+      const env = readFileSync(fake.env, "utf8");
+      expect(env).not.toContain(SECRET);
+      expect(env).not.toContain("BRIDGE_");
+      expect(env).not.toContain("sk-ant-x");
+      expect(env).toContain("UTF-8");
+    });
+
+    it("works in setup mode too (the core is not involved) and copies the value saved since start", async () => {
+      const s = store();
+      writeEnv("BRIDGE_PASSPHRASE=short\n");
+      const fake = fakePbcopy();
+      expect(await copyPassphraseToClipboard({ store: s, command: fake.command })).toBe("not_set");
+      expect(existsSync(fake.out)).toBe(false);
+      expect(await s.write({ passphrase: GOOD })).toMatchObject({ ok: true });
+      expect(await copyPassphraseToClipboard({ store: s, command: fake.command })).toBe("ok");
+      expect(readFileSync(fake.out, "utf8")).toBe(GOOD);
+    });
+
+    it("not_set: no passphrase anywhere", async () => {
+      const fake = fakePbcopy();
+      expect(await copyPassphraseToClipboard({ store: store(), command: fake.command })).toBe("not_set");
+      writeEnv("BRIDGE_PASSPHRASE=\n");
+      expect(await copyPassphraseToClipboard({ store: store(), command: fake.command })).toBe("not_set");
+      expect(existsSync(fake.out)).toBe(false);
+    });
+
+    it("locked: a passphrase set outside .env is refused and pbcopy is not run", async () => {
+      writeEnv(`BRIDGE_PASSPHRASE='${GOOD}'\n`);
+      const fake = fakePbcopy();
+      const s = store({ BRIDGE_PASSPHRASE: "set by the service definition" });
+      expect(await copyPassphraseToClipboard({ store: s, command: fake.command })).toBe("locked");
+      expect(existsSync(fake.out)).toBe(false);
+    });
+
+    it("unavailable: pbcopy missing, failing, or hanging", async () => {
+      writeEnv(`BRIDGE_PASSPHRASE='${GOOD}'\n`);
+      const s = store();
+      expect(await copyPassphraseToClipboard({ store: s, command: join(root, "no-such-pbcopy") })).toBe(
+        "unavailable",
+      );
+      expect(await copyPassphraseToClipboard({ store: s, command: fakePbcopy(1).command })).toBe(
+        "unavailable",
+      );
+      const hanging = join(root, "hang");
+      writeFileSync(hanging, "#!/bin/sh\nexec sleep 30\n", { mode: 0o755 });
+      expect(await copyPassphraseToClipboard({ store: s, command: hanging, timeoutMs: 200 })).toBe(
+        "unavailable",
+      );
     });
   });
 
@@ -324,6 +466,58 @@ describe("settings store", () => {
       expect(readFileSync(configFile, "utf8")).toBe(
         '{\n  "oauth": { "extraResources": ["https://keep.example/mcp"] },\n  "chatgpt": null\n}\n',
       );
+    });
+
+    it("writes captchaAuto as a boolean under captcha.auto, in place", async () => {
+      const example = readFileSync(join(import.meta.dirname, "../../config/bridge.example.json"), "utf8");
+      writeConfig(example);
+      const s = store();
+      expect(await s.write({ captchaAuto: true })).toEqual({ ok: true, changed: [] });
+      expect(await s.write({ captchaAuto: false })).toEqual({ ok: true, changed: ["captchaAuto"] });
+      expect(readFileSync(configFile, "utf8")).toBe(
+        example.replace('"captcha": { "auto": true }', '"captcha": { "auto": false }'),
+      );
+      const loaded = s.loadConfig();
+      expect(loaded.ok).toBe(false); // no passphrase here; the file itself must still be valid
+      writeEnv(`BRIDGE_PASSPHRASE='${GOOD}'\n`);
+      const withPassphrase = s.loadConfig();
+      expect(withPassphrase.ok && withPassphrase.config.captcha).toEqual({ auto: false });
+      expect(await s.write({ captchaAuto: false })).toEqual({ ok: true, changed: [] });
+    });
+
+    it("adds captcha.auto to a file without it and treats a missing value as the default true", async () => {
+      const s = store();
+      expect(await s.write({ captchaAuto: true })).toEqual({ ok: true, changed: [] });
+      expect(existsSync(configFile)).toBe(false);
+      writeConfig('{\n  "asideAccount": "u1"\n}\n');
+      expect(await s.write({ captchaAuto: false })).toEqual({ ok: true, changed: ["captchaAuto"] });
+      expect(JSON.parse(readFileSync(configFile, "utf8"))).toEqual({
+        asideAccount: "u1",
+        captcha: { auto: false },
+      });
+      expect(readFileSync(configFile, "utf8").startsWith('{\n  "asideAccount": "u1",')).toBe(true);
+    });
+
+    it("refuses a captchaAuto that is not a boolean and writes nothing", async () => {
+      const s = store();
+      for (const bad of ["true", 1, null]) {
+        expect(await s.write({ captchaAuto: bad as unknown as boolean })).toMatchObject({
+          ok: false,
+          error: "invalid",
+          fields: { captchaAuto: "bad_value" },
+        });
+      }
+      expect(existsSync(configFile)).toBe(false);
+    });
+
+    it("refuses a captchaAuto change to an unreadable config file", async () => {
+      writeConfig("{ broken");
+      expect(await store().write({ captchaAuto: false })).toMatchObject({
+        ok: false,
+        error: "file_unreadable",
+        file: configFile,
+      });
+      expect(readFileSync(configFile, "utf8")).toBe("{ broken");
     });
 
     it("does nothing when no value changes", async () => {

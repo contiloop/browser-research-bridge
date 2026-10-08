@@ -6,6 +6,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
+  challengeAttempt,
   fakeBrowser,
   makeTempDir,
   manifestFor,
@@ -48,12 +49,26 @@ export default {
 `;
 }
 
+/** An adapter whose read (or search) meets a captcha page. */
+function blockedAdapter(where: "read" | "search"): string {
+  const blocked = '{ status: "access_denied", message: "captcha page", blocked: true }';
+  return `export default {
+  async search() {
+    ${where === "search" ? `return { results: [], nextCursor: null, ...${blocked} };` : 'return { results: [{ title: "Story 1", url: "https://demo.example.com/s/1", publishedAt: null, datePrecision: null, excerpt: null, author: null }], nextCursor: null, status: "ok" };'}
+  },
+  async read() { return ${blocked}; },
+  async smokeTest() { return { status: "ok" }; },
+};
+`;
+}
+
 describe("SiteValidator", () => {
   let tmp: { dir: string; cleanup: () => Promise<void> };
   let sitesDir: string;
   let browser: FakeBrowser;
   let scheduler: InMemoryScheduler;
   let holders: string[];
+  let exclusives: boolean[];
 
   const validator = (owner: (h: string) => string | null = () => null) =>
     new SiteValidator({
@@ -72,9 +87,11 @@ describe("SiteValidator", () => {
     browser = fakeBrowser();
     scheduler = new InMemoryScheduler();
     holders = [];
+    exclusives = [];
     const run = scheduler.runForSite.bind(scheduler);
     scheduler.runForSite = (options, task) => {
       holders.push(options.holder);
+      exclusives.push(options.exclusive === true);
       return run(options, task);
     };
   });
@@ -101,6 +118,9 @@ describe("SiteValidator", () => {
     expect(browser.scopes[0]?.lease).toBeDefined();
     expect(browser.disposed).toBe(browser.scopes.length);
     expect(new Set(holders)).toEqual(new Set(["validation"]));
+    // Real-site validation holds the site alone (exclusive).
+    expect(exclusives.length).toBeGreaterThan(0);
+    expect(exclusives.every((x) => x)).toBe(true);
   });
 
   it("full validation respects the site's cool-down unless the caller passes ignoreCooldown", async () => {
@@ -167,6 +187,9 @@ describe("SiteValidator", () => {
     expect(report.passed).toBe(true);
     expect(report.steps.map((s) => s.name)).toEqual(["search", "read"]);
     expect(new Set(holders)).toEqual(new Set(["health check"]));
+    // A health check holds the site alone (exclusive), like full validation.
+    expect(exclusives.length).toBeGreaterThan(0);
+    expect(exclusives.every((x) => x)).toBe(true);
     expect(await readFile(join(dir, "validation.json"), "utf8")).toBe(before);
     expect(await lightCheck(validator())("demo", { ignoreCooldown: true })).toEqual({ status: "ok" });
   });
@@ -175,5 +198,58 @@ describe("SiteValidator", () => {
     const report = await validator().full("../escape");
     expect(report.passed).toBe(false);
     expect(report.failure?.message).toContain("invalid site key");
+  });
+
+  it("light form reports a blocked search on the page the adapter's session last showed (its search page)", async () => {
+    await writeAdapterFolder(join(sitesDir, "other"), "other", {
+      manifest: manifestFor("other", { hostnames: ["other.example.com"] }),
+      adapter: blockedAdapter("search"),
+    });
+    browser.lastUrls.set("other", "https://other.example.com/search?q=sample");
+    expect(await lightCheck(validator())("other", {})).toMatchObject({
+      status: "access_denied",
+      blocked: { url: "https://other.example.com/search?q=sample" },
+    });
+  });
+
+  it("light form reports the block page it met (read: its URL; search: none) for Check now", async () => {
+    await writeAdapterFolder(join(sitesDir, "demo"), "demo", {
+      manifest: manifestFor("demo", { hostnames: ["demo.example.com"] }),
+      adapter: blockedAdapter("read"),
+    });
+    const seen: { url: string | null }[] = [];
+    const report = await validator().light("demo", { onBlocked: (b) => seen.push(b) });
+    expect(report.passed).toBe(false);
+    expect(report.failure).toMatchObject({ step: "read", status: "access_denied" });
+    expect(seen).toEqual([{ url: "https://demo.example.com/s/1" }]);
+    expect(await lightCheck(validator())("demo", { ignoreCooldown: true })).toEqual({
+      status: "access_denied",
+      message: expect.stringContaining("captcha page") as string,
+      blocked: { url: "https://demo.example.com/s/1" },
+    });
+
+    await writeAdapterFolder(join(sitesDir, "other"), "other", {
+      manifest: manifestFor("other", { hostnames: ["other.example.com"] }),
+      adapter: blockedAdapter("search"),
+    });
+    expect(await lightCheck(validator())("other", {})).toMatchObject({
+      status: "access_denied",
+      blocked: { url: null },
+    });
+  });
+
+  it("validation never attempts a captcha (full form on a blocked adapter)", async () => {
+    browser = fakeBrowser({ solveChallenge: async () => challengeAttempt() });
+    const staging = join(sitesDir, "demo", ".staging");
+    await writeAdapterFolder(staging, "demo", {
+      manifest: manifestFor("demo", { hostnames: ["demo.example.com"] }),
+      adapter: blockedAdapter("read"),
+      validated: false,
+    });
+    const report = await validator().full("demo", { staging: true });
+    expect(report.passed).toBe(false);
+    expect(report.failure).toMatchObject({ step: "read", status: "access_denied" });
+    expect(browser.challenges).toEqual([]);
+    expect(holders.includes("captcha")).toBe(false);
   });
 });

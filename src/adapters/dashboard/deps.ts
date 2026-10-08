@@ -3,7 +3,7 @@
  * admin app depends only on these operations and tests can pass fakes; `bridge.services` satisfies
  * it structurally.
  */
-import type { HelperRuntimeId, OnboardingJobService } from "../onboarding/index.js";
+import type { HelperCheckResult, HelperRuntimeId, OnboardingJobService } from "../onboarding/index.js";
 import type { OAuthServer } from "../oauth/index.js";
 import type { RegistrySite } from "../registry/index.js";
 import type { BrowserPort } from "../../ports/browser.js";
@@ -69,7 +69,30 @@ export interface PageSettingsChange {
   passphrase?: string;
   helperRuntime?: string;
   asideAccount?: string;
+  /** `captcha.auto` in `config/bridge.json`. */
+  captchaAuto?: boolean;
 }
+
+/**
+ * The last helper check of this install, kept outside the core (src/app: `data/helper-check.json`),
+ * shared by `POST helper/check` and the automatic check after a core start.
+ */
+export interface HelperCheckLog {
+  /** The last recorded check, or null. No model call. */
+  last(): Promise<HelperCheckResult | null>;
+  /**
+   * Runs one check on this core's job service (one model call; a check already in progress on the
+   * same core is shared), records it, and logs metadata only.
+   */
+  run(jobs: Pick<DashboardDeps["jobs"], "helperCheck">): Promise<HelperCheckResult>;
+}
+
+/**
+ * What "Copy passphrase" did: the stored passphrase was put on this Mac's clipboard (`ok`), there is
+ * no valid passphrase (`not_set`), it is set outside `.env` (`locked`), or the clipboard tool is
+ * missing or failed (`unavailable`). Never the value itself.
+ */
+export type PassphraseClipboardResult = "ok" | "not_set" | "locked" | "unavailable";
 
 /**
  * What a `PUT settings` would do, worked out before anything is written: refused (`locked`,
@@ -130,6 +153,13 @@ export interface DashboardSource {
   settingsPage?: SettingsPageSupport | undefined;
   /** The ChatGPT connection service; null or absent when no connection tool is wired. */
   chatgpt?: DashboardChatgpt | null | undefined;
+  /** The persisted last helper check; absent → kept in memory for the life of the page (tests). */
+  helperChecks?: HelperCheckLog | undefined;
+  /**
+   * "Copy passphrase": puts the stored passphrase on this Mac's clipboard from the server process
+   * and answers only what happened. Works whether or not the core runs.
+   */
+  copyPassphrase?: (() => Promise<PassphraseClipboardResult>) | undefined;
 }
 
 /** The core is off; routes that need it answer 503 `not_running`. */

@@ -117,6 +117,29 @@ pre {
   top: 0;
 }
 
+/* Read by screen readers, not shown (a label whose heading is already visible). */
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+
+.status-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.note {
+  padding: 8px 12px;
+  border-left: 3px solid var(--border);
+  color: var(--muted);
+}
+
 /* ---------------------------------------------------------------- header, status, tabs */
 
 .top {
@@ -279,6 +302,38 @@ pre {
 .badge-unknown {
   color: var(--muted);
   background: var(--code-bg);
+}
+
+/* ---------------------------------------------------------------- Getting started: what to do next */
+
+.next {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px 16px;
+  padding: 16px 18px;
+  margin: 8px 0 16px;
+  background: var(--accent-soft);
+  border: 1px solid var(--accent);
+  border-radius: var(--radius);
+}
+
+.next.is-done {
+  background: var(--good-soft);
+  border-color: var(--good);
+}
+
+.next p {
+  margin: 0;
+}
+
+.next-text {
+  flex: 1 1 320px;
+  font-size: 1.05em;
+}
+
+.next-label {
+  color: var(--accent);
 }
 
 /* ---------------------------------------------------------------- Getting started steps */
@@ -494,6 +549,26 @@ button:disabled {
 
 .details[open] > summary {
   margin-bottom: 8px;
+}
+
+/* "More": background that is not needed to act. */
+.more {
+  margin: 0 0 8px;
+}
+
+.more > summary {
+  color: var(--accent);
+  font-size: 0.88em;
+}
+
+.switch-row input[type="checkbox"] {
+  width: 18px;
+  height: 18px;
+  accent-color: var(--accent);
+}
+
+.switch-row button {
+  margin-left: auto;
 }
 
 .facts {

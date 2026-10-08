@@ -3,10 +3,13 @@
  * checks the manifest and hostname ownership, runs the static check before importing any adapter
  * code, imports the adapter, and drives the validation core through the scheduler and the browser
  * port. The full form writes `validation.json` into the validated folder; the light form (health
- * check) only returns its report, so a failed health check never makes a site unloadable.
+ * check) only returns its report, so a failed health check never makes a site unloadable. Neither form
+ * attempts a captcha; the light form only tells its caller where it met a block page (`onBlocked`).
  */
 import { join } from "node:path";
+import { isFailureStatus } from "../../core/outcome.js";
 import { isValidSiteKey } from "../../core/site-key.js";
+import type { AdapterContext, SiteAdapter } from "../../ports/adapter.js";
 import type { Clock } from "../../ports/clock.js";
 import { systemClock } from "../../ports/clock.js";
 import type { Logger } from "../../ports/logger.js";
@@ -66,6 +69,53 @@ export interface LightValidationOptions {
   signal?: AbortSignal | undefined;
   /** Run even while the site cools down (user-initiated "Check now"). */
   ignoreCooldown?: boolean | undefined;
+  /**
+   * Told when a step fails on a block or captcha page (the adapter's `blocked: true` with a failure
+   * status): `url` is the read's page, else the page the adapter's browser session last showed (the
+   * search page), null when it showed none. "Check now" uses it to run one challenge attempt; the
+   * report itself is unchanged.
+   */
+  onBlocked?: ((block: LightBlock) => void) | undefined;
+}
+
+/** Where the light check met a block or captcha page. */
+export interface LightBlock {
+  url: string | null;
+}
+
+function isBlockedFailure(response: unknown): boolean {
+  if (typeof response !== "object" || response === null) return false;
+  const r = response as { blocked?: unknown; status?: unknown };
+  return r.blocked === true && isFailureStatus(r.status);
+}
+
+/** The page the adapter's browser session last showed, or null. */
+function sessionPage(ctx: AdapterContext): string | null {
+  try {
+    return ctx.browser.lastUrl();
+  } catch {
+    return null;
+  }
+}
+
+/** The adapter with its search and read watched for block pages (methods otherwise unchanged). */
+function observeBlocks(adapter: SiteAdapter, onBlocked: (block: LightBlock) => void): SiteAdapter {
+  const observed: SiteAdapter = {
+    search: async (request, ctx) => {
+      const response = await adapter.search(request, ctx);
+      if (isBlockedFailure(response)) onBlocked({ url: sessionPage(ctx) });
+      return response;
+    },
+    read: async (ref, ctx) => {
+      const response = await adapter.read(ref, ctx);
+      if (isBlockedFailure(response)) onBlocked({ url: ref.url ?? sessionPage(ctx) });
+      return response;
+    },
+    smokeTest: (ctx) => adapter.smokeTest(ctx),
+  };
+  if (adapter.canonicalize) observed.canonicalize = (url) => adapter.canonicalize!(url);
+  if (adapter.checkCompleteness) observed.checkCompleteness = (page) => adapter.checkCompleteness!(page);
+  return observed;
 }
 
 export class SiteValidator {
@@ -144,12 +194,19 @@ export class SiteValidator {
       });
     }
     const site = { key, manifest: loaded.manifest };
+    // A health check holds the site alone, so its verdict is not mixed with concurrent tool calls.
     const runner: ValidationRunner = {
       step: (_label, budgetMs, fn) =>
         runAdapterTask(
           this.options.runtime,
           site,
-          { holder: "health check", budgetMs, signal: opts.signal, ignoreCooldown: opts.ignoreCooldown },
+          {
+            holder: "health check",
+            budgetMs,
+            signal: opts.signal,
+            ignoreCooldown: opts.ignoreCooldown,
+            exclusive: true,
+          },
           fn,
         ),
     };
@@ -158,7 +215,7 @@ export class SiteValidator {
       key,
       target: "live",
       manifest: loaded.manifest,
-      adapter: loaded.adapter,
+      adapter: opts.onBlocked ? observeBlocks(loaded.adapter, opts.onBlocked) : loaded.adapter,
       runner,
       clock: this.clock,
       smokeBudgetMs: this.options.smokeBudgetMs,
@@ -232,12 +289,13 @@ export class SiteValidator {
     }
 
     const site = { key, manifest };
+    // Real-site validation (site:validate, the promotion gate, run_validation) holds the site alone.
     const runner: ValidationRunner = {
       step: (_label, budgetMs, fn) =>
         runAdapterTask(
           this.options.runtime,
           site,
-          { holder: "validation", budgetMs, signal, ignoreCooldown },
+          { holder: "validation", budgetMs, signal, ignoreCooldown, exclusive: true },
           fn,
         ),
     };

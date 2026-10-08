@@ -135,6 +135,74 @@ describe("loadConfig", () => {
       runtime: "auto",
       codexModel: null,
     });
+    expect(fromExample.captcha).toEqual({ auto: true });
+  });
+
+  it("has the browser pool and captcha tunables with their defaults, and no maxConcurrentSites", () => {
+    expect(DEFAULT_TUNABLES).toMatchObject({
+      maxConcurrentPerSite: 3,
+      maxConcurrentTasks: 8,
+      concurrentStaggerMs: 500,
+      captchaAttemptBudgetMs: 45_000,
+      captchaInlineMinRemainingMs: 40_000,
+      captchaRerunReserveMs: 15_000,
+      coolDownSeconds: 600,
+      warmTabTtlSeconds: 300,
+    });
+    expect(Object.keys(DEFAULT_TUNABLES)).not.toContain("maxConcurrentSites");
+    writeJson({ tunables: { maxConcurrentPerSite: 2, maxConcurrentTasks: 5, concurrentStaggerMs: 250 } });
+    const config = loadConfig({ rootDir: root, env: { BRIDGE_PASSPHRASE: GOOD } });
+    expect(config.tunables).toMatchObject({
+      maxConcurrentPerSite: 2,
+      maxConcurrentTasks: 5,
+      concurrentStaggerMs: 250,
+    });
+    expect(config.warnings).toEqual([]);
+    writeJson({ tunables: { maxConcurrentPerSite: 0 } });
+    expect(() => loadConfig({ rootDir: root, env: { BRIDGE_PASSPHRASE: GOOD } })).toThrow(
+      /maxConcurrentPerSite must be a positive number/,
+    );
+  });
+
+  it("allows concurrentStaggerMs: 0 (no stagger) but no negative value; every other tunable stays positive", () => {
+    writeJson({ tunables: { concurrentStaggerMs: 0 } });
+    const config = loadConfig({ rootDir: root, env: { BRIDGE_PASSPHRASE: GOOD } });
+    expect(config.tunables.concurrentStaggerMs).toBe(0);
+    expect(config.warnings).toEqual([]);
+    writeJson({ tunables: { concurrentStaggerMs: -1 } });
+    expect(() => loadConfig({ rootDir: root, env: { BRIDGE_PASSPHRASE: GOOD } })).toThrow(
+      /concurrentStaggerMs must be a non-negative number/,
+    );
+    for (const key of Object.keys(DEFAULT_TUNABLES).filter((k) => k !== "concurrentStaggerMs")) {
+      writeJson({ tunables: { [key]: 0 } });
+      expect(() => loadConfig({ rootDir: root, env: { BRIDGE_PASSPHRASE: GOOD } }), key).toThrow(
+        new RegExp(`${key} must be a positive number`),
+      );
+    }
+  });
+
+  it("warns about and ignores an existing maxConcurrentSites value", () => {
+    writeJson({ tunables: { maxConcurrentSites: 4 } });
+    const config = loadConfig({ rootDir: root, env: { BRIDGE_PASSPHRASE: GOOD } });
+    expect(config.warnings).toEqual(['unknown tunable "maxConcurrentSites" ignored']);
+    expect(config.tunables).toEqual(DEFAULT_TUNABLES);
+    expect(Object.keys(config.tunables)).not.toContain("maxConcurrentSites");
+  });
+
+  it("loads captcha.auto (default true) from the config file only and validates it", () => {
+    expect(loadConfig({ rootDir: root, env: { BRIDGE_PASSPHRASE: GOOD } }).captcha).toEqual({ auto: true });
+    writeJson({ captcha: { auto: false } });
+    const off = loadConfig({ rootDir: root, env: { BRIDGE_PASSPHRASE: GOOD, BRIDGE_CAPTCHA_AUTO: "true" } });
+    expect(off.captcha).toEqual({ auto: false });
+    expect(off.warnings).toEqual([]);
+    writeJson({ captcha: {} });
+    expect(loadConfig({ rootDir: root, env: { BRIDGE_PASSPHRASE: GOOD } }).captcha).toEqual({ auto: true });
+    for (const bad of [{ auto: "yes" }, { auto: null }, { auto: 1 }]) {
+      writeJson({ captcha: bad });
+      expect(() => loadConfig({ rootDir: root, env: { BRIDGE_PASSPHRASE: GOOD } })).toThrow(/captcha\.auto/);
+    }
+    writeJson({ captcha: true });
+    expect(() => loadConfig({ rootDir: root, env: { BRIDGE_PASSPHRASE: GOOD } })).toThrow(/captcha/);
   });
 
   it("loads the helper runtime, Codex model, and tool locations with defaults", () => {

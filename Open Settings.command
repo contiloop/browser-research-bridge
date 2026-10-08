@@ -1,23 +1,27 @@
 #!/bin/bash
 # Open Settings.command: double-click in Finder to open the Browser Research Bridge settings page.
 #
-# In order: checks Node.js >= 24; if the settings page already answers, only opens it; otherwise
-# installs the dependencies (first time), creates .env and config/bridge.json from the examples,
-# registers the background service once (after one confirmation) with ops/install-launchd.sh --bridge
-# or starts it when it is registered but not running, waits for the page, and opens it signed in in
-# the default browser. Messages are shown in Korean and English.
+# In order: checks Node.js >= 24; checks the clone's upstream for a newer version and, after the
+# user's Enter, updates (git pull --ff-only, npm ci, ops/install-launchd.sh --bridge; see
+# ops/update-check.sh); if the settings page already answers, only opens it; otherwise installs the
+# dependencies (first time), creates .env and config/bridge.json from the examples, registers the
+# background service once (after one confirmation) with ops/install-launchd.sh --bridge or starts it
+# when it is registered but not running, waits for the page, and opens it signed in in the default
+# browser. Messages are shown in Korean and English.
 #
-# The admin token in <data>/admin-token is read only to build the link handed to `open`; it is never
-# printed. The program is controlled only through launchctl and the label below, never by matching
-# its command line (docs/engineering-notes.md). macOS only; runs under the system bash 3.2.
+# The admin token in <data>/admin-token is read only to build the link handed to `open` and the
+# update check's cookie exchange with the page; it is never printed. The program is controlled only
+# through launchctl and the label below or the installer, never by matching its command line
+# (docs/engineering-notes.md). macOS only; runs under the system bash 3.2.
 set -uo pipefail
 
 LABEL="com.browser-research-bridge"
 WAIT_SECONDS=150
 
 say() { printf '%s\n%s\n\n' "$1" "$2"; }
+# fail [<korean> <english>]: the message (when given), then the closing line; ends with status 1.
 fail() {
-  say "$1" "$2"
+  [[ $# -ge 2 ]] && say "$1" "$2"
   say "이 창은 닫아도 됩니다." "You can close this window."
   exit 1
 }
@@ -48,6 +52,8 @@ fi
 NODE="$BRB_NODE"
 NODE_DIR="$(dirname "$NODE")"
 export PATH="$NODE_DIR:$PATH"
+NPM="$NODE_DIR/npm"
+[[ -x "$NPM" ]] || NPM="$(command -v npm || true)"
 
 # Settings-page port and data folder, resolved like the bridge does: .env, else config/bridge.json,
 # else the built-in defaults (8788, data). A value that is missing or invalid falls through.
@@ -87,15 +93,56 @@ page_answers() {
   [[ -n "$code" && "$code" != "000" ]]
 }
 
+# The background service's registration: sets `loaded` (label loaded: 1/0), `registered_dir` (the
+# plist's WorkingDirectory, physical path, empty when unknown), and `service`: none (not registered),
+# here (registered for this folder), other (registered for another folder, or loaded without a plist).
+read_registration() {
+  loaded=0
+  launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1 && loaded=1
+  registered_dir=""
+  if [[ -f "$PLIST" ]]; then
+    registered_dir="$(plutil -extract WorkingDirectory raw -o - "$PLIST" 2>/dev/null || true)"
+    [[ -n "$registered_dir" && -d "$registered_dir" ]] && registered_dir="$(cd "$registered_dir" && pwd -P)"
+  fi
+  if [[ $loaded -eq 0 && ! -f "$PLIST" ]]; then
+    service=none
+  elif [[ "$registered_dir" == "$REPO_DIR" ]]; then
+    service=here
+  else
+    service=other
+  fi
+}
+
 # ---------------------------------------------------------------- 2. already running?
 read_settings
-if page_answers; then
+running=0
+page_answers && running=1
+
+# ---------------------------------------------------------------- 3. newer version?
+# Only when the background service is this folder's, or not registered and the program not running
+# (a program started by hand is its developer's to update); a service registered for another folder
+# is never touched. Silent when there is nothing to offer (no clone, no upstream, no network).
+# shellcheck source=ops/update-check.sh
+. "$REPO_DIR/ops/update-check.sh"
+read_registration
+restarted_by_update=0
+if [[ -n "$NPM" ]] && [[ "$service" == here || ("$service" == none && $running -eq 0) ]]; then
+  brb_update_offer "$REPO_DIR" "$service" "$running" "$ADMIN_PORT" "$TOKEN_FILE" "$NPM"
+  case "$BRB_UPDATE_RESULT" in
+    updated) [[ "$service" == here ]] && restarted_by_update=1 ;;
+    # A failed pull changed nothing: open the current version. After a failed npm ci or installer
+    # the message says to double-click again (the update stays pending).
+    failed) [[ "$BRB_UPDATE_STEP" == pull ]] || fail ;;
+  esac
+fi
+
+if [[ $restarted_by_update -eq 1 ]]; then
+  : # the installer restarted the service with the new version; wait for its page below
+elif [[ $running -eq 1 ]]; then
   say "프로그램이 이미 실행 중입니다. 설정 페이지를 엽니다." "The program is already running. Opening the settings page."
 else
-  # -------------------------------------------------------------- 3. dependencies
+  # -------------------------------------------------------------- 4. dependencies
   if [[ ! -f "$REPO_DIR/node_modules/tsx/dist/cli.mjs" ]]; then
-    NPM="$NODE_DIR/npm"
-    [[ -x "$NPM" ]] || NPM="$(command -v npm || true)"
     [[ -n "$NPM" ]] || fail "npm을 찾지 못했습니다. Node.js를 https://nodejs.org/ 에서 다시 설치하세요." \
       "npm was not found. Reinstall Node.js from https://nodejs.org/."
     say "필요한 구성 요소를 설치합니다(처음 한 번). 몇 분 걸릴 수 있습니다." \
@@ -113,7 +160,7 @@ else
     echo
   fi
 
-  # -------------------------------------------------------------- 4. settings files
+  # -------------------------------------------------------------- 5. settings files
   if [[ ! -f "$REPO_DIR/.env" ]]; then
     (umask 077 && cp "$REPO_DIR/.env.example" "$REPO_DIR/.env") ||
       fail ".env 파일을 만들지 못했습니다." "Could not create the .env file."
@@ -127,10 +174,9 @@ else
   fi
   read_settings
 
-  # -------------------------------------------------------------- 5. background service
-  loaded=0
-  launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1 && loaded=1
-  if [[ $loaded -eq 0 && ! -f "$PLIST" ]]; then
+  # -------------------------------------------------------------- 6. background service
+  read_registration
+  if [[ "$service" == none ]]; then
     say "이 프로그램을 백그라운드 서비스로 등록합니다. 로그인할 때마다 자동으로 시작되어 백그라운드에서 실행됩니다." \
       "This registers the program as a background service: it will start at every login and run in the background."
     say "계속하려면 Enter 키를 누르세요. 취소하려면 이 창을 닫으세요." \
@@ -144,12 +190,7 @@ else
     echo
   else
     # Registered already (by the installer or by hand): only check that it is this folder's, then start it.
-    registered_dir=""
-    if [[ -f "$PLIST" ]]; then
-      registered_dir="$(plutil -extract WorkingDirectory raw -o - "$PLIST" 2>/dev/null || true)"
-      [[ -n "$registered_dir" && -d "$registered_dir" ]] && registered_dir="$(cd "$registered_dir" && pwd -P)"
-    fi
-    if [[ "$registered_dir" != "$REPO_DIR" ]]; then
+    if [[ "$service" != here ]]; then
       fail "백그라운드 서비스가 다른 폴더(${registered_dir:-알 수 없음})용으로 등록되어 있어 그대로 두었습니다. 이 폴더($REPO_DIR)로 옮기려면 이 폴더에서 ops/install-launchd.sh --bridge 를 실행하세요." \
         "The background service is registered for another folder (${registered_dir:-unknown}), so it was left alone. To move it to this folder ($REPO_DIR), run ops/install-launchd.sh --bridge in this folder."
     fi
@@ -166,7 +207,7 @@ else
   fi
 fi
 
-# ---------------------------------------------------------------- 6. wait, then open signed in
+# ---------------------------------------------------------------- 7. wait, then open signed in
 printf '%s\n%s\n' "설정 페이지가 준비되기를 기다리는 중..." "Waiting for the settings page..."
 ready=0
 for ((i = 0; i < WAIT_SECONDS; i++)); do
@@ -199,7 +240,7 @@ if [[ $open_status -ne 0 ]]; then
   fail "브라우저를 열지 못했습니다." "Could not open the browser."
 fi
 
-# ---------------------------------------------------------------- 7. done
+# ---------------------------------------------------------------- 8. done
 say "설정 페이지를 기본 브라우저에서 열었습니다. 이 창은 닫아도 됩니다." \
   "The settings page is open in the default browser. You can close this window."
 exit 0

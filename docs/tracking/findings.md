@@ -14,11 +14,11 @@
 - **Why not now**: login state lives in Aside's browser profile, outside the bridge; the bridge must never store or replay credentials.
 - **Approach**: none on the bridge side beyond reporting `auth_required` with the login action; a fix would have to come from Aside.
 
-## `browser:check` ignores the bridge's configured Aside account
+## `browser:check` and `browser:captcha-check` ignore the bridge's configured Aside account
 
-- **Problem**: with `asideAccount` (or `BRIDGE_ASIDE_ACCOUNT`) set to something other than `u0`, `npm run browser:check` still checks `u0` unless `ASIDE_ACCOUNT` or `--account` is given (`src/adapters/aside/check.ts`).
+- **Problem**: with `asideAccount` (or `BRIDGE_ASIDE_ACCOUNT`) set to something other than `u0`, `npm run browser:check` and `npm run browser:captcha-check` still use `u0` unless `ASIDE_ACCOUNT` or `--account` is given (`src/adapters/aside/check.ts`, `captcha-check.ts`).
 - **Blast radius**: the check can pass while the bridge's own account is signed out, or fail while the bridge works; only diagnostics are affected.
-- **Why not now**: diagnostics only, with a documented workaround (`-- --account <id>`); the fix is a code change in `check.ts` that has not been scheduled.
+- **Why not now**: diagnostics only, with a documented workaround (`-- --account <id>`); the fix is a code change in both CLIs that has not been scheduled.
 - **Approach**: resolve the account as `--account` → `BRIDGE_ASIDE_ACCOUNT`/`config/bridge.json` → `u0`.
 
 ## Lint is not part of the promotion gate for agent-written adapters
@@ -66,7 +66,7 @@
 ## Claude's sign-in state cannot be probed without a model call, so `auto` always picks Claude
 
 - **Problem**: the Claude probe reports `installed` whenever the Agent SDK resolves (it is a dependency) and `signedIn: null` unless `ANTHROPIC_API_KEY` is set. `null` counts as available, so `onboarding.runtime: auto` selects Claude on every Mac, including one that has only Codex signed in.
-- **Blast radius**: a ChatGPT-only user who keeps `auto` gets helper jobs that fail with a Claude sign-in message; Getting started step 4 stays "to do" after Check. The guides tell such users to select Codex.
+- **Blast radius**: a ChatGPT-only user who keeps `auto` gets helper jobs that fail with a Claude sign-in message; Getting started step 4 stays "to do" after Check, and the automatic helper check tries Claude again after every core start (nothing `ok` is recorded for it). The guides tell such users to select Codex.
 - **Why not now**: telling whether Claude Code is signed in needs a model call or reading Claude Code's credential store, which the bridge must not do.
 - **Approach**: fall back to Codex in `auto` when a Claude run fails with "not signed in", or remember the last helper check's result for the selection.
 
@@ -84,16 +84,56 @@
 - **Why not now**: telling "this folder's bridge" from another one needs a check of the answering process's working directory or a folder-specific marker in the page's answer.
 - **Approach**: give each checkout its own `BRIDGE_ADMIN_PORT` in `.env` before double-clicking (documented for test instances), or add a folder marker the opener can compare.
 
-## Updating needs more than `git pull` and the opener
-
-- **Problem**: the opener only opens the page when the program already answers, and installs dependencies only when `node_modules` is missing. After `git pull` the running process keeps the old code (server modules are loaded once; only UI files are re-read), and changed dependencies are not installed.
-- **Blast radius**: a user who follows "pull, then double-click" runs the old server code with possibly mismatched dependencies until the next login or crash restart.
-- **Why not now**: an update action belongs to the deliberately excluded follow-ups (installing from inside the program, a stop control on the page).
-- **Approach**: the guides give the full sequence (`git pull`, `npm ci`, `ops/install-launchd.sh --bridge`, then the opener); a later opener could compare the checked-out commit with the running one and offer the restart.
-
 ## The owner's tunnel-client was not installed the official way
 
 - **Problem**: the owner's copy of tunnel-client 0.0.14 lives at `~/.local/opt/tunnel-client/0.0.14/` (symlinked from `~/.local/bin/tunnel-client`), which does not match the Homebrew layout the official repository gives as the supported macOS install; how it was installed is unknown.
 - **Blast radius**: this Mac only. The program finds the tool on `PATH` or through `TUNNEL_CLIENT_BIN`, so it works either way; but the tool's interface was confirmed on this copy, and a copy not from the official tap may differ from what users install with `brew install openai/tools/tunnel-client`, and may not be notarized.
 - **Why not now**: replacing the tool on the owner's Mac is the owner's decision and touches files outside the project.
 - **Approach**: the owner installs from the official tap (`brew install openai/tools/tunnel-client`), removes the old copy, and re-runs `tunnel-client --version` and the ChatGPT connection check.
+
+## Adapter-kit doc comments still say a block page starts a cool-down
+
+- **Problem**: since decision 0015 only `rate_limited` starts a cool-down, but the doc comments in `src/adapter-kit/completeness.ts` (the `blockPage` rule and the `blocked` verdict) and `src/adapter-kit/results.ts` (`blocked` of `searchFailure`/`readFailure`) still say a block or captcha page makes the site cool down. These files are also served to the helper through `read_reference`.
+- **Blast radius**: the helper or a person writing an adapter may expect a pause that no longer happens and report a throttle page with `blocked` only; code behavior is correct.
+- **Why not now**: any change to `src/adapter-kit/` requires a live `npm run site:validate -- <key>` for every site (`docs/standards.md`), which needs the Aside app and the site logins.
+- **Approach**: correct the comments together with the next kit change that is validated live; until then `docs/ADAPTERS.md` §5 states the current rule.
+
+## DataDome's slider sits in a cross-origin frame the solver cannot see
+
+- **Problem**: the captcha solver detects widgets in the tab's main frame only and never reaches inside a cross-origin frame. DataDome (Reuters) draws its slider inside its own `captcha-delivery.com` iframe, so the attempt reports `kind: unknown` and does nothing.
+- **Blast radius**: a Reuters read or search that meets DataDome's slider still fails with "The captcha could not be solved automatically. Open <url> in Aside, solve it, then retry"; each tool call spends at most one attempt (up to 45 seconds when inline). Other vendors whose challenge lives inside their frame behave the same.
+- **Why not now**: acting inside the frame needs the frame's own coordinates (CDP frame targets or a script in the vendor's frame), which would bypass the shim's frame rules; the behavior on the live site has not been observed yet (T10).
+- **Approach**: confirm with `npm run browser:captcha-check -- <reuters url>`; if DataDome sliders are common, design a frame-aware detection that stays inside the bridge's privileged step and never runs page scripts in vendor frames.
+
+## A DataDome bot check costs every blocked call a full inline attempt
+
+- **Condition**: Reuters answers a search with the DataDome bot check ("Please enable JS and disable any ad blocker") while `captcha.auto` is on, as on 2026-10-08 16:13 UTC after three parallel ChatGPT searches.
+- **Symptom**: each blocked `search_sites` call took 57–60 s: the inline attempt ran out of its 45 s budget with `kind: "unknown", rounds: 0` (the widened reload of the DataDome page never reached detection), the three parallel calls shared that one attempt and all re-ran to `access_denied`; the next call started a second attempt, which ended in `adapter_error`. Afterwards Reuters showed its login wall and the site became `needs_login`.
+- **Blast radius**: ChatGPT waits about a minute per blocked call and still gets nothing; the DataDome challenge (its slider lives in the vendor's frame) is never solved by the bridge.
+- **Why not now**: found after the cycle's final review, on the live program. Candidate fix for the next cycle: after an attempt ends `unknown`/`unavailable` for a site, make further attempts on that site background-only (no inline wait) for a period, and let the adapter report the bot check with the "solve it in Aside" action at once; separately, decide whether DataDome's frame can be acted on through the accessibility tree of the vendor frame.
+
+## A bot check that arrives as an in-page request to the vendor host is reported as `adapter_error`, not as a blocked page
+
+- **Condition**: Reuters starts the DataDome check while the adapter's page script is running (seen on 2026-10-08 16:12 UTC with three parallel searches: the first answered `ok` with 15 results, the next two failed within 1.5 s).
+- **Symptom**: the page's own `window.fetch` call inside `page.evaluate` is redirected to `geo.captcha-delivery.com`; the tab filter blocks it and, because the request came from injected code, the shim counts it as the script's: "page script blocked by the bridge: request to geo.captcha-delivery.com is outside the site's hostnames" → `adapter_error`. The outcome carries no `blocked: true`, so no captcha attempt and no "solve it in Aside" action; the client only sees an adapter error.
+- **Blast radius**: any site whose bot check interrupts an API call made from inside the page; parallel loads make it more likely.
+- **Why not now**: found on the live program after the cycle closed. Candidate fix: when the blocked host of a shim violation is one of the captcha vendor hosts (`CAPTCHA_VENDOR_HOSTS`), map the step to `access_denied` with `blocked: true` and the bot-check message instead of `adapter_error`, so the attempt / user-action path runs; keep the violation log line.
+
+## A Reuters article read fails with `adapter_error` when the page loads its video player
+
+- **Condition**: a Reuters article that embeds a video; seen on 2026-10-08 16:32 UTC in a `read_documents` batch from ChatGPT (1 of 5 refs).
+- **Symptom**: the page requests `cd.elements.video`, which is not in the Reuters manifest's `extraAllowedHosts`; the tab filter blocks it and the shim attributes the request to the adapter's injected code, so the read ends `adapter_error` ("page script blocked by the bridge … outside the site's hostnames") instead of `ok`. ChatGPT reported it as a retryable page-script error, which is accurate: it is not a login or subscription problem.
+- **Blast radius**: single articles with a video embed; a retry may or may not hit the same timing.
+- **Why not now**: found after the cycle closed. Fix: add `elements.video` to `sites/reuters/manifest.json` `extraAllowedHosts` (bump `version`, note in `NOTES.md`), re-run `npm run site:validate -- reuters` against the live site with the owner's login, commit the rewritten `validation.json`, restart the bridge. Also worth checking whether a request the site's own player makes should be attributed to the adapter at all (`docs/BROWSER.md`, attribution rule).
+
+## The "Check now" button is easy to miss on a `needs_login` site card
+
+- **Condition**: after the page rebuild, a `needs_login` card shows the Aside AI login text's copy button prominently and "Check now" less prominently; on 2026-10-08 the owner logged in in Aside but the status stayed `needs_login` because the button was never pressed (no `POST /api/sites/<key>/check` in the log).
+- **Blast radius**: the user believes the login did not work.
+- **Why not now**: found after the owner's page review. Fix for the next page pass: on a `needs_login` card make "Check now" the primary action after the login step ("Logged in? Press Check now"), and say on the card that the status updates only after Check now.
+
+## Aside profiles: the program uses account `u0`, logins in another profile are invisible to it
+
+- **Condition**: Aside on the owner's Mac has two accounts (`u0`, the Google-signed one with Profile 0, and `u3`, a local account with Profile 1). The bridge uses `asideAccount: u0`.
+- **Symptom**: logging in to a site in the other profile's window changes nothing for the bridge; its tabs still show the site logged out.
+- **Why not now**: nothing to fix in code; the page's `needs_login` wording should name the profile ("log in in the Aside window of account u0"). Recorded for the next page pass; the Aside AI login text could also name the account.

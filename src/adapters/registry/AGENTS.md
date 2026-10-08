@@ -3,10 +3,11 @@
 ## Scope
 
 The registration source of truth and everything that changes which adapter code is live:
+
 - `registry.ts`: `SiteRegistryService`, which reconciles `data/sites.json` with `sites/` at startup, keeps the in-memory snapshot (`list`, `get`, `findByHostname`), enforces hostname ownership (`checkAddHostname`, `hostnameOwner`, `registerOnboarding`), loads and hot-reloads adapters, and applies lifecycle transitions with their effects (cache clear, scheduler cool-down; removal also clears the site's cool-down);
 - `folders.ts`: folder inspection and the loadability rule;
 - `loader.ts`: `ModuleAdapterLoader`, which runs the static check, then a version-stamped dynamic import, and shape-checks the default export;
-- `site-task.ts`: `runAdapterTask` (site lock → scoped browser session → `AdapterContext` → dispose) and `browserHostnames`;
+- `site-task.ts`: `runAdapterTask` (a place on the site through the scheduler, shared pool or `exclusive` → scoped browser session → `AdapterContext` → dispose) and `browserHostnames`;
 - `operations.ts`: `promoteStaging` and `removeSite`.
 
 Not in scope: deciding transitions (pure function in `src/core/lifecycle.ts`), validation logic, job orchestration, git internals (an injected committer).
@@ -30,7 +31,7 @@ Not in scope: deciding transitions (pure function in `src/core/lifecycle.ts`), v
 ## Patterns
 
 - Lifecycle changes go through `apply(state, event)` → `transitionSite` → effects; never set `status` directly.
-- `runAdapterTask` is the only way adapter code touches the browser: it names the lock holder (`search`, `read`, `health check`, `validation`, `onboarding running`, `repair running`) for `timeout` messages.
+- `runAdapterTask` is the only way adapter code touches the browser: it names the holder (`search`, `read`, `fetch`, `health check`, `validation`, `onboarding running`, `repair running`; challenge attempts use `captcha` through the scheduler directly) for `timeout` messages and passes `exclusive` through (validation and health checks set it; tool calls do not).
 
 ## Tests
 

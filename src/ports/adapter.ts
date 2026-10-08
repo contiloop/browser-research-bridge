@@ -35,8 +35,8 @@ export interface AdapterSearchResponse {
   message?: string | undefined;
   action?: string | undefined;
   /**
-   * The adapter detected a block or captcha page (as opposed to a paywall): the site is left alone
-   * for the cool-down period. `rate_limited` starts the cool-down without this flag.
+   * The adapter detected a block or captcha page (as opposed to a paywall). The flag does not start
+   * a cool-down; only a `rate_limited` status does.
    */
   blocked?: boolean | undefined;
 }

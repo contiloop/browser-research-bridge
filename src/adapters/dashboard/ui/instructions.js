@@ -1,11 +1,16 @@
-/* Fixed addresses, terminal commands, and the two instruction texts for the Aside AI.
- * A plain ES module with no DOM access, so the page and the unit tests import the same texts.
+/* Fixed addresses, terminal commands, and the instruction texts for the Aside AI (the AI built into
+ * the Aside browser). A plain ES module with no DOM access, so the page and the unit tests import the
+ * same texts.
  *
  * Rules the texts follow (checked by tests): the AI stops before the runtime key is created and
  * before the connector is submitted; it never asks for, reads, or types a key or the passphrase and
  * never acts on the consent page; it does not open or operate the program's local settings page.
- * The texts hold no secret and no settings-page address. The only value put into a text is the
- * tunnel id, which is not a secret. */
+ * The login text asks the AI to log the user in with the password already saved in the Aside
+ * browser, to stop and tell the user when no password is saved or a code is asked for, and never to
+ * ask the user for a password. The texts hold no secret and no settings-page address. The only
+ * values put into a text are the tunnel id (not a secret) and a site's login address, both checked
+ * for their form first. */
+/* global URL */
 
 /** Canonical setup URLs from `tunnel-client --help`, and the official install guide (src/adapters/tunnel-client/AGENTS.md). */
 export const LINKS = {
@@ -91,6 +96,102 @@ const TEXTS = {
     ].join("\n"),
   },
 };
+
+/* The login text: `{step1}` becomes the first step, which names the site's login address. */
+const LOGIN_TEXTS = {
+  en: {
+    text: [
+      "Please help me log in to one website in this browser. Follow these rules exactly:",
+      "- Do not open or operate the program's local settings page (the Browser Research Bridge settings page on this computer). Stay on the website named below.",
+      "- Use only the password that is already saved in this browser for this site. Never ask me for a password or a code.",
+      "- If no password is saved for this site, stop and tell me.",
+      "- If the site asks for a code (for example one sent by text message or email, or one from an authenticator app), stop and tell me.",
+      "- The buttons and labels on the site may be worded differently from these instructions.",
+      "",
+      "Steps:",
+      "{step1}",
+      "2. Log in with the password saved in this browser for this site.",
+      "3. When the site shows that I am logged in, stop and tell me.",
+    ].join("\n"),
+    url: "1. Open {address}",
+    host: "1. Open https://{address}/ and go to the site's login page.",
+  },
+  ko: {
+    text: [
+      "이 브라우저에서 웹사이트 한 곳에 로그인하도록 도와주세요. 아래 규칙을 정확히 지켜 주세요.",
+      "- 이 프로그램의 로컬 설정 페이지(이 컴퓨터의 Browser Research Bridge 설정 페이지)는 열지도, 조작하지도 마세요. 아래에 적힌 웹사이트에서만 작업하세요.",
+      "- 이 브라우저에 이 사이트용으로 이미 저장된 비밀번호만 쓰세요. 저에게 비밀번호나 인증 코드를 묻지 마세요.",
+      "- 이 사이트에 저장된 비밀번호가 없으면 멈추고 저에게 알려 주세요.",
+      "- 사이트가 인증 코드(문자나 이메일로 받는 코드, 인증 앱의 코드 등)를 요구하면 멈추고 저에게 알려 주세요.",
+      "- 사이트의 버튼과 이름은 이 안내와 다르게 적혀 있을 수 있습니다.",
+      "",
+      "순서:",
+      "{step1}",
+      "2. 이 브라우저에 이 사이트용으로 저장된 비밀번호로 로그인하세요.",
+      "3. 로그인된 것이 보이면 멈추고 저에게 알려 주세요.",
+    ].join("\n"),
+    url: "1. {address} 를 여세요.",
+    host: "1. https://{address}/ 를 열고 사이트의 로그인 페이지로 가세요.",
+  },
+};
+
+/** A public DNS name with at least one dot; no IP literal, `localhost`, or `.local` name. */
+const HOSTNAME = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{0,62}$/;
+
+function publicHostname(value) {
+  if (typeof value !== "string") return null;
+  const host = value.trim().toLowerCase().replace(/\.$/, "");
+  if (!HOSTNAME.test(host)) return null;
+  if (host === "localhost" || host.endsWith(".localhost") || host.endsWith(".local")) return null;
+  return host;
+}
+
+function publicLoginUrl(value) {
+  if (typeof value !== "string" || value.length > 500 || /\s/.test(value)) return null;
+  let url;
+  try {
+    url = new URL(value);
+  } catch {
+    return null;
+  }
+  if (url.protocol !== "https:" && url.protocol !== "http:") return null;
+  if (url.username !== "" || url.password !== "" || url.port !== "") return null;
+  if (publicHostname(url.hostname) === null) return null;
+  return url.href;
+}
+
+/**
+ * Where the login text sends the Aside AI: the site's `loginUrl` when it is a plain web address on a
+ * public host, else the first public hostname (`hostnames`, then the host of `input` when that is a
+ * web address). `{ kind: "url" | "host", address }`, or null when none qualifies (no text is offered).
+ */
+export function loginTarget({ loginUrl, hostnames, input } = {}) {
+  const url = publicLoginUrl(loginUrl);
+  if (url !== null) return { kind: "url", address: url };
+  for (const name of Array.isArray(hostnames) ? hostnames : []) {
+    const host = publicHostname(name);
+    if (host !== null) return { kind: "host", address: host };
+  }
+  if (typeof input === "string") {
+    try {
+      const host = publicHostname(new URL(input).hostname);
+      if (host !== null) return { kind: "host", address: host };
+    } catch {
+      // Not a web address (a site name): no login address to offer.
+    }
+  }
+  return null;
+}
+
+/** The login text for the Aside AI in `lang` for a {@link loginTarget} result, or null without one. */
+export function loginText(lang, target) {
+  if (!target || (target.kind !== "url" && target.kind !== "host")) return null;
+  const address = target.kind === "url" ? publicLoginUrl(target.address) : publicHostname(target.address);
+  if (address === null) return null;
+  const texts = LOGIN_TEXTS[lang] ?? LOGIN_TEXTS.en;
+  const step1 = texts[target.kind].replace("{address}", address);
+  return texts.text.replace("{step1}", step1);
+}
 
 const TUNNEL_ID = /^tunnel_[0-9a-f]{32}$/;
 

@@ -18,6 +18,7 @@
     "dev": "tsx --env-file-if-exists=.env src/app/main.ts",
     "site:validate": "tsx --env-file-if-exists=.env src/adapters/validation/cli.ts",
     "browser:check": "tsx --env-file-if-exists=.env src/adapters/aside/check.ts",
+    "browser:captcha-check": "tsx --env-file-if-exists=.env src/adapters/aside/captcha-check.ts",
     "site:onboard": "tsx --env-file-if-exists=.env src/adapters/onboarding/cli.ts"
   },
   "dependencies": {

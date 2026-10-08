@@ -59,13 +59,39 @@ export interface BlockPattern {
 }
 
 /**
- * Per-tab request filter for CDP `Network.setBlockedURLs` (first matching rule wins): requests to
- * the scope's hostnames and their subdomains pass, everything else is blocked.
+ * A host a bridge tab may additionally load from while the bridge itself widens the tab (only a
+ * challenge attempt does, with the fixed `CAPTCHA_VENDOR_HOSTS` of captcha.ts): the host or a
+ * subdomain, optionally only under `pathPrefix` (which starts and ends with "/").
  */
-export function blockedUrlPatterns(hostnames: readonly string[]): BlockPattern[] {
+export interface ExtraHost {
+  readonly host: string;
+  readonly pathPrefix?: string | undefined;
+}
+
+/**
+ * Per-tab request filter for CDP `Network.setBlockedURLs` (first matching rule wins): requests to
+ * the scope's hostnames and their subdomains pass, everything else is blocked. `extra` (bridge code
+ * only) lets a widened tab also reach those hosts, limited to their path prefix.
+ */
+export function blockedUrlPatterns(
+  hostnames: readonly string[],
+  extra: readonly ExtraHost[] = [],
+): BlockPattern[] {
   const allow = hostnames.flatMap((h) => [
     { urlPattern: `*://${h}/*`, block: false },
     { urlPattern: `*://*.${h}/*`, block: false },
   ]);
-  return [...allow, { urlPattern: "*://*/*", block: true }, { urlPattern: "*://*:*/*", block: true }];
+  const widened = extra.flatMap((e) => {
+    const path = e.pathPrefix ?? "/";
+    return [
+      { urlPattern: `*://${e.host}${path}*`, block: false },
+      { urlPattern: `*://*.${e.host}${path}*`, block: false },
+    ];
+  });
+  return [
+    ...allow,
+    ...widened,
+    { urlPattern: "*://*/*", block: true },
+    { urlPattern: "*://*:*/*", block: true },
+  ];
 }

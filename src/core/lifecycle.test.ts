@@ -105,18 +105,20 @@ describe("live outcomes", () => {
     },
   );
 
-  it("rate_limited starts the cool-down without a status change", () => {
+  it("rate_limited starts the cool-down without a status change, flagged or not", () => {
     const t = transitionSite(site("active"), live("rate_limited"));
     expect(t.state.status).toBe("active");
     expect(t.effects.coolDown).toBe(true);
+    const flagged = transitionSite(site("active"), live("rate_limited", { blocked: true }));
+    expect(flagged.effects.coolDown).toBe(true);
   });
 
-  it("access_denied starts the cool-down only for a flagged block page (a paywall does not)", () => {
+  it("access_denied never starts the cool-down, not even for a flagged block page", () => {
     const paywall = transitionSite(site("active"), live("access_denied"));
     expect(paywall.effects.coolDown).toBe(false);
     expect(paywall.state.status).toBe("active");
     const blocked = transitionSite(site("active"), live("access_denied", { blocked: true }));
-    expect(blocked.effects.coolDown).toBe(true);
+    expect(blocked.effects.coolDown).toBe(false);
     expect(blocked.state.status).toBe("active");
   });
 

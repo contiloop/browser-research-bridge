@@ -2,6 +2,7 @@ import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { writeAdapterFolder } from "../../../test/support/site-fixtures.js";
+import { InMemoryScheduler } from "../aside/scheduler.js";
 import { MemoryJobStore } from "./job-store.js";
 import type { OnboardingJobService } from "./service.js";
 import { addInputHostname, checkPublicHostname, redactSecrets } from "./service.js";
@@ -537,6 +538,28 @@ describe("OnboardingJobService", () => {
     ).toBe(true);
     // Page script bodies are wrapped in their own IIFE.
     expect(h.browser.scripts[0]).toContain("return await (async () => {");
+  });
+
+  it("each helper browser step holds the site alone (exclusive) as 'onboarding running'", async () => {
+    const steps: { site: string; holder: string; exclusive: boolean }[] = [];
+    const scheduler = new InMemoryScheduler();
+    const run = scheduler.runForSite.bind(scheduler);
+    scheduler.runForSite = (options, task) => {
+      steps.push({ site: options.site, holder: options.holder, exclusive: options.exclusive === true });
+      return run(options, task);
+    };
+    await svc.stop();
+    svc = h.makeService({ scheduler });
+    h.runner.push(async (ctx) => {
+      await ctx.call("browser_open", { url: `https://${HOST}/` });
+      await ctx.call("browser_run_script", { tabId: "t1", title: "x", code: "return 1" });
+      await ctx.call("report_failure", { reason: "test over" });
+    });
+    await svc.add({ input: HOST });
+    await svc.start();
+    await svc.whenIdle();
+    expect(steps.length).toBeGreaterThanOrEqual(2);
+    expect(steps.every((s) => s.site === KEY && s.holder === "onboarding running" && s.exclusive)).toBe(true);
   });
 
   describe("hosts outside the site's domain need the user's approval", () => {

@@ -2,7 +2,7 @@
  * Option construction of the Claude Agent SDK runner (no network, no agent process). The real
  * round-trip (auth + tool call) is the smoke check `npm run site:onboard -- --sdk-check`.
  */
-import { createSdkMcpServer } from "@anthropic-ai/claude-agent-sdk";
+import { createSdkMcpServer, tool as sdkTool } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
 import { describe, expect, it } from "vitest";
 import {
@@ -13,6 +13,7 @@ import {
   denyNonBridgeTools,
   effortLevel,
 } from "./sdk-runner.js";
+import { jobToolList } from "./test-fixtures.js";
 import type { AgentTool } from "./types.js";
 
 const tool = (name: string): AgentTool => ({
@@ -60,6 +61,20 @@ describe("buildSdkOptions", () => {
     expect(o.cwd).toBe("/tmp/job-1");
     expect(o.systemPrompt).toBe("SYSTEM");
     expect(o.hooks?.PreToolUse).toHaveLength(1);
+  });
+
+  it("allows exactly the job's tool list, browser_solve_captcha included", () => {
+    const tools = jobToolList();
+    // The runner serves the same list through the SDK's in-process server (as in ClaudeAgentRunner.run).
+    const real = createSdkMcpServer({
+      name: "bridge",
+      version: "1.0.0",
+      tools: tools.map((t) => sdkTool(t.name, t.description, t.inputShape, async () => ({ content: [] }))),
+    });
+    const o = buildSdkOptions(base, { ...request, tools }, real, new AbortController());
+    expect(o.allowedTools).toEqual(tools.map((t) => `mcp__bridge__${t.name}`));
+    expect(o.allowedTools).toContain("mcp__bridge__browser_solve_captcha");
+    expect(o.tools).toEqual([]);
   });
 
   it("uses the configured model, effort, and turn limit; resumes a session when asked", () => {

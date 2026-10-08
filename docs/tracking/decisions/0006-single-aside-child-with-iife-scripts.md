@@ -1,5 +1,7 @@
 # 0006 — One long-lived `aside mcp` child with IIFE-wrapped scripts
 
+> **Note (2026-10-08):** the scheduler mentioned below is now a per-site pool with exclusive tasks instead of a site lock with a 4-site cap ([0015](0015-per-site-pool-and-no-block-cooldown.md)). The decision itself, one long-lived child with IIFE-wrapped scripts, stands.
+
 ## Context
 
 Aside is the only browser engine; its CLI exposes a `repl` tool over MCP (`aside mcp --account <account>`). A probe showed that one session runs concurrent `repl` calls in parallel, but all calls share one persistent top-level scope (a second `const t0` fails), the REPL's global `page` is reassigned by every `openTab`, and the context resets after 30 minutes idle. Tabs a session opened are closed when its child exits.

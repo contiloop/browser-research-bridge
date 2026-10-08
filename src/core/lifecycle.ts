@@ -43,7 +43,7 @@ export type LifecycleEvent =
   | { type: "onboarding_failed"; reason: string; at: string }
   /** A validated adapter was moved into place (Add or Repair): the site is `active`. */
   | { type: "promoted"; at: string }
-  /** A live search/read outcome. `blocked` marks a block/captcha page. */
+  /** A live search/read outcome. `blocked` marks a block/captcha page; it does not start a cool-down. */
   | { type: "live_outcome"; outcome: Outcome; blocked?: boolean | undefined; at: string }
   /** A health check (light validation) result. */
   | { type: "health_check"; outcome: Outcome; at: string }
@@ -53,7 +53,7 @@ export type LifecycleEvent =
 export interface LifecycleEffects {
   /** Clear the site's cache entries (search pages and documents). */
   clearCache: boolean;
-  /** Leave the site alone for the cool-down period (scheduler `setCooldown`). */
+  /** Leave the site alone for the cool-down period (scheduler `setCooldown`); only after `rate_limited`. */
   coolDown: boolean;
 }
 
@@ -114,8 +114,9 @@ function isSuccess(status: OutcomeStatus): boolean {
  * - Live outcomes (only for serving sites; `onboarding`/`failed` sites are never searched or read):
  *   `auth_required` → `needs_login` at once and the cache is cleared; `adapter_error` counts toward
  *   `degraded` (N consecutive, tunable, from `active`); `ok`/`empty` reset the count; `rate_limited`
- *   or a `blocked` page start the cool-down without a status change; `access_denied`, `timeout`,
- *   `browser_unavailable`, `unsupported` never change the status or the count.
+ *   starts the cool-down without a status change (a `blocked` block/captcha page does not);
+ *   `access_denied`, `timeout`, `browser_unavailable`, `unsupported` never change the status or the
+ *   count.
  * - Health check (serving sites): `ok` → `active` (clearing the cache and recording the login
  *   confirmation when recovering from `needs_login`); `auth_required` → `needs_login`;
  *   `browser_unavailable` → no change (the check did not reach the site; it is retried at the next
@@ -161,7 +162,7 @@ export function transitionSite(
     case "live_outcome": {
       if (!isServingStatus(state.status)) return unchanged(state);
       const { status } = event.outcome;
-      effects.coolDown = status === "rate_limited" || event.blocked === true;
+      effects.coolDown = status === "rate_limited";
       if (isSuccess(status)) {
         next.consecutiveAdapterErrors = 0;
       } else if (status === "auth_required") {

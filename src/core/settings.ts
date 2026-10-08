@@ -1,6 +1,7 @@
 /**
- * Rules for the settings the user can change (access passphrase, helper runtime, ChatGPT tunnel id).
- * Shared by the configuration loader and the settings store so startup and saving apply the same checks.
+ * Rules for the settings the user can change (access passphrase, helper runtime, automatic captcha
+ * handling, ChatGPT tunnel id). Shared by the configuration loader and the settings store so startup
+ * and saving apply the same checks.
  */
 
 /** Minimum passphrase length, counted in characters (code points) as startup counts them. */
@@ -12,6 +13,9 @@ export const DEFAULT_HELPER_RUNTIME: HelperRuntimeSetting = "auto";
 
 export const DEFAULT_ASIDE_ACCOUNT = "u0";
 
+/** `config/bridge.json` → `captcha.auto` (no environment override); on unless set to false. */
+export const DEFAULT_CAPTCHA_AUTO = true;
+
 /** Why the configuration cannot start the core. */
 export const CONFIG_PROBLEM_CODES = ["passphrase_missing", "passphrase_too_short", "config_invalid"] as const;
 export type ConfigProblemCode = (typeof CONFIG_PROBLEM_CODES)[number];
@@ -21,6 +25,11 @@ export const TUNNEL_ID_PATTERN = /^tunnel_[0-9a-fA-F]{32}$/;
 
 export function isHelperRuntimeSetting(value: unknown): value is HelperRuntimeSetting {
   return typeof value === "string" && (HELPER_RUNTIME_SETTINGS as readonly string[]).includes(value);
+}
+
+/** `captcha.auto` is a boolean; anything else (including the strings "true"/"false") is refused. */
+export function isCaptchaAutoSetting(value: unknown): value is boolean {
+  return typeof value === "boolean";
 }
 
 export function isTunnelId(value: unknown): value is string {

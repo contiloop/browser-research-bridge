@@ -10,7 +10,11 @@
  * - documents are capped at `documentMaxChars` and cached only when `ok`;
  * - the per-tool text budgets (`fetch` 60k; `read_documents` 120k split evenly with a 10k floor) cut
  *   at a paragraph boundary and set `truncated: true`;
- * - every live outcome is fed back into the site lifecycle (incl. `blocked` → cool-down).
+ * - every live outcome is fed back into the site lifecycle (`rate_limited` → cool-down; `blocked` does not cool down);
+ * - a blocked read (block or captcha page) gets one challenge attempt on its URL (a native id: the page
+ *   the adapter last showed, else the homepage) and one re-run (`callWithChallenge`, ./live-call.ts);
+ *   at most one attempt per site and tool call: the refs of one `read_documents` call that meet the
+ *   challenge while it runs join it and re-run, later ones do not start another.
  */
 import { finalizeDocument } from "../../core/assemble.js";
 import { parseRef, resolveSiteByHostname, toAdapterRef } from "../../core/ids.js";
@@ -25,8 +29,8 @@ import { readCacheKey } from "../storage/result-cache.js";
 import { adapterOutcome, normalizeReadResponse } from "./adapter-output.js";
 import { DEFAULT_TOOL_TUNABLES, errorMessage } from "./deps.js";
 import type { ToolServiceDeps, ToolTunables } from "./deps.js";
-import { callSiteAdapter, finishOutcome, recordLiveOutcome } from "./live-call.js";
-import type { LiveCallContext } from "./live-call.js";
+import { callSiteAdapter, callWithChallenge, finishOutcome } from "./live-call.js";
+import type { LiveCallContext, SettledCall } from "./live-call.js";
 
 /** The error object of a failed read (`fetch` tool error text, `read_documents` item `error`). */
 export interface ReadError {
@@ -85,20 +89,28 @@ export class ReadService {
       runSiteTask: deps.runSiteTask,
       logger: deps.logger,
       clock: deps.clock ?? systemClock,
+      challenges: deps.challenges,
     };
   }
 
   /** `fetch`: one ref, text within the `fetch` budget. Never throws; failures come back as items. */
   async fetch(ref: string, signal?: AbortSignal): Promise<ReadItem> {
-    const item = await this.readOne(ref, this.deadline(), signal);
+    const item = await this.readOne(ref, this.deadline(), signal, "fetch", new Set());
     if (item.document === undefined) return item;
     return { ...item, document: applyTextBudget(item.document, this.tunables.fetchTextMaxChars) };
   }
 
-  /** `read_documents`: per-item outcomes in input order; the total text budget is split evenly. */
+  /**
+   * `read_documents`: per-item outcomes in input order; the total text budget is split evenly. The refs
+   * share one captcha attempt per site: a ref of a site that already had its attempt in this call only
+   * joins one still in flight.
+   */
   async readDocuments(refs: readonly string[], signal?: AbortSignal): Promise<ReadDocumentsOutput> {
     const deadline = this.deadline();
-    const items = await Promise.all(refs.map((ref) => this.readOne(ref, deadline, signal)));
+    const attempted = new Set<string>();
+    const items = await Promise.all(
+      refs.map((ref) => this.readOne(ref, deadline, signal, "read", attempted)),
+    );
     const documents = items.filter((i) => i.document !== undefined).length;
     const share = perItemBudget(
       this.tunables.readDocumentsTotalMaxChars,
@@ -122,10 +134,16 @@ export class ReadService {
       .map((s) => s.key);
   }
 
-  /** One ref; never throws. */
-  async readOne(ref: string, deadline: number, signal?: AbortSignal): Promise<ReadItem> {
+  /** One ref; never throws. `attempted`: sites that had their captcha attempt in this tool call. */
+  async readOne(
+    ref: string,
+    deadline: number,
+    signal?: AbortSignal,
+    holder = "read",
+    attempted: Set<string> = new Set(),
+  ): Promise<ReadItem> {
     try {
-      return await this.readOneUnsafe(ref, deadline, signal);
+      return await this.readOneUnsafe(ref, deadline, signal, holder, attempted);
     } catch (error) {
       this.deps.logger.error("read failed unexpectedly", { error: errorMessage(error) });
       return failure(
@@ -136,7 +154,13 @@ export class ReadService {
     }
   }
 
-  private async readOneUnsafe(ref: string, deadline: number, signal?: AbortSignal): Promise<ReadItem> {
+  private async readOneUnsafe(
+    ref: string,
+    deadline: number,
+    signal: AbortSignal | undefined,
+    holder: string,
+    attempted: Set<string>,
+  ): Promise<ReadItem> {
     const sites = this.deps.registry.list();
     const parsed = parseRef(ref);
     if (parsed.kind === "invalid") {
@@ -201,35 +225,47 @@ export class ReadService {
       return { ref, status: "ok", document: withRequestedId(cached) };
     }
 
-    const call = await callSiteAdapter(
-      this.live,
-      key,
-      { holder: "read", deadline, signal },
-      async (loaded, actx) => {
-        const response = normalizeReadResponse(await loaded.adapter.read(adapterRef, actx));
-        if (response.document === null) return { response, document: null };
-        const adapter = loaded.adapter;
-        const document = finalizeDocument(key, response.document, {
-          fetchedAt: actx.now().toISOString(),
-          maxChars: this.tunables.documentMaxChars,
-          canonicalize: adapter.canonicalize ? (url: string) => adapter.canonicalize!(url) : undefined,
-        });
-        return { response, document };
-      },
-    );
+    const once = async (): Promise<SettledCall<Document | null>> => {
+      const call = await callSiteAdapter(
+        this.live,
+        key,
+        { holder, deadline, signal },
+        async (loaded, actx) => {
+          const response = normalizeReadResponse(await loaded.adapter.read(adapterRef, actx));
+          if (response.document === null) return { response, document: null };
+          const adapter = loaded.adapter;
+          const document = finalizeDocument(key, response.document, {
+            fetchedAt: actx.now().toISOString(),
+            maxChars: this.tunables.documentMaxChars,
+            canonicalize: adapter.canonicalize ? (url: string) => adapter.canonicalize!(url) : undefined,
+          });
+          return { response, document };
+        },
+      );
+      if (!call.ok)
+        return {
+          outcome: finishOutcome(call.outcome, key, loginUrl),
+          blocked: false,
+          value: null,
+          pageUrl: call.pageUrl,
+        };
+      const { response, document } = call.value;
+      return {
+        outcome: finishOutcome(adapterOutcome(response), key, loginUrl),
+        blocked: response.blocked,
+        value: document,
+        pageUrl: call.pageUrl,
+      };
+    };
 
-    let outcome: Outcome;
-    let blocked = false;
-    let document: Document | null = null;
-    if (call.ok) {
-      const { response } = call.value;
-      outcome = finishOutcome(adapterOutcome(response), key, loginUrl);
-      blocked = response.blocked;
-      document = call.value.document;
-    } else {
-      outcome = finishOutcome(call.outcome, key, loginUrl);
-    }
-    await recordLiveOutcome(this.live, key, outcome, blocked);
+    // An attempt targets the page of the failed read; a native id has no URL, so the page the
+    // adapter last showed (else the homepage). One attempt per site for the whole tool call.
+    const settled = await callWithChallenge(
+      this.live,
+      { key, holder, deadline, signal, url: adapterRef.url ?? null, attempted },
+      once,
+    );
+    const { outcome, blocked, value: document } = settled;
 
     if (outcome.status !== "ok" || document === null) {
       this.deps.logger.info("site read outcome", { site: key, status: outcome.status, blocked });

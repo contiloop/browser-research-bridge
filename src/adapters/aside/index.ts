@@ -19,12 +19,21 @@ export type { ReplCallRequest, ReplCallResult, ReplClient } from "./repl-client.
 export { InMemoryScheduler } from "./scheduler.js";
 export type { InMemorySchedulerOptions } from "./scheduler.js";
 export {
+  CAPTCHA_MESSAGES,
+  CAPTCHA_VENDOR_HOSTS,
+  DEFAULT_CAPTCHA_BUDGET_MS,
+  DEFAULT_CAPTCHA_TIMINGS,
+  MAX_CAPTCHA_ROUNDS,
+} from "./captcha.js";
+export type { CaptchaTimings } from "./captcha.js";
+export {
   blockedUrlPatterns,
   checkUrlInScope,
   hostInScope,
   normalizeHostname,
   normalizeHostnames,
 } from "./hosts.js";
+export type { ExtraHost } from "./hosts.js";
 export { describeViolations, scanPageScript } from "./script-scan.js";
 export type { ScanViolation } from "./script-scan.js";
 export { checkPageScript, shadowParams } from "./shim.js";

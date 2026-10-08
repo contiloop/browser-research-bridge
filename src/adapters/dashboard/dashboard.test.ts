@@ -26,7 +26,9 @@ import type { HelperRuntimeId, HelperStatus } from "../onboarding/index.js";
 import type {
   DashboardDeps,
   DashboardSource,
+  HelperCheckLog,
   PageSettingsChange,
+  PassphraseClipboardResult,
   SettingsInfo,
   SettingsPreview,
 } from "./deps.js";
@@ -638,6 +640,7 @@ function settingsView(patch: Partial<SettingsView> = {}): SettingsView {
     passphrase: { set: true, valid: true, locked: false },
     anthropicApiKey: { set: false, locked: false },
     helperRuntime: { value: "auto" },
+    captchaAuto: { value: true },
     asideAccount: { value: "u0", locked: false, source: "default" },
     chatgpt: null,
     oauthExtraResources: [],
@@ -736,6 +739,7 @@ function fakeSource() {
     disconnect: vi.fn(async (): Promise<ChatgptDisconnectResult> => accepted()),
   };
   const logger = new MemoryLogger();
+  const copyPassphrase = vi.fn(async (): Promise<PassphraseClipboardResult> => "ok");
   const source: DashboardSource = {
     logger,
     location: { adminPort: PORT, dataDir: "/project/data" },
@@ -744,6 +748,7 @@ function fakeSource() {
     settings,
     settingsPage,
     chatgpt,
+    copyPassphrase,
   };
   return {
     source,
@@ -752,6 +757,7 @@ function fakeSource() {
     settings,
     settingsPage,
     chatgpt,
+    copyPassphrase,
     logger,
     order,
     setCore: (next: DashboardDeps | null) => (core = next),
@@ -784,6 +790,7 @@ const NEW_WRITES: [string, string, unknown][] = [
   ["POST", "/api/chatgpt/retry", undefined],
   ["DELETE", "/api/chatgpt", {}],
   ["POST", "/api/helper/check", undefined],
+  ["POST", "/api/settings/passphrase/clipboard", undefined],
 ];
 
 describe("settings-page API: guards", () => {
@@ -804,6 +811,7 @@ describe("settings-page API: guards", () => {
     expect(f.chatgpt.retry).not.toHaveBeenCalled();
     expect(f.chatgpt.disconnect).not.toHaveBeenCalled();
     expect(f.deps.jobs.helperCheck).not.toHaveBeenCalled();
+    expect(f.copyPassphrase).not.toHaveBeenCalled();
     // The new reads need the cookie too.
     for (const path of ["/api/status", "/api/settings", "/api/chatgpt", "/api/helper"]) {
       expect((await get(app, path)).status, path).toBe(401);
@@ -836,6 +844,7 @@ describe("settings-page API: reads", () => {
       passphrase: { set: true, valid: true, locked: false },
       helperRuntime: { value: "auto", supported: ["claude", "codex"] },
       asideAccount: { value: "u0", locked: false },
+      captchaAuto: true,
       info: INFO,
     };
     expect(await (await get(app, "/api/settings", { cookie: COOKIE })).json()).toEqual(expected);
@@ -850,15 +859,22 @@ describe("settings-page API: reads", () => {
     f.setView(
       settingsView({
         helperRuntime: { value: null },
+        captchaAuto: { value: null },
         asideAccount: { value: null, locked: false, source: "config_file" },
       }),
     );
     const nulls = (await (await get(app, "/api/settings", { cookie: COOKIE })).json()) as {
       helperRuntime: { value: unknown };
       asideAccount: { value: unknown };
+      captchaAuto: unknown;
     };
     expect(nulls.helperRuntime.value).toBeNull();
     expect(nulls.asideAccount.value).toBeNull();
+    expect(nulls.captchaAuto).toBeNull();
+    f.setView(settingsView({ captchaAuto: { value: false } }));
+    expect(await (await get(app, "/api/settings", { cookie: COOKIE })).json()).toMatchObject({
+      captchaAuto: false,
+    });
   });
 
   it("GET chatgpt answers in every mode", async () => {
@@ -976,6 +992,9 @@ describe("settings-page API: PUT settings", () => {
       [{ helperRuntime: "gpt" }, { helperRuntime: "bad_value" }],
       [{ asideAccount: ["u1"] }, { asideAccount: "bad_value" }],
       [{ passphrase: SECRET_PASSPHRASE, disconnectApps: "yes" }, { disconnectApps: "bad_value" }],
+      [{ captchaAuto: "false" }, { captchaAuto: "bad_value" }],
+      [{ captchaAuto: 0 }, { captchaAuto: "bad_value" }],
+      [{ captchaAuto: null }, { captchaAuto: "bad_value" }],
     ];
     for (const [body, fields] of cases) {
       const res = await send(app, "PUT", "/api/settings", body, authed);
@@ -1208,6 +1227,125 @@ describe("settings-page API: PUT settings", () => {
   });
 });
 
+describe("settings-page API: captchaAuto", () => {
+  it("PUT settings passes captchaAuto through the preview and the store and restarts the core", async () => {
+    const f = fakeSource();
+    const app = makeApp(f.source);
+    const res = await send(app, "PUT", "/api/settings", { captchaAuto: false }, authed);
+    expect(res.status).toBe(202);
+    expect(await res.json()).toEqual({ changed: ["captchaAuto"], restarting: true, appsDisconnected: null });
+    expect(f.settingsPage.preview).toHaveBeenCalledWith({ captchaAuto: false });
+    expect(f.settings.write).toHaveBeenCalledWith({ captchaAuto: false });
+    expect(f.order).toEqual(["write", "restart"]);
+    // Together with other fields; `true` is sent as a boolean as well.
+    await send(app, "PUT", "/api/settings", { captchaAuto: true, helperRuntime: "codex" }, authed);
+    expect(f.settings.write).toHaveBeenLastCalledWith({ helperRuntime: "codex", captchaAuto: true });
+  });
+
+  it("no change and file_unreadable follow the preview", async () => {
+    const f = fakeSource();
+    const app = makeApp(f.source);
+    f.settingsPage.preview.mockReturnValueOnce({ ok: true, changed: [] });
+    const same = await send(app, "PUT", "/api/settings", { captchaAuto: true }, authed);
+    expect(same.status).toBe(200);
+    expect(await same.json()).toEqual({ changed: [], restarting: false, appsDisconnected: null });
+    f.settingsPage.preview.mockReturnValueOnce({
+      ok: false,
+      error: "file_unreadable",
+      message: "/project/config/bridge.json is not valid JSON",
+    });
+    const unreadable = await send(app, "PUT", "/api/settings", { captchaAuto: false }, authed);
+    expect(unreadable.status).toBe(409);
+    expect(await unreadable.json()).toMatchObject({ error: "file_unreadable" });
+    expect(f.settings.write).not.toHaveBeenCalled();
+  });
+});
+
+describe("settings-page API: POST settings/passphrase/clipboard", () => {
+  const PATH = "/api/settings/passphrase/clipboard";
+
+  it("ok → 200 { ok: true } in every mode (core on, off, or restarting)", async () => {
+    const f = fakeSource();
+    const app = makeApp(f.source);
+    const res = await send(app, "POST", PATH, undefined, authed);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true });
+    f.setCore(null);
+    f.setStatus(SETUP_STATUS);
+    expect((await send(app, "POST", PATH, undefined, authed)).status).toBe(200);
+    f.setStatus(RESTARTING_STATUS);
+    f.setBusy(true);
+    expect((await send(app, "POST", PATH, {}, authed)).status).toBe(200);
+    expect(f.copyPassphrase).toHaveBeenCalledTimes(3);
+    expect(f.logger.lines.filter((l) => l.includes("passphrase copied to the clipboard"))).toHaveLength(3);
+  });
+
+  it("maps not_set and locked to 409, unavailable to 500, with the error body shape", async () => {
+    const f = fakeSource();
+    const app = makeApp(f.source);
+    f.copyPassphrase.mockResolvedValueOnce("not_set");
+    const notSet = await send(app, "POST", PATH, undefined, authed);
+    expect(notSet.status).toBe(409);
+    expect(await notSet.json()).toEqual({ error: "not_set", message: expect.any(String) as string });
+    f.copyPassphrase.mockResolvedValueOnce("locked");
+    const locked = await send(app, "POST", PATH, undefined, authed);
+    expect(locked.status).toBe(409);
+    expect(await locked.json()).toEqual({
+      error: "locked",
+      message: expect.stringContaining("set outside the settings files") as string,
+      fields: { passphrase: "locked" },
+    });
+    f.copyPassphrase.mockResolvedValueOnce("unavailable");
+    const unavailable = await send(app, "POST", PATH, undefined, authed);
+    expect(unavailable.status).toBe(500);
+    expect(await unavailable.json()).toEqual({ error: "unavailable", message: expect.any(String) as string });
+    f.copyPassphrase.mockRejectedValueOnce(new Error("boom"));
+    const thrown = await send(app, "POST", PATH, undefined, authed);
+    expect(thrown.status).toBe(500);
+    expect(await thrown.json()).toMatchObject({ error: "server_error" });
+  });
+
+  it("404 when the process does not provide it; GET is not a route", async () => {
+    const f = fakeSource();
+    const app = makeApp({ ...f.source, copyPassphrase: undefined });
+    expect((await send(app, "POST", PATH, undefined, authed)).status).toBe(404);
+    const withIt = makeApp(f.source);
+    expect((await get(withIt, PATH, { cookie: COOKIE })).status).toBe(404);
+    expect(f.copyPassphrase).not.toHaveBeenCalled();
+  });
+});
+
+describe("settings-page API: the persisted helper check", () => {
+  it("GET helper reads the last check from the process's log; POST helper/check runs through it", async () => {
+    const f = fakeSource();
+    const stored: HelperCheckResult = {
+      at: "2026-10-07T00:00:00.000Z",
+      runtime: "codex",
+      ok: false,
+      code: "limit_reached",
+      message: "usage limit",
+    };
+    const fresh: HelperCheckResult = { ...stored, runtime: "claude", ok: true, code: "ok", message: null };
+    const log = {
+      last: vi.fn(async () => stored),
+      run: vi.fn(async (jobs: Pick<DashboardDeps["jobs"], "helperCheck">) => {
+        expect(jobs.helperCheck).toBe(f.deps.jobs.helperCheck);
+        return fresh;
+      }),
+    } satisfies HelperCheckLog;
+    const app = makeApp({ ...f.source, helperChecks: log });
+    const status = (await (await get(app, "/api/helper", { cookie: COOKIE })).json()) as HelperStatus;
+    expect(status.lastCheck).toEqual(stored);
+    expect(f.deps.jobs.helperStatus).toHaveBeenCalledWith(stored);
+    const check = await send(app, "POST", "/api/helper/check", undefined, authed);
+    expect(check.status).toBe(200);
+    expect(await check.json()).toEqual(fresh);
+    expect(log.run).toHaveBeenCalledTimes(1);
+    // The job service itself is not called directly: the log shares a check already in progress.
+    expect(f.deps.jobs.helperCheck).not.toHaveBeenCalled();
+  });
+});
+
 describe("settings-page API: POST restart", () => {
   it("202 restarting; job_running without confirmation; accepted in setup", async () => {
     const f = fakeSource();
@@ -1400,6 +1538,10 @@ describe("settings-page API: no secret leaves", () => {
       await collect(await get(app, path, { cookie: COOKIE }));
     }
     await collect(await send(app, "POST", "/api/helper/check", undefined, authed));
+    for (const result of ["ok", "not_set", "locked", "unavailable"] as const) {
+      f.copyPassphrase.mockResolvedValueOnce(result);
+      await collect(await send(app, "POST", "/api/settings/passphrase/clipboard", undefined, authed));
+    }
     await collect(await send(app, "POST", "/api/restart", {}, authed));
     await collect(await send(app, "DELETE", "/api/chatgpt", {}, authed));
     const all = [...bodies, ...f.logger.lines].join("\n");
@@ -1435,19 +1577,19 @@ describe("changed routes: lang and the job summary", () => {
     expect(deps.jobs.retryJob).toHaveBeenLastCalledWith("job-1", { lang: "en" });
   });
 
-  it("the job summary carries lang and runtime (old records: en and null)", async () => {
+  it("the job summary carries lang, runtime, and blockKind (old records: en, null, other)", async () => {
     const { deps } = fakeDeps();
     deps.jobs.list.mockReturnValue([
-      job({ lang: "ko", runtime: "codex" }),
-      job({ id: "old", lang: undefined, runtime: undefined }),
+      job({ lang: "ko", runtime: "codex", state: "awaiting_user", blockKind: "login" }),
+      job({ id: "old", lang: undefined, runtime: undefined, blockKind: undefined }),
     ]);
     const app = makeApp(deps);
     const body = (await (await get(app, "/api/jobs", { cookie: COOKIE })).json()) as {
-      jobs: { id: string; lang: string; runtime: string | null }[];
+      jobs: { id: string; lang: string; runtime: string | null; blockKind: string }[];
     };
-    expect(body.jobs.map((j) => [j.id, j.lang, j.runtime])).toEqual([
-      ["job-1", "ko", "codex"],
-      ["old", "en", null],
+    expect(body.jobs.map((j) => [j.id, j.lang, j.runtime, j.blockKind])).toEqual([
+      ["job-1", "ko", "codex", "login"],
+      ["old", "en", null, "other"],
     ]);
   });
 });

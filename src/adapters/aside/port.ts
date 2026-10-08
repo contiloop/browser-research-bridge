@@ -5,9 +5,11 @@
  *
  * Tabs: the port only ever opens its own tabs and addresses them by the target id Aside returned;
  * it never lists or attaches to the user's tabs. Tabs a session opened are closed on `dispose()`,
- * except one per site that may be kept warm for `warmTabTtlMs` and reused by the next session of
- * the same site and hostnames. A REPL restart closes all bridge tabs (Aside closes a REPL session's
- * tabs when the session ends), so handles from an older generation are treated as gone.
+ * except the session's first tab, which may be kept warm for `warmTabTtlMs`. Up to
+ * `maxWarmTabsPerSite` tabs per site stay warm (keeping one more closes the oldest); a session of the
+ * same site and hostnames takes a free warm tab (removing it from the list, so parallel sessions
+ * never share one) or opens a new tab. A REPL restart closes all bridge tabs (Aside closes a REPL
+ * session's tabs when the session ends), so handles from an older generation are treated as gone.
  */
 import { randomBytes, randomUUID } from "node:crypto";
 import { OutcomeError, errorToOutcome } from "../../core/outcome.js";
@@ -16,16 +18,38 @@ import type {
   BrowserScope,
   BrowserSession,
   BrowserStatus,
+  ChallengeAttempt,
   CookieFetchInit,
   CookieFetchResponse,
   OpenTabOptions,
   PageScriptOptions,
   Screenshot,
   SnapshotOptions,
+  SolveChallengeOptions,
   TabHandle,
 } from "../../ports/browser.js";
-import type { Logger } from "../../ports/logger.js";
-import { DEFAULT_STEP_TIMEOUT_MS, DEFAULT_WARM_TAB_TTL_MS, REPL_CALL_CAP_MS } from "./defaults.js";
+import type { LogFields, Logger } from "../../ports/logger.js";
+import type {
+  ActionKind,
+  CaptchaActResult,
+  CaptchaDetection,
+  CaptchaTimings,
+  ChallengeDriver,
+} from "./captcha.js";
+import {
+  CAPTCHA_VENDOR_HOSTS,
+  DEFAULT_CAPTCHA_TIMINGS,
+  parseActResult,
+  parseDetection,
+  runChallengeAttempt,
+} from "./captcha.js";
+import {
+  DEFAULT_MAX_CONCURRENT_PER_SITE,
+  DEFAULT_STEP_TIMEOUT_MS,
+  DEFAULT_WARM_TAB_TTL_MS,
+  REPL_CALL_CAP_MS,
+} from "./defaults.js";
+import type { ExtraHost } from "./hosts.js";
 import { checkUrlInScope, normalizeHostnames } from "./hosts.js";
 import { ASIDE_LOGIN_ACTION, looksLikeLoginProblem } from "./mcp-repl-client.js";
 import type { ReplClient } from "./repl-client.js";
@@ -37,8 +61,12 @@ export interface AsideBrowserPortOptions {
   logger?: Logger | undefined;
   /** Per adapter step (default 120 s; the in-REPL deadline is capped below Aside's 120 s limit). */
   stepTimeoutMs?: number | undefined;
-  /** How long a site's last tab stays open for reuse after a session ends (default 5 min; 0 = off). */
+  /** How long a session's first tab stays open for reuse after the session ends (default 5 min; 0 = off). */
   warmTabTtlMs?: number | undefined;
+  /** Warm tabs kept per site (the per-site pool size, `maxConcurrentPerSite`; default 3). */
+  maxWarmTabsPerSite?: number | undefined;
+  /** Waits inside a challenge attempt (defaults in captcha.ts; tests shorten them). */
+  captchaTimings?: Partial<CaptchaTimings> | undefined;
 }
 
 interface RunOptions {
@@ -50,16 +78,22 @@ interface RunOptions {
   generation?: number | undefined;
   notBefore?: number | undefined;
   minIntervalMs?: number | undefined;
+  /** Challenge attempts only: hosts a tab installed or re-guarded in this call may also load from. */
+  extraHosts?: readonly ExtraHost[] | undefined;
 }
 
 interface RunResult {
   value: unknown;
   lastLoadAt: number | null;
   generation: number;
+  /** The last on-site main-frame URL a touched tab showed after the step (unchecked; see `AsideSession.note`). */
+  pageUrl: string | null;
 }
 
 interface WarmTab {
-  key: string;
+  site: string;
+  /** Site and hostnames the tab was opened for; only a session with the same scope may reuse it. */
+  scope: string;
   targetId: string;
   generation: number;
   timer: ReturnType<typeof setTimeout>;
@@ -89,10 +123,13 @@ export class AsideBrowserPort implements BrowserPort {
   readonly logger: Logger;
   readonly stepTimeoutMs: number;
   private readonly warmTabTtlMs: number;
+  private readonly maxWarmTabsPerSite: number;
   private readonly instanceId = randomBytes(6).toString("hex");
   private readonly extraGlobals = new Set<string>();
-  private readonly warm = new Map<string, WarmTab>();
+  /** Warm tabs per site key, oldest first. */
+  private readonly warm = new Map<string, WarmTab[]>();
   private readonly sessions = new Set<AsideSession>();
+  private readonly captchaTimings: CaptchaTimings;
   private stopped = false;
 
   constructor(options: AsideBrowserPortOptions) {
@@ -100,6 +137,11 @@ export class AsideBrowserPort implements BrowserPort {
     this.logger = options.logger ?? silentLogger;
     this.stepTimeoutMs = options.stepTimeoutMs ?? DEFAULT_STEP_TIMEOUT_MS;
     this.warmTabTtlMs = options.warmTabTtlMs ?? DEFAULT_WARM_TAB_TTL_MS;
+    const max = options.maxWarmTabsPerSite ?? DEFAULT_MAX_CONCURRENT_PER_SITE;
+    this.maxWarmTabsPerSite = Number.isFinite(max)
+      ? Math.max(1, Math.floor(max))
+      : DEFAULT_MAX_CONCURRENT_PER_SITE;
+    this.captchaTimings = { ...DEFAULT_CAPTCHA_TIMINGS, ...options.captchaTimings };
   }
 
   async status(): Promise<BrowserStatus> {
@@ -134,16 +176,103 @@ export class AsideBrowserPort implements BrowserPort {
     return session;
   }
 
+  /**
+   * One challenge attempt (captcha.ts): on the given tab when it is an open tab of a live session with
+   * exactly this scope in the current REPL generation, else in a fresh session tab opened at `url`.
+   * Logs one `captcha attempt` line (site, kind, rounds, result, duration, the solver's fixed message;
+   * never page content).
+   */
+  async solveChallenge(options: SolveChallengeOptions): Promise<ChallengeAttempt> {
+    const site = options.scope.siteKey;
+    const started = Date.now();
+    let attempt: ChallengeAttempt | undefined;
+    let error: string | undefined;
+    try {
+      attempt = await this.attemptChallenge(options);
+      return attempt;
+    } catch (err) {
+      error = errorToOutcome(err).status;
+      throw err;
+    } finally {
+      const result = !attempt
+        ? "unsolved"
+        : !attempt.available
+          ? "unavailable"
+          : attempt.solved
+            ? "solved"
+            : "unsolved";
+      const fields: LogFields = {
+        site,
+        kind: attempt?.kind ?? "unknown",
+        rounds: attempt?.rounds ?? 0,
+        result,
+        durationMs: Date.now() - started,
+      };
+      // The solver's message is one of its fixed texts (captcha.ts), never page content.
+      if (attempt !== undefined) fields["message"] = attempt.message;
+      if (error !== undefined) fields["error"] = error;
+      this.logger.info("captcha attempt", fields);
+    }
+  }
+
+  private async attemptChallenge(options: SolveChallengeOptions): Promise<ChallengeAttempt> {
+    if (this.stopped) throw new OutcomeError("browser_unavailable", "the browser port is shut down");
+    const site = options.scope.siteKey;
+    let hostnames: string[];
+    try {
+      hostnames = normalizeHostnames(options.scope.hostnames);
+    } catch (err) {
+      throw new OutcomeError("adapter_error", err instanceof Error ? err.message : String(err));
+    }
+    const check = checkUrlInScope(options.url, hostnames);
+    if (!check.ok) throw this.violation(site, "captcha", check);
+    const run = new ChallengeRun(
+      this,
+      { ...options.scope, hostnames },
+      hostnames,
+      check.url,
+      options,
+      this.captchaTimings,
+    );
+    try {
+      return await runChallengeAttempt(run, this.captchaTimings);
+    } finally {
+      run.close();
+    }
+  }
+
   async shutdown(): Promise<void> {
     this.stopped = true;
     for (const s of [...this.sessions]) await s.dispose().catch(() => undefined);
-    for (const key of [...this.warm.keys()]) await this.closeWarm(key);
+    for (const tabs of [...this.warm.values()]) {
+      for (const w of [...tabs]) await this.closeWarm(w);
+    }
     await this.repl.close();
   }
 
   /** @internal */
   forgetSession(session: AsideSession): void {
     this.sessions.delete(session);
+  }
+
+  /** @internal A session for a challenge attempt's own tab (disposed by the attempt). */
+  challengeSession(scope: BrowserScope, hostnames: readonly string[]): AsideSession {
+    if (this.stopped) throw new OutcomeError("browser_unavailable", "the browser port is shut down");
+    const session = new AsideSession(this, scope, hostnames);
+    this.sessions.add(session);
+    return session;
+  }
+
+  /** @internal An open tab of a live session with exactly this scope, in the current REPL generation. */
+  challengeTab(tabId: string, site: string, hostnames: readonly string[]): ChallengeTarget | undefined {
+    const key = scopeKey(site, hostnames);
+    for (const s of this.sessions) {
+      if (s.key() !== key) continue;
+      const generation = s.generationOf(tabId);
+      if (generation !== undefined && generation === this.repl.generation())
+        return { id: tabId, generation, owner: s };
+    }
+    return undefined;
   }
 
   /** @internal Logs an out-of-scope URL (host only) and returns the `adapter_error` to throw. */
@@ -157,6 +286,8 @@ export class AsideBrowserPort implements BrowserPort {
   async run(op: ShimOp, options: RunOptions): Promise<RunResult> {
     if (options.signal?.aborted)
       throw new OutcomeError("timeout", "browser step cancelled (time budget spent)");
+    if (op.kind === "script" && options.extraHosts !== undefined && options.extraHosts.length > 0)
+      throw new OutcomeError("adapter_error", "page scripts never run with widened hosts");
     const deadlineMs = Math.max(1000, Math.min(options.timeoutMs, REPL_CALL_CAP_MS));
     for (let attempt = 0; attempt < 3; attempt += 1) {
       let wireOp = op;
@@ -184,6 +315,7 @@ export class AsideBrowserPort implements BrowserPort {
         notBefore: options.notBefore ?? 0,
         minIntervalMs: options.minIntervalMs ?? 0,
         instanceId: this.instanceId,
+        extraHosts: options.extraHosts,
       });
       const res = await this.repl.call({
         title: options.title,
@@ -202,7 +334,12 @@ export class AsideBrowserPort implements BrowserPort {
             hosts: envelope.pageBlocked.join(",").slice(0, 300),
           });
         }
-        return { value: envelope.value, lastLoadAt: envelope.lastLoadAt, generation: res.generation };
+        return {
+          value: envelope.value,
+          lastLoadAt: envelope.lastLoadAt,
+          generation: res.generation,
+          pageUrl: typeof envelope.pageUrl === "string" ? envelope.pageUrl : null,
+        };
       }
       if (envelope.kind === "globals") {
         // A REPL global the shim does not shadow yet: shadow it and retry.
@@ -221,18 +358,27 @@ export class AsideBrowserPort implements BrowserPort {
     );
   }
 
-  /** @internal */
+  /**
+   * @internal Takes a free warm tab of the site opened for the same hostnames (the newest one), or
+   * undefined. A taken tab leaves the list, so two sessions never share it. Tabs of an older REPL
+   * generation are dropped on the way (the restart already closed them).
+   */
   takeWarm(site: string, hostnames: readonly string[]): WarmTab | undefined {
-    const key = scopeKey(site, hostnames);
-    const w = this.warm.get(key);
-    if (!w) return undefined;
-    clearTimeout(w.timer);
-    this.warm.delete(key);
-    if (w.generation !== this.repl.generation()) return undefined;
-    return w;
+    const generation = this.repl.generation();
+    for (const stale of (this.warm.get(site) ?? []).filter((w) => w.generation !== generation)) {
+      this.forgetWarm(stale);
+    }
+    const scope = scopeKey(site, hostnames);
+    const match = (this.warm.get(site) ?? []).findLast((w) => w.scope === scope);
+    if (match === undefined) return undefined;
+    this.forgetWarm(match);
+    return match;
   }
 
-  /** @internal Keeps a tab warm for the site, or closes it when warm tabs are off. */
+  /**
+   * @internal Keeps a tab warm for the site, or returns false when warm tabs are off (the caller
+   * closes it). Keeping more than `maxWarmTabsPerSite` closes the site's oldest warm tabs.
+   */
   async keepWarm(
     site: string,
     hostnames: readonly string[],
@@ -240,13 +386,20 @@ export class AsideBrowserPort implements BrowserPort {
     generation: number,
   ): Promise<boolean> {
     if (this.stopped || this.warmTabTtlMs <= 0 || generation !== this.repl.generation()) return false;
-    const key = scopeKey(site, hostnames);
-    if (this.warm.has(key)) await this.closeWarm(key);
-    const timer = setTimeout(() => {
-      void this.closeWarm(key);
-    }, this.warmTabTtlMs);
-    timer.unref?.();
-    this.warm.set(key, { key, targetId, generation, timer });
+    const entry: WarmTab = {
+      site,
+      scope: scopeKey(site, hostnames),
+      targetId,
+      generation,
+      timer: setTimeout(() => {
+        void this.closeWarm(entry);
+      }, this.warmTabTtlMs),
+    };
+    entry.timer.unref?.();
+    const tabs = [...(this.warm.get(site) ?? []), entry];
+    this.warm.set(site, tabs);
+    const evict = tabs.slice(0, Math.max(0, tabs.length - this.maxWarmTabsPerSite));
+    for (const w of evict) await this.closeWarm(w);
     return true;
   }
 
@@ -270,12 +423,20 @@ export class AsideBrowserPort implements BrowserPort {
     }
   }
 
-  private async closeWarm(key: string): Promise<void> {
-    const w = this.warm.get(key);
-    if (!w) return;
+  /** Removes a warm tab from its site's list and stops its timer; false when it was not listed. */
+  private forgetWarm(w: WarmTab): boolean {
+    const tabs = this.warm.get(w.site);
+    const i = tabs?.indexOf(w) ?? -1;
+    if (tabs === undefined || i < 0) return false;
     clearTimeout(w.timer);
-    this.warm.delete(key);
-    await this.closeTabById(key.split("|")[0] ?? "-", w.targetId, w.generation);
+    tabs.splice(i, 1);
+    if (tabs.length === 0) this.warm.delete(w.site);
+    return true;
+  }
+
+  private async closeWarm(w: WarmTab): Promise<void> {
+    if (!this.forgetWarm(w)) return;
+    await this.closeTabById(w.site, w.targetId, w.generation);
   }
 
   private classifyRawFailure(text: string, isError: boolean): OutcomeError {
@@ -339,6 +500,8 @@ class AsideSession implements BrowserSession {
   private readonly tabs = new Map<string, OwnedTab>();
   private defaultTab: OwnedTab | null = null;
   private disposed = false;
+  /** The last on-site main-frame URL a step of this session reported (`lastUrl()`). */
+  private lastPage: string | null = null;
 
   constructor(
     private readonly port: AsideBrowserPort,
@@ -393,6 +556,7 @@ class AsideSession implements BrowserSession {
             generation: warm.generation,
           },
         );
+        this.note(r);
         return this.register(r.value, r.generation);
       } catch (err) {
         const status = err instanceof OutcomeError ? err.status : "adapter_error";
@@ -407,7 +571,43 @@ class AsideSession implements BrowserSession {
       { kind: "open", url: check.url, waitUntil: options.waitUntil },
       { ...base, title: `Bridge ${this.site}: open ${check.host}` },
     );
+    this.note(r);
     return this.register(r.value, r.generation);
+  }
+
+  lastUrl(): string | null {
+    return this.lastPage;
+  }
+
+  /** Remembers the step's page URL when it is on the session's hostnames (checked again here). */
+  private note(r: RunResult): void {
+    if (r.pageUrl === null) return;
+    const check = checkUrlInScope(r.pageUrl, this.hostnames);
+    if (check.ok) this.lastPage = check.url;
+  }
+
+  /** @internal Scope identity (site and hostnames), as for warm tabs. */
+  key(): string {
+    return scopeKey(this.site, this.hostnames);
+  }
+
+  /** @internal Generation of an open tab of this session; undefined when it is not one. */
+  generationOf(tabId: string): number | undefined {
+    return this.disposed ? undefined : this.tabs.get(tabId)?.generation;
+  }
+
+  /** @internal Drops a tab the port closed on the session's behalf. */
+  forgetTab(tabId: string): void {
+    const t = this.tabs.get(tabId);
+    if (!t) return;
+    this.tabs.delete(tabId);
+    if (this.defaultTab === t) this.defaultTab = null;
+  }
+
+  /** @internal Registers a tab the port opened for this session (a challenge attempt's widened tab). */
+  adopt(value: unknown, generation: number): TabHandle {
+    this.assertOpen();
+    return this.register(value, generation);
   }
 
   private register(value: unknown, generation: number): TabHandle {
@@ -450,6 +650,7 @@ class AsideSession implements BrowserSession {
         generation: t.generation,
       },
     );
+    this.note(r);
     const tree = typeof r.value === "string" ? r.value : "";
     return options.maxChars !== undefined && tree.length > options.maxChars
       ? tree.slice(0, options.maxChars)
@@ -480,6 +681,7 @@ class AsideSession implements BrowserSession {
       },
     );
     if (r.lastLoadAt !== null) lease?.recordPageLoad?.(r.lastLoadAt);
+    this.note(r);
     return r.value;
   }
 
@@ -535,18 +737,28 @@ class AsideSession implements BrowserSession {
         generation: t.generation,
       },
     );
+    this.note(r);
     const base64 = typeof r.value === "string" ? r.value : "";
     return { mimeType: base64.startsWith("/9j/") ? "image/jpeg" : "image/png", base64 };
   }
 
   async dispose(): Promise<void> {
+    await this.end(true);
+  }
+
+  /** @internal Disposes the session and closes all its tabs, keeping none warm (an abandoned attempt). */
+  async discard(): Promise<void> {
+    await this.end(false);
+  }
+
+  private async end(keepWarm: boolean): Promise<void> {
     if (this.disposed) return;
     this.disposed = true;
     this.port.forgetSession(this);
     const tabs = [...this.tabs.values()];
     this.tabs.clear();
     let kept: OwnedTab | null = null;
-    if (this.defaultTab && tabs.includes(this.defaultTab)) {
+    if (keepWarm && this.defaultTab && tabs.includes(this.defaultTab)) {
       const d = this.defaultTab;
       if (await this.port.keepWarm(this.site, this.hostnames, d.handle.id, d.generation)) kept = d;
     }
@@ -554,5 +766,241 @@ class AsideSession implements BrowserSession {
       if (t !== kept) await this.port.closeTabById(this.site, t.handle.id, t.generation);
     }
     this.defaultTab = null;
+  }
+}
+
+interface ChallengeTarget {
+  id: string;
+  generation: number;
+  /** The session that owns the tab (the caller's, or the attempt's own). */
+  owner: AsideSession;
+}
+
+/**
+ * The browser work of one challenge attempt (`ChallengeDriver` of captcha.ts). Every REPL call runs
+ * under the attempt's budget and the scope's signal. A tab may reach `CAPTCHA_VENDOR_HOSTS` only while
+ * it is the attempt's target: it becomes the target before the widening call goes out, so `restore`
+ * owns every tab that may carry the widened filter and guard. `restore` puts back the normal ones, or
+ * closes the tab when it cannot be sure: the widening call did not come back (it may still be running
+ * in the REPL), the restore failed, or the attempt was abandoned (the scope's signal aborted: site
+ * removed, core stopped). A closed tab is forgotten by its session and never kept warm.
+ */
+class ChallengeRun implements ChallengeDriver {
+  private readonly deadline: number;
+  private readonly budget = new AbortController();
+  private readonly timer: ReturnType<typeof setTimeout>;
+  private readonly unlink: () => void;
+  /** The scope's own signal (the caller's or the lease's); its abort abandons the attempt. */
+  private readonly outer: AbortSignal | undefined;
+  private target: ChallengeTarget | null = null;
+  /** False while a widening call is out or after it failed: its effect on the target is unknown. */
+  private widenSettled = true;
+  private ownSession: AsideSession | null = null;
+
+  constructor(
+    private readonly port: AsideBrowserPort,
+    private readonly scope: BrowserScope,
+    private readonly hostnames: readonly string[],
+    private readonly url: string,
+    private readonly options: SolveChallengeOptions,
+    private readonly timings: CaptchaTimings,
+  ) {
+    const budgetMs = Number.isFinite(options.budgetMs) ? Math.max(0, options.budgetMs) : 0;
+    this.deadline = Date.now() + budgetMs;
+    const outer = scope.signal ?? scope.lease?.signal;
+    this.outer = outer;
+    const abort = () => this.budget.abort();
+    if (outer?.aborted) abort();
+    else outer?.addEventListener("abort", abort, { once: true });
+    this.unlink = () => outer?.removeEventListener("abort", abort);
+    this.timer = setTimeout(abort, budgetMs);
+    this.timer.unref?.();
+  }
+
+  close(): void {
+    clearTimeout(this.timer);
+    this.unlink();
+  }
+
+  remainingMs(): number {
+    return this.budget.signal.aborted ? 0 : this.deadline - Date.now();
+  }
+
+  private get site(): string {
+    return this.scope.siteKey;
+  }
+
+  /**
+   * Options of one REPL call. `load`: the call loads the page and already waited for its slot through
+   * `lease.beforePageLoad()`, so the REPL-side gate must not wait the interval a second time; other
+   * calls (detection, actions) keep the slot the last load left.
+   */
+  private step(
+    title: string,
+    options: { widened?: boolean; generation?: number | undefined; load?: boolean } = {},
+  ): RunOptions {
+    const remaining = this.remainingMs();
+    if (remaining <= 0) throw new OutcomeError("timeout", "the captcha attempt's time budget is spent");
+    const lease = this.scope.lease;
+    return {
+      site: this.site,
+      hostnames: this.hostnames,
+      title: `Bridge ${this.site}: captcha ${title}`,
+      timeoutMs: Math.min(remaining, this.port.stepTimeoutMs),
+      signal: this.budget.signal,
+      generation: options.generation,
+      notBefore: options.load === true ? 0 : (lease?.nextPageLoadAt?.() ?? 0),
+      minIntervalMs: lease?.minIntervalMs ?? 0,
+      extraHosts: options.widened === true ? CAPTCHA_VENDOR_HOSTS : undefined,
+    };
+  }
+
+  /** A wait inside one REPL call, kept a second short of the remaining budget. */
+  private waitMs(ms: number): number {
+    return Math.max(0, Math.min(ms, this.remainingMs() - 1000));
+  }
+
+  private requireTarget(): ChallengeTarget {
+    if (!this.target) throw new OutcomeError("browser_unavailable", "the challenge tab is not open");
+    return this.target;
+  }
+
+  async probe(): Promise<boolean> {
+    const r = await this.port.run(
+      { kind: "captcha", targetId: null, step: { action: "probe" } },
+      this.step("check capability"),
+    );
+    return (r.value as { available?: unknown } | null)?.available === true;
+  }
+
+  async prepare(): Promise<void> {
+    const given = this.options.tab
+      ? this.port.challengeTab(this.options.tab.id, this.site, this.hostnames)
+      : undefined;
+    if (given !== undefined && (await this.widen(given))) {
+      // The adapter's tab: reload the challenge URL with the widened filter and guard.
+      await this.reload(given);
+      return;
+    }
+    // A fresh tab: opened with the normal filter and guard like any session tab and adopted, so the
+    // attempt owns it before anything is widened; then widened and reloaded like the adapter's tab.
+    const session = this.port.challengeSession(this.scope, this.hostnames);
+    this.ownSession = session;
+    const options = this.step("open", { load: true });
+    await this.scope.lease?.beforePageLoad();
+    const r = await this.port.run({ kind: "open", url: this.url }, options);
+    const handle = session.adopt(r.value, r.generation);
+    const fresh: ChallengeTarget = { id: handle.id, generation: r.generation, owner: session };
+    if (!(await this.widen(fresh))) {
+      throw new OutcomeError(
+        "browser_unavailable",
+        "the challenge tab could not be prepared; retry the request",
+      );
+    }
+    await this.reload(fresh);
+  }
+
+  /**
+   * Widens the tab's filter and guard to the vendor hosts. The tab becomes the target before the call
+   * goes out, so `restore` handles it even when the call is cut short (abort, budget, error). False
+   * when the tab was left as it was (gone, off-site, unknown guard) or closed because its guard could
+   * not be replaced.
+   */
+  private async widen(t: ChallengeTarget): Promise<boolean> {
+    const options = this.step("widen tab", { widened: true, generation: t.generation });
+    this.target = t;
+    this.widenSettled = false;
+    const r = await this.port.run(
+      { kind: "guard", targetId: t.id, onSite: true, closeIfStuck: false },
+      options,
+    );
+    this.widenSettled = true;
+    const v = r.value as { replaced?: unknown; closed?: unknown } | null;
+    if (v?.replaced === true) return true;
+    this.target = null;
+    if (v?.closed === true) t.owner.forgetTab(t.id);
+    return false;
+  }
+
+  /** Loads the challenge URL in the widened tab (one politeness wait, through the lease). */
+  private async reload(t: ChallengeTarget): Promise<void> {
+    const options = this.step("reload", { widened: true, generation: t.generation, load: true });
+    await this.scope.lease?.beforePageLoad();
+    await this.port.run({ kind: "open", url: this.url, reuseTargetId: t.id }, options);
+  }
+
+  async detect(): Promise<CaptchaDetection> {
+    const t = this.requireTarget();
+    const step = {
+      action: "detect" as const,
+      noneWaitMs: this.waitMs(this.timings.noneWaitMs),
+      pendingWaitMs: this.waitMs(this.timings.pendingWaitMs),
+      pollMs: this.timings.pollMs,
+    };
+    const r = await this.port.run(
+      { kind: "captcha", targetId: t.id, step },
+      this.step("detect", { generation: t.generation }),
+    );
+    return parseDetection((r.value as { detection?: unknown } | null)?.detection);
+  }
+
+  async act(kind: ActionKind): Promise<CaptchaActResult> {
+    const t = this.requireTarget();
+    const step = {
+      action: "act" as const,
+      expect: kind,
+      settleMs: this.timings.settleMs,
+      textSettleMs: this.timings.textSettleMs,
+      pendingWaitMs: this.waitMs(this.timings.pendingWaitMs),
+      pollMs: this.timings.pollMs,
+    };
+    const r = await this.port.run(
+      { kind: "captcha", targetId: t.id, step },
+      this.step(kind, { generation: t.generation }),
+    );
+    if (r.lastLoadAt !== null) this.scope.lease?.recordPageLoad?.(r.lastLoadAt);
+    return parseActResult(r.value);
+  }
+
+  async restore(): Promise<void> {
+    const t = this.target;
+    this.target = null;
+    const abandoned = this.outer?.aborted === true;
+    if (t) {
+      let restored = false;
+      // A widening call that did not come back may still run in the REPL and could land after a
+      // restore; an abandoned attempt's tab must not stay warm. Both are closed instead.
+      if (this.widenSettled && !abandoned) {
+        try {
+          // Outside the budget and the scope's signal: the restore must run even after a timeout.
+          const r = await this.port.run(
+            { kind: "guard", targetId: t.id, onSite: false, closeIfStuck: true },
+            {
+              site: this.site,
+              hostnames: this.hostnames,
+              title: `Bridge ${this.site}: captcha restore tab`,
+              timeoutMs: this.timings.restoreTimeoutMs,
+              generation: t.generation,
+            },
+          );
+          restored = (r.value as { replaced?: unknown } | null)?.replaced === true;
+        } catch (err) {
+          this.port.logger.debug("restoring a challenge tab failed", {
+            site: this.site,
+            error: errorToOutcome(err).message.slice(0, 200),
+          });
+        }
+      }
+      if (!restored) {
+        // Never keep a tab that may still allow the vendor hosts.
+        t.owner.forgetTab(t.id);
+        await this.port.closeTabById(this.site, t.id, t.generation);
+      }
+    }
+    if (this.ownSession) {
+      const s = this.ownSession;
+      this.ownSession = null;
+      await (abandoned ? s.discard() : s.dispose()).catch(() => undefined);
+    }
   }
 }

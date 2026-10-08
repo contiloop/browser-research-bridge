@@ -1,7 +1,7 @@
 /**
  * The onboarding agent's browser: one browser session through the shimmed port, scoped to the
- * job's hostnames, used one step at a time under the scheduler's site lock (a job holds the lock
- * per browser step, never for its whole duration, so live reads interleave).
+ * job's hostnames, used one step at a time; each step holds the site alone in the scheduler
+ * (exclusive), never the whole job, so live reads interleave between steps.
  *
  * Scope = provisional hostnames ∪ the live manifest's hostnames/extraAllowedHosts (repair) ∪ the
  * staged manifest's hostnames/extraAllowedHosts that the agent may use, re-read before every step.
@@ -13,11 +13,16 @@
  * subdomain), IP literals, `localhost`, and single-label names are never in scope (site
  * isolation). When the scope changes the session is replaced and its tabs are closed. Tabs are
  * named `t1`, `t2`, … for the agent; only bridge-opened tabs exist.
+ *
+ * A challenge attempt (`solveChallenge`) is one more step of the same kind: the port's solver runs on
+ * the agent's tab with the session's scope and lease, while the step holds the site alone.
  */
 import { OutcomeError } from "../../core/outcome.js";
-import type { BrowserPort, BrowserSession, TabHandle } from "../../ports/browser.js";
+import { wrapPageScript } from "../../adapter-kit/page-script.js";
+import type { BrowserPort, BrowserSession, ChallengeAttempt, TabHandle } from "../../ports/browser.js";
 import type { Scheduler, SiteLease } from "../../ports/scheduler.js";
 import { registrableDomain } from "../../core/site-key.js";
+import { DEFAULT_CAPTCHA_BUDGET_MS } from "../aside/captcha.js";
 import { normalizeHostname } from "../aside/hosts.js";
 
 export interface ScopeSources {
@@ -112,6 +117,30 @@ export function approvalPauseMessage(hosts: readonly string[]): string {
   return `The job is paused: the user must approve browser access to ${hosts.join(", ")} (outside the site's own domain). End your turn now without further tool calls.`;
 }
 
+/** Reads the tab's current address (the page the agent looks at), through the shim like any page script. */
+export const CURRENT_URL_SCRIPT = wrapPageScript("return await page.evaluate(() => location.href);");
+
+/** Messages of an attempt that does not run (fixed text; the agent then reports the block). */
+export const CHALLENGE_NOT_RUN = Object.freeze({
+  noCapability: "captcha solving is not available in this browser",
+  turnedOff: "automatic captcha solving is turned off in the settings",
+});
+
+function notRun(message: string): ChallengeAttempt {
+  return { solved: false, kind: "unknown", rounds: 0, message, available: false };
+}
+
+/** An http(s) URL from a page script result, else `fallback`. */
+function pageUrl(value: unknown, fallback: string): string {
+  if (typeof value !== "string") return fallback;
+  try {
+    const u = new URL(value);
+    return u.protocol === "https:" || u.protocol === "http:" ? u.href : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
 /** A lease that forwards to the lease of the step in progress (the session outlives one step). */
 class StepLease implements SiteLease {
   current: SiteLease | null = null;
@@ -160,6 +189,10 @@ export interface AgentBrowserOptions {
   note: (message: string) => void;
   /** Pauses the job for the user's approval of these hosts (the step then fails). */
   pauseForApproval: (hosts: readonly string[]) => void;
+  /** Time budget of one challenge attempt (default 45 s; the port enforces it). */
+  challengeBudgetMs?: number | undefined;
+  /** False when the user turned automatic captcha solving off (`captcha.auto`); default true. */
+  challengesEnabled?: boolean | undefined;
 }
 
 export class AgentBrowser {
@@ -202,7 +235,7 @@ export class AgentBrowser {
     this.tabs.delete(id);
   }
 
-  /** Runs `fn` as one browser step under the site lock with a fresh look at the scope. */
+  /** Runs `fn` as one browser step holding the site alone (exclusive) with a fresh look at the scope. */
   async step<T>(fn: (session: BrowserSession) => Promise<T>): Promise<T> {
     if (this.options.signal.aborted) throw new OutcomeError("timeout", "the job was cancelled");
     const scope = await this.options.scope();
@@ -241,6 +274,7 @@ export class AgentBrowser {
         budgetMs: this.options.stepBudgetMs,
         minIntervalMs,
         signal: this.options.signal,
+        exclusive: true,
       },
       async (lease) => {
         this.lease.current = lease;
@@ -251,6 +285,38 @@ export class AgentBrowser {
         }
       },
     );
+  }
+
+  /**
+   * One challenge attempt on the job's tab `id` (unknown id → the same error as every tab tool), run
+   * as one browser step: the site held alone under the job's holder, the session's scope and lease,
+   * and the tab's current address as the page the solver reloads. Without the port capability, or
+   * with solving turned off, it answers `available: false` without touching the browser.
+   */
+  async solveChallenge(id: string): Promise<ChallengeAttempt> {
+    const tab = this.tab(id);
+    const port = this.options.browser;
+    if (this.options.challengesEnabled === false) return notRun(CHALLENGE_NOT_RUN.turnedOff);
+    if (port.solveChallenge === undefined) return notRun(CHALLENGE_NOT_RUN.noCapability);
+    const budgetMs = this.options.challengeBudgetMs ?? DEFAULT_CAPTCHA_BUDGET_MS;
+    return this.step(async (session) => {
+      let current: unknown = null;
+      try {
+        current = await session.runScript(CURRENT_URL_SCRIPT, {
+          tab,
+          title: "onboarding: captcha page address",
+        });
+      } catch {
+        // The tab's address at opening is the fallback; the solver opens a fresh tab when this one is gone.
+      }
+      const attempt = await port.solveChallenge?.({
+        scope: session.scope,
+        tab,
+        url: pageUrl(current, tab.url),
+        budgetMs,
+      });
+      return attempt ?? notRun(CHALLENGE_NOT_RUN.noCapability);
+    });
   }
 
   /** Closes the session and its tabs. */

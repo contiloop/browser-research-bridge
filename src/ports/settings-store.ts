@@ -58,6 +58,11 @@ export interface SettingsView {
   anthropicApiKey: { set: boolean; locked: boolean };
   /** `onboarding.runtime`; null when the config file cannot be read or holds an invalid value. */
   helperRuntime: { value: HelperRuntimeSetting | null };
+  /**
+   * `captcha.auto` (absent → the default `true`); null when the config file cannot be read or holds
+   * a non-boolean. No environment override, so never locked.
+   */
+  captchaAuto: { value: boolean | null };
   /** Effective browser account; `value` null when the winning place holds an unreadable or invalid value. */
   asideAccount: { value: string | null; locked: boolean; source: SettingSource };
   /** The program-managed connection marker, or null when absent, null, invalid, or unreadable. */
@@ -81,6 +86,8 @@ export interface SettingsChange {
   chatgpt?: ChatgptConnectionSetting | null;
   /** Adds and removes accepted addresses in `oauth.extraResources`; other entries and their order are kept. */
   oauthExtraResources?: { add?: readonly string[]; remove?: readonly string[] };
+  /** Written to `captcha.auto` in `config/bridge.json`; must be a boolean (no environment override, never locked). */
+  captchaAuto?: boolean;
 }
 
 export type SettingsField = keyof SettingsChange;

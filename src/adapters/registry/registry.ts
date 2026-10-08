@@ -81,7 +81,7 @@ export interface SiteRegistryOptions {
   stateStore: SiteStateStore;
   loader: AdapterModuleLoader;
   cache?: Cache | undefined;
-  /** Receives cool-downs after `rate_limited` / blocked pages. */
+  /** Receives cool-downs after `rate_limited` outcomes. */
   scheduler?: CooldownTarget | undefined;
   clock?: Clock | undefined;
   logger?: Logger | undefined;

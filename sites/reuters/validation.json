@@ -4,11 +4,11 @@
   "form": "full",
   "target": "live",
   "passed": true,
-  "startedAt": "2026-10-06T03:57:55.600Z",
-  "finishedAt": "2026-10-06T03:58:52.269Z",
-  "durationMs": 56669,
-  "adapterHash": "67be9587ef8844d2f865d9b47029efff4ec0c48a1e098fd1f4f2121c6e6e1f45",
-  "manifestVersion": 1,
+  "startedAt": "2026-10-08T16:46:02.863Z",
+  "finishedAt": "2026-10-08T16:47:07.402Z",
+  "durationMs": 64539,
+  "adapterHash": "222f3f0f308baff03c42910e5ba8cdd913259ad8f6bc2d95c3ab02c167610e41",
+  "manifestVersion": 2,
   "gatedCheck": "passed",
   "failure": null,
   "steps": [
@@ -35,7 +35,7 @@
       "passed": true,
       "status": "ok",
       "message": "sample search returned 10 results",
-      "durationMs": 6665,
+      "durationMs": 8438,
       "details": {
         "results": 10,
         "nextCursor": true
@@ -46,7 +46,7 @@
       "passed": true,
       "status": "ok",
       "message": "second page returned 10 results (10 new)",
-      "durationMs": 6327,
+      "durationMs": 6718,
       "details": {
         "results": 10,
         "fresh": 10
@@ -57,7 +57,7 @@
       "passed": true,
       "status": "ok",
       "message": "sample read ok (4679 characters, subscriber)",
-      "durationMs": 11809,
+      "durationMs": 13253,
       "details": {
         "textLength": 4679,
         "accessLevel": "subscriber",
@@ -70,7 +70,7 @@
       "passed": true,
       "status": "ok",
       "message": "gated page reads as subscriber; logged-out form classified auth_required (paid Reuters article without a signed-in session (the paywall is applied client-side))",
-      "durationMs": 14074,
+      "durationMs": 18346,
       "details": {
         "textLength": 5031,
         "accessLevel": "subscriber",
@@ -84,7 +84,7 @@
       "passed": true,
       "status": "ok",
       "message": "smokeTest passed",
-      "durationMs": 17794,
+      "durationMs": 17784,
       "details": {}
     }
   ]

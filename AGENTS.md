@@ -22,10 +22,11 @@ browser-research-bridge/
 │   ├── engineering-notes.md         ← traps (symptom → cause → response), non-obvious mechanisms, checklists
 │   ├── operations.md                ← setup order, env/config by role, run/verify commands, tunnels, launchd
 │   ├── contracts.md                 ← wire contracts: MCP tools, OAuth endpoints, settings-page API, CLI exit codes
-│   ├── ADAPTERS.md                  ← adapter authoring manual; the onboarding agent reads it (§10, §12 cited by its prompt)
+│   ├── ADAPTERS.md                  ← adapter authoring manual; the onboarding agent reads it (§12 cited by its prompt; §10 is the validation rule set `run_validation` enforces)
 │   ├── BROWSER.md                   ← Aside port and page-script shim manual; the onboarding agent reads it
 │   ├── ONBOARDING.md                ← helper (onboarding agent) manual: Claude/Codex runtimes, tools, job states, CLI
 │   ├── DASHBOARD.md                 ← settings page manual (areas, Getting started, opener) and admin API
+│   ├── ACCEPTANCE.md                ← real-environment acceptance record with evidence
 │   └── tracking/
 │       ├── status.md                ← built and verified vs remaining scope
 │       ├── findings.md              ← unresolved problems with why-not-now
@@ -43,7 +44,9 @@ browser-research-bridge/
 │           ├── 0010-login-flags-and-cooldown-policy.md
 │           ├── 0011-setup-only-mode-and-in-process-restart.md
 │           ├── 0012-helper-on-claude-or-codex-subscriptions.md
-│           └── 0013-reuters-as-reference-adapter.md
+│           ├── 0013-reuters-as-reference-adapter.md
+│           ├── 0014-captcha-attempts-and-vendor-hosts.md
+│           └── 0015-per-site-pool-and-no-block-cooldown.md
 ├── src/
 │   ├── core/
 │   │   └── AGENTS.md                ← pure domain logic: query, ids, cursor, merge, outcomes, lifecycle
@@ -53,11 +56,13 @@ browser-research-bridge/
 │   │   └── AGENTS.md                ← the only runtime import site adapters may use
 │   ├── adapters/
 │   │   ├── aside/
-│   │   │   └── AGENTS.md            ← Aside REPL browser port, page-script shim, scheduler
+│   │   │   └── AGENTS.md            ← Aside REPL browser port, page-script shim, per-site pool scheduler,
+│   │   │                                  captcha solver (captcha.ts, browser:captcha-check in captcha-check.ts)
 │   │   ├── oauth/
 │   │   │   └── AGENTS.md            ← built-in OAuth 2.1 server and bearer middleware
 │   │   ├── mcp/
-│   │   │   └── AGENTS.md            ← the five tools, search/read services, Streamable HTTP handler
+│   │   │   └── AGENTS.md            ← the five tools, search/read services, challenge coordinator (challenge.ts),
+│   │   │                                  Streamable HTTP handler
 │   │   ├── registry/
 │   │   │   └── AGENTS.md            ← site registration, loading, lifecycle effects, swap and removal
 │   │   ├── validation/
@@ -72,17 +77,18 @@ browser-research-bridge/
 │   │   ├── tunnel-client/
 │   │   │   └── AGENTS.md            ← OpenAI's connection tool: key file, profile, managed child, readiness
 │   │   ├── storage/
-│   │   │   └── AGENTS.md            ← JSON-file stores under data/: sites, tokens, cache
+│   │   │   └── AGENTS.md            ← JSON-file stores under data/: sites, tokens, cache, last helper check
 │   │   └── git/
 │   │       └── AGENTS.md            ← per-site auto-commit
 │   └── app/
 │       └── AGENTS.md                ← config loading, composition root (app.ts, bridge-process.ts), run modes (run-mode.ts),
 │                                      ChatGPT connection (chatgpt-connection.ts), settings-page support (settings-page.ts,
-│                                      settings.ts), listeners, health timer
+│                                      settings.ts), helper checks (helper-check.ts), listeners, health timer
 ├── sites/
 │   └── AGENTS.md                    ← one adapter folder per site (reuters, …)
-└── ops/
-    └── AGENTS.md                    ← launchd templates, installer, and the opener's Node search
+├── ops/
+│   └── AGENTS.md                    ← launchd templates, installer, the opener's Node search and update check (update-check.sh)
+└── test/ops/update-check.test.sh    ← the opener's update check in temporary clones (not part of npm run verify)
 ```
 
 ## Hard gates
@@ -100,11 +106,11 @@ The complete rule set is in `docs/standards.md`.
 - Always read `docs/standards.md`, `docs/engineering-notes.md`, and the `AGENTS.md` of every module you will touch.
 - Touching OAuth, the public listener, the dashboard guards, or anything that decides who may call what: read the authentication flow and the authorization matrix in `docs/security.md` and the OAuth section of `docs/contracts.md` first.
 - Changing a tool's input, output, status values, or pagination: read `docs/contracts.md` and the search, read, and cursor sections of `docs/business-rules.md`; ChatGPT's `search`/`fetch` shapes are fixed by ChatGPT, not by this project.
-- Editing the browser port, the shim, or any page script: read the REPL shared-scope, `aside`-word, and session-loss entries in `docs/engineering-notes.md`, plus `docs/BROWSER.md`.
+- Editing the browser port, the shim, the captcha solver, or any page script: read the REPL shared-scope, `aside`-word, session-loss, and challenge-attempt entries in `docs/engineering-notes.md`, plus `docs/BROWSER.md`; the captcha vendor hosts live only in `CAPTCHA_VENDOR_HOSTS` (`docs/standards.md`).
 - Editing an adapter in `sites/` or anything in `src/adapter-kit/`: read `docs/ADAPTERS.md` and the validation-hash entry in `docs/engineering-notes.md`; re-run `npm run site:validate -- <key>` afterwards.
-- Changing the onboarding prompt or tools, or editing `docs/ADAPTERS.md`/`docs/BROWSER.md`: the agent reads those two files by path and its prompt cites ADAPTERS.md §10 and §12; keep paths and section numbers stable.
-- Changing lifecycle, health-check, or registry behavior: read the lifecycle and onboarding-job sections of `docs/business-rules.md`.
-- Touching the settings page, run-mode control, the settings store, the ChatGPT connection, or the opener (`src/adapters/dashboard/`, `src/adapters/settings/`, `src/adapters/tunnel-client/`, `src/app/{run-mode,bridge-process,chatgpt-connection,settings-page,settings}.ts`, `Open Settings.command`): read the settings-page sections of `docs/security.md` and `docs/contracts.md`, `docs/DASHBOARD.md`, and the run-mode section of `docs/business-rules.md`; every new state-changing route needs a test that it is refused without the cookie and with a foreign `Origin`.
+- Changing the onboarding prompt or tools, or editing `docs/ADAPTERS.md`/`docs/BROWSER.md`: the agent reads those two files by path and its prompt cites ADAPTERS.md §12 and the tools rely on §10 (validation); keep paths and section numbers stable.
+- Changing lifecycle, health-check, scheduler, captcha-attempt, or registry behavior: read the lifecycle, browser-scheduling, challenge-attempt, and onboarding-job sections of `docs/business-rules.md`.
+- Touching the settings page, run-mode control, the settings store, the ChatGPT connection, or the opener (`src/adapters/dashboard/`, `src/adapters/settings/`, `src/adapters/tunnel-client/`, `src/app/{run-mode,bridge-process,chatgpt-connection,settings-page,settings,helper-check}.ts`, `Open Settings.command`, `ops/update-check.sh`): read the settings-page sections of `docs/security.md` and `docs/contracts.md`, `docs/DASHBOARD.md`, and the run-mode section of `docs/business-rules.md`; every new state-changing route needs a test that it is refused without the cookie and with a foreign `Origin`; a change to the opener or `ops/update-check.sh` must pass `bash test/ops/update-check.test.sh`.
 - Touching the Codex helper runtime or upgrading Codex: read `src/adapters/onboarding/codex-runtime.AGENTS-evidence.md`; re-run that evidence on the installed Codex, and if a restriction can no longer be enforced, ship Claude only rather than weaken it.
 - Starting, stopping, or restarting the bridge, or running anything against the real Aside browser: read `docs/operations.md` (launchd, tunnel start order); the live background service runs from this folder's working tree; never kill it with `pkill -f src/app/main.ts`.
 
@@ -113,7 +119,7 @@ The complete rule set is in `docs/standards.md`.
 Stop and report to the user immediately when you find:
 
 - a credential exposure: a cookie, password, OAuth token, admin token, passphrase, tunnel runtime key, or API key in a log line, tool result, API response, page, job log, commit, the helper's environment, or an instruction text for an AI;
-- a reach beyond the approved surface: a public route other than `/mcp` and the OAuth routes, a tool or page script that reaches a host outside the site's declared hosts, a shim layer that can be bypassed, the settings page answering without the admin cookie and same-origin checks, the public listener or a connection tool started without a valid passphrase, a connection tool targeting anything but the public port, or a helper (Claude or Codex) with a tool, file, network, or command capability beyond the bridge's helper tools;
+- a reach beyond the approved surface: a public route other than `/mcp` and the OAuth routes, a tool or page script that reaches a host outside the site's declared hosts (only the bridge's own challenge attempt may also reach the fixed `CAPTCHA_VENDOR_HOSTS`, on its tab and while it runs), a shim layer that can be bypassed, the settings page answering without the admin cookie and same-origin checks, the public listener or a connection tool started without a valid passphrase, a connection tool targeting anything but the public port, or a helper (Claude or Codex) with a tool, file, network, or command capability beyond the bridge's helper tools;
 - an OAuth bypass: `/mcp` answering without a valid token, a token accepted for a resource the bridge does not serve, consent granted without the passphrase, or a code exchanged without a matching PKCE verifier;
 - a bridge commit, onboarding write, or adapter change outside `sites/<key>/`;
 - a read that returns `ok` with partial text, or a login or access failure reported as `empty`;

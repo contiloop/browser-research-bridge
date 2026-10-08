@@ -1,6 +1,6 @@
 /**
  * Core factory: wires config → browser port, scheduler, cache, registry, validator, health timer,
- * OAuth server, MCP tool services, and the public listener. In production the run-mode controller
+ * captcha coordinator, OAuth server, MCP tool services, and the public listener. In production the run-mode controller
  * (./run-mode.ts) calls it once per core start with the configuration it just loaded, so a restart
  * always gets a new instance (`stop()` runs once); tests call it with a fake browser and stub
  * adapter helpers.
@@ -22,6 +22,7 @@ import {
 import { GitSiteCommitter } from "../adapters/git/index.js";
 import type { OnboardingJobService } from "../adapters/onboarding/index.js";
 import {
+  ChallengeCoordinator,
   ReadService,
   SearchService,
   createBridgeMcpServer,
@@ -93,6 +94,8 @@ export interface BridgeServices {
   registry: SiteRegistryService;
   validator: SiteValidator;
   health: HealthChecker;
+  /** Captcha attempts after a blocked live call or "Check now" (`captcha.auto` and its tunables). */
+  challenges: ChallengeCoordinator;
   committer: GitSiteCommitter;
   oauth: OAuthServer;
   search: SearchService;
@@ -134,7 +137,10 @@ export interface BridgeApp {
   /** Adds a listener started after the public listener (call before `start`). */
   attach(listener: BridgeListener): void;
   start(options?: StartOptions): Promise<StartedBridge>;
-  /** Graceful shutdown: timers, onboarding jobs, attached listeners, public listener, browser port. Idempotent. */
+  /**
+   * Graceful shutdown: timers, captcha attempts, onboarding jobs, attached listeners, public listener,
+   * browser port. Idempotent.
+   */
   stop(): Promise<void>;
 }
 
@@ -152,7 +158,9 @@ export function createApp(options: CreateAppOptions): BridgeApp {
   };
 
   const scheduler = new InMemoryScheduler({
-    maxConcurrentSites: tunables.maxConcurrentSites,
+    maxConcurrentPerSite: tunables.maxConcurrentPerSite,
+    maxConcurrentTasks: tunables.maxConcurrentTasks,
+    concurrentStaggerMs: tunables.concurrentStaggerMs,
     coolDownMs,
     now: () => clock.now().getTime(),
   });
@@ -169,6 +177,8 @@ export function createApp(options: CreateAppOptions): BridgeApp {
       logger,
       stepTimeoutMs: tunables.adapterStepTimeoutMs,
       warmTabTtlMs: tunables.warmTabTtlSeconds * 1000,
+      // One warm tab per pool place, so parallel calls on a site can each reuse one.
+      maxWarmTabsPerSite: tunables.maxConcurrentPerSite,
     });
   const runtime: AdapterRuntime = { browser, scheduler, helpers, logger, clock };
 
@@ -200,6 +210,20 @@ export function createApp(options: CreateAppOptions): BridgeApp {
     clock,
     logger,
   });
+  // One coordinator per core: the live tools and "Check now" share each site's single attempt.
+  const challenges = new ChallengeCoordinator({
+    settings: {
+      auto: config.captcha.auto,
+      attemptBudgetMs: tunables.captchaAttemptBudgetMs,
+      inlineMinRemainingMs: tunables.captchaInlineMinRemainingMs,
+      rerunReserveMs: tunables.captchaRerunReserveMs,
+    },
+    browser,
+    scheduler,
+    registry,
+    logger,
+    clock,
+  });
   const health = new HealthChecker({
     registry,
     scheduler,
@@ -207,6 +231,7 @@ export function createApp(options: CreateAppOptions): BridgeApp {
     intervalMs: tunables.healthCheckIntervalSeconds * 1000,
     clock,
     logger,
+    challenges,
   });
   const committer = new GitSiteCommitter({
     sitesDir: config.sitesDir,
@@ -229,7 +254,7 @@ export function createApp(options: CreateAppOptions): BridgeApp {
 
   const runSiteTask: SiteTaskRunner = (site, taskOptions, task) =>
     runAdapterTask(runtime, site, taskOptions, task);
-  const toolDeps = { registry, runSiteTask, cache, tunables, logger, clock };
+  const toolDeps = { registry, runSiteTask, cache, tunables, logger, clock, challenges };
   const search = new SearchService(toolDeps);
   const read = new ReadService(toolDeps);
   const mcp = createMcpHttpHandler({
@@ -269,6 +294,7 @@ export function createApp(options: CreateAppOptions): BridgeApp {
     registry,
     validator,
     health,
+    challenges,
     committer,
     oauth,
     search,
@@ -298,6 +324,8 @@ export function createApp(options: CreateAppOptions): BridgeApp {
   const stop = (): Promise<void> => {
     stopping ??= (async () => {
       health.stop();
+      // Running captcha attempts are abandoned; the browser shutdown below closes their tabs.
+      challenges.dispose();
       if (purgeTimer !== null) clearInterval(purgeTimer);
       await jobs.stop().catch((error: unknown) => {
         logger.warn("onboarding jobs stop failed", { error: (error as Error).message });

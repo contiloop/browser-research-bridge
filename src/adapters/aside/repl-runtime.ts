@@ -5,7 +5,7 @@
  * so it is plain ES2023 kept as a string and exercised by the unit tests in a `node:vm` context with
  * a fake REPL. It is evaluated once per REPL call as `async function (env, userFn)` and returns a
  * JSON envelope:
- *   { ok: true, value, lastLoadAt } |
+ *   { ok: true, value, lastLoadAt, pageUrl? } |
  *   { ok: false, kind: "violation" | "script" | "timeout" | "tab_gone" | "globals" | "internal", ... }
  *
  * What it enforces on every call:
@@ -20,9 +20,14 @@
  * - `fetch`/`openTab` wrappers accept only the scope's hostnames; `fetch` follows redirects by hand
  *   and checks every hop; `set-cookie` headers are dropped.
  * - After every call, for each touched tab: the in-page guard stores (isolated world, every frame)
- *   are drained, the main-frame URL is checked (off-scope → about:blank), and popups opened from
- *   bridge tabs are closed. Any attributed violation fails the call, even if the script caught the
- *   error. Blocks caused by the site's own scripts are returned as `pageBlocked` (not a failure).
+ *   are drained, the main-frame URL is checked (off-scope → about:blank; the last on-site one is
+ *   returned as `pageUrl`), and popups opened from bridge tabs are closed. Any attributed violation
+ *   fails the call, even if the script caught the error. Blocks caused by the site's own scripts are returned as `pageBlocked` (not a failure).
+ * - Init-script identifiers: the guard scripts registered on each bridge tab are remembered (a
+ *   non-enumerable REPL global) so the `guard` op can remove and replace them. Only challenge attempts
+ *   use it, to widen a tab to the captcha vendor hosts and to restore it afterwards.
+ * - `captcha` op: runs the privileged challenge step of captcha.ts on a bridge tab (never a user tab),
+ *   with the REPL's `captcha` global, and the same post-step drain and popup sweep as any step.
  */
 export const REPL_RUNTIME_SOURCE = String.raw`async function (env, userFn) {
   "use strict";
@@ -39,7 +44,7 @@ export const REPL_RUNTIME_SOURCE = String.raw`async function (env, userFn) {
   }
 
   var hosts = env.hostnames;
-  var state = { violations: [], lastLoadAt: null, notBefore: env.notBefore, opened: [], pageBlocked: [] };
+  var state = { violations: [], lastLoadAt: null, notBefore: env.notBefore, opened: [], pageBlocked: [], pageUrl: null };
   // Target ids of every tab this bridge opened in this REPL context. A non-enumerable REPL global:
   // scripts cannot name it (scan) or reach the global object (shadowing + hardening).
   var reg = globalThis[env.registryKey];
@@ -69,11 +74,25 @@ export const REPL_RUNTIME_SOURCE = String.raw`async function (env, userFn) {
     state.lastLoadAt = t;
     state.notBefore = t + env.minIntervalMs;
   };
+  // Identifiers of the guard init scripts registered on each bridge tab (target id → identifiers).
+  var initReg = globalThis[env.initRegistryKey];
+  if (!initReg) {
+    initReg = new Map();
+    Object.defineProperty(globalThis, env.initRegistryKey, { value: initReg, enumerable: false, writable: false, configurable: false });
+  }
+  var forget = function (id) { reg.delete(String(id)); initReg.delete(String(id)); };
+  var addGuards = async function (raw) {
+    var ids = [];
+    var a = await raw._sendToTarget("Page.addScriptToEvaluateOnNewDocument", { source: env.isolatedGuard, worldName: env.worldName });
+    if (a && a.identifier !== undefined && a.identifier !== null) ids.push(String(a.identifier));
+    var b = await raw._sendToTarget("Page.addScriptToEvaluateOnNewDocument", { source: env.mainGuard });
+    if (b && b.identifier !== undefined && b.identifier !== null) ids.push(String(b.identifier));
+    initReg.set(String(raw.targetId), ids);
+  };
   var install = async function (raw) {
     await raw._sendToTarget("Network.setBlockedURLs", { urls: [], urlPatterns: env.blockPatterns });
     try { await raw._sendToTarget("Network.setBypassServiceWorker", { bypass: true }); } catch (e) { /* older browsers */ }
-    await raw._sendToTarget("Page.addScriptToEvaluateOnNewDocument", { source: env.isolatedGuard, worldName: env.worldName });
-    await raw._sendToTarget("Page.addScriptToEvaluateOnNewDocument", { source: env.mainGuard });
+    await addGuards(raw);
   };
   // Reads (and empties) the isolated-world guard stores of the tab's frames (main frame first).
   var drainGuard = async function (raw) {
@@ -127,10 +146,12 @@ export const REPL_RUNTIME_SOURCE = String.raw`async function (env, userFn) {
       try { await anyRaw._sendToTarget("Target.closeTarget", { targetId: String(ti.targetId) }); } catch (e) { /* already gone */ }
     }
   };
+  // Checks a touched tab after a step; the last on-site page URL it sees is returned as pageUrl.
   var postCheck = async function (raw) {
     var u = "";
     try { u = String(raw.url()); } catch (e) { return; }
     await drainGuard(raw);
+    if (inScope(u) !== null) state.pageUrl = u;
     if (pageUrlOk(u)) return;
     state.violations.push({ kind: "navigation", host: hostOf(u) || "an off-site page" });
     try { await raw.goto("about:blank"); } catch (e) { /* the call fails anyway */ }
@@ -148,7 +169,7 @@ export const REPL_RUNTIME_SOURCE = String.raw`async function (env, userFn) {
       await raw.goto(url, waitUntil ? { waitUntil: waitUntil } : {});
     } catch (e) {
       try { await realCloseTab(raw); } catch (x) { /* ignore */ }
-      reg.delete(String(raw.targetId));
+      forget(raw.targetId);
       throw e;
     }
     return raw;
@@ -324,7 +345,7 @@ export const REPL_RUNTIME_SOURCE = String.raw`async function (env, userFn) {
     state.opened.splice(i, 1);
     await postCheck(raw);
     await realCloseTab(raw);
-    reg.delete(String(raw.targetId));
+    forget(raw.targetId);
   };
   var scriptSnapshot = async function (p, opts) {
     var raw = unwrap(p);
@@ -350,6 +371,7 @@ export const REPL_RUNTIME_SOURCE = String.raw`async function (env, userFn) {
     try { json = JSON.stringify(value === undefined ? null : value); } catch (e) { return { ok: false, kind: "script", message: "the result is not JSON-serializable", lastLoadAt: state.lastLoadAt }; }
     var out = { ok: true, value: JSON.parse(json === undefined ? "null" : json), lastLoadAt: state.lastLoadAt };
     if (state.pageBlocked.length) out.pageBlocked = state.pageBlocked;
+    if (state.pageUrl !== null) out.pageUrl = state.pageUrl;
     return out;
   };
   var fail = function (err) {
@@ -378,7 +400,7 @@ export const REPL_RUNTIME_SOURCE = String.raw`async function (env, userFn) {
       await sweepPopups(raw0);
       if (state.violations.length && !op.reuseTargetId) {
         try { await realCloseTab(raw0); } catch (e) { /* ignore */ }
-        reg.delete(String(raw0.targetId));
+        forget(raw0.targetId);
       }
       return finish({ targetId: String(raw0.targetId), url: String(raw0.url()) });
     }
@@ -389,7 +411,7 @@ export const REPL_RUNTIME_SOURCE = String.raw`async function (env, userFn) {
       var swept = state.violations;
       state.violations = [];
       if (raw1) await realCloseTab(raw1);
-      reg.delete(String(op.targetId));
+      forget(op.targetId);
       return finish({ closed: Boolean(raw1), popups: swept });
     }
     if (op.kind === "snapshot") {
@@ -436,13 +458,62 @@ export const REPL_RUNTIME_SOURCE = String.raw`async function (env, userFn) {
           await postCheck(touched[ti]);
           await sweepPopups(touched[ti]);
           try { await realCloseTab(touched[ti]); } catch (e) { /* ignore */ }
-          reg.delete(String(touched[ti].targetId));
+          forget(touched[ti].targetId);
         }
         state.opened = [];
         if (sessionRaw) await postCheck(sessionRaw);
         await sweepPopups(sessionRaw);
       }
       return finish(result);
+    }
+    if (op.kind === "guard") {
+      // Re-issues the request filter and replaces the guard init scripts with this call's (widened or
+      // normal) ones. Only bridge tabs; never a tab whose registered scripts are unknown.
+      var gid = String(op.targetId);
+      var raw5 = reg.has(gid) ? await realGetTab(gid) : undefined;
+      if (!raw5) { forget(gid); return finish({ replaced: false, closed: false, reason: "gone" }); }
+      if (op.onSite) {
+        var u5 = "";
+        try { u5 = String(raw5.url()); } catch (e) { u5 = ""; }
+        if (inScope(u5) === null) return finish({ replaced: false, closed: false, reason: "off-site" });
+      }
+      var ids5 = initReg.get(gid);
+      var stuck = !ids5 || ids5.length < 2;
+      if (stuck && !op.closeIfStuck) return finish({ replaced: false, closed: false, reason: "unknown guard" });
+      if (!stuck) {
+        await raw5._sendToTarget("Network.setBlockedURLs", { urls: [], urlPatterns: env.blockPatterns });
+        for (var gi = 0; gi < ids5.length; gi++) {
+          try { await raw5._sendToTarget("Page.removeScriptToEvaluateOnNewDocument", { identifier: ids5[gi] }); } catch (e) { stuck = true; }
+        }
+      }
+      if (stuck) {
+        // The tab may keep a guard that cannot be replaced: it must not be used again.
+        try { await realCloseTab(raw5); } catch (e) { /* already gone */ }
+        forget(gid);
+        return finish({ replaced: false, closed: true, reason: "guard not replaceable" });
+      }
+      await addGuards(raw5);
+      return finish({ replaced: true, closed: false });
+    }
+    if (op.kind === "captcha") {
+      // Privileged challenge step (captcha.ts) with the REPL's captcha capability, on a bridge tab only.
+      var cap;
+      try { cap = typeof captcha === "object" && captcha !== null ? captcha : undefined; } catch (e) { cap = undefined; }
+      var raw6 = null;
+      if (op.targetId) {
+        if (!reg.has(String(op.targetId))) { var gone = new Error("the tab is gone"); gone.__brbTabGone = true; throw gone; }
+        raw6 = await getRaw(op.targetId);
+        await postCheck(raw6);
+        if (state.violations.length) return finish(null);
+      }
+      var tools = { sleep: realSleep, gate: gate, worldName: env.captcha.worldName, pageSource: env.captcha.pageSource, table: env.captcha.table };
+      var stepOut;
+      try {
+        stepOut = await withDeadline(userFn(raw6, cap, op.step, tools));
+      } finally {
+        if (raw6) { await postCheck(raw6); await sweepPopups(raw6); }
+      }
+      return finish(stepOut);
     }
     return { ok: false, kind: "internal", message: "unknown operation" };
   } catch (err) {

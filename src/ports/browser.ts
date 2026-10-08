@@ -9,6 +9,9 @@
  * Failures are thrown as `OutcomeError` (src/core/outcome.ts): `browser_unavailable` when Aside is not
  * reachable (action "run `aside login`" when the CLI login expired), `timeout` when a step exceeds its
  * budget, `adapter_error` for a shim violation (the violation is logged).
+ *
+ * `solveChallenge` is the only port operation that is not reachable from adapters (they get a
+ * `BrowserSession`); it is called by bridge code after an adapter reported a block page.
  */
 import type { JsonValue } from "./json.js";
 import type { SiteLease } from "./scheduler.js";
@@ -85,6 +88,12 @@ export interface BrowserSession {
   /** Cookie-bearing fetch from the browser context, restricted to the scope's hostnames. */
   fetch(url: string, init?: CookieFetchInit): Promise<CookieFetchResponse>;
   screenshot(tab: TabHandle): Promise<Screenshot>;
+  /**
+   * The main-frame URL, on the scope's hostnames, that this session's tabs last showed after a step
+   * (opening a tab, a page script, a snapshot); null before any. A cookie fetch does not change it.
+   * The bridge aims a challenge attempt after a blocked search at it (the site's search page).
+   */
+  lastUrl(): string | null;
   /** Closes the tabs this session opened (a warm tab may be retained by the port). */
   dispose(): Promise<void>;
 }
@@ -97,9 +106,54 @@ export interface BrowserStatus {
   action?: string | undefined;
 }
 
+/** `none`: no challenge is visible; `unknown`: a challenge or block page the solver cannot act on. */
+export type ChallengeKind = "checkbox" | "slider" | "text" | "none" | "unknown";
+
+/** Result of one challenge attempt. */
+export interface ChallengeAttempt {
+  /**
+   * An action was performed and the page then no longer showed a recognized widget or block marker.
+   * It is not proof: the caller confirms by re-running the adapter call.
+   */
+  solved: boolean;
+  kind: ChallengeKind;
+  /** Action rounds performed (at most 2). */
+  rounds: number;
+  /**
+   * Human-readable summary from a fixed set of texts (e.g. "text captcha: no vision model is
+   * configured in Aside"), never page content; callers may show and log it.
+   */
+  message: string;
+  /** False when the browser has no captcha capability (older Aside). */
+  available: boolean;
+}
+
+export interface SolveChallengeOptions {
+  /** The site's scope; the attempt holds its lease's politeness like any step. */
+  scope: BrowserScope;
+  /** The tab the adapter met the challenge in; used when it is still open, on-site, and in this scope. */
+  tab?: TabHandle | undefined;
+  /**
+   * The challenge URL (on the scope's hostnames); opened in a session tab when `tab` is not usable.
+   * Live calls pass the failed read's URL, else the adapter session's last page (`lastUrl()`), else
+   * the site's homepage.
+   */
+  url: string;
+  /** Time budget for detection plus at most two action rounds. */
+  budgetMs: number;
+}
+
 export interface BrowserPort {
   status(): Promise<BrowserStatus>;
   openSession(scope: BrowserScope): Promise<BrowserSession>;
+  /**
+   * One bounded challenge attempt with the bridge's own solver (privileged bridge code, not an adapter
+   * script). While it runs, the tab may also reach the fixed captcha vendor hosts; afterwards its filter
+   * and guard are restored. Throws `OutcomeError` only for setup failures (`adapter_error` for a URL
+   * outside the scope, `browser_unavailable`); a spent budget is an unsolved result.
+   * Optional so in-memory test ports need not implement it; a port without it cannot solve challenges.
+   */
+  solveChallenge?(options: SolveChallengeOptions): Promise<ChallengeAttempt>;
   /** Closes bridge-owned tabs and stops the child process. */
   shutdown(): Promise<void>;
 }

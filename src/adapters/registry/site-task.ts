@@ -1,6 +1,7 @@
 /**
- * Runs one adapter call in the browser (builds the adapter's `ctx`): acquires the site lock through the
- * scheduler, opens a browser session scoped to the site's hosts (manifest `hostnames` ∪
+ * Runs one adapter call in the browser (builds the adapter's `ctx`): gets a place on the site through
+ * the scheduler (a pool place, or the whole site when `exclusive`), opens a browser session scoped to
+ * the site's hosts (manifest `hostnames` ∪
  * `extraAllowedHosts`) under the lease (politeness interval, budget), builds the adapter context,
  * and always disposes the session. Used by validation, health checks, and live search/read.
  */
@@ -30,6 +31,8 @@ export interface AdapterTaskOptions {
   signal?: AbortSignal | undefined;
   /** Run even while the site cools down (user-initiated checks). */
   ignoreCooldown?: boolean | undefined;
+  /** Hold the site alone (validation, health checks); default: share the site's pool (tool calls). */
+  exclusive?: boolean | undefined;
 }
 
 /** Browser scope of a site: ownership hostnames plus the navigation/request-only extra hosts. */
@@ -65,6 +68,7 @@ export async function runAdapterTask<T>(
       signal: options.signal,
       budgetMs: options.budgetMs,
       ignoreCooldown: options.ignoreCooldown,
+      exclusive: options.exclusive,
     },
     async (lease) => {
       const session = await runtime.browser.openSession({

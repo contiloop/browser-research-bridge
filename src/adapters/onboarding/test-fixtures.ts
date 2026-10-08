@@ -13,7 +13,14 @@ import {
   passedReport,
   silentLogger,
 } from "../../../test/support/site-fixtures.js";
-import type { BrowserPort, BrowserScope, BrowserSession, TabHandle } from "../../ports/browser.js";
+import type {
+  BrowserPort,
+  BrowserScope,
+  BrowserSession,
+  ChallengeAttempt,
+  SolveChallengeOptions,
+  TabHandle,
+} from "../../ports/browser.js";
 import type { SiteCommitAction } from "../../ports/site-store.js";
 import { InMemoryScheduler } from "../aside/scheduler.js";
 import { promoteStaging, removeSite } from "../registry/operations.js";
@@ -28,7 +35,9 @@ import { MemoryJobStore } from "./job-store.js";
 import { OnboardingJobService } from "./service.js";
 import type { OnboardingJobServiceOptions } from "./service.js";
 import { SiteStagingValidation } from "./staging-validation.js";
-import type { AgentRunRequest, AgentRunResult, AgentRunner, AgentToolResult } from "./types.js";
+import { createOnboardingTools } from "./tools.js";
+import type { ToolHost } from "./tools.js";
+import type { AgentRunRequest, AgentRunResult, AgentRunner, AgentTool, AgentToolResult } from "./types.js";
 
 export { adapterSource, manifestFor };
 
@@ -107,21 +116,35 @@ export interface RecordingBrowser extends BrowserPort {
   opened: { url: string; hosts: readonly string[] }[];
   scripts: string[];
   disposed: number;
+  /** Every `solveChallenge` call (only when the port was given a challenge answer). */
+  challenges: SolveChallengeOptions[];
+}
+
+export interface RecordingBrowserOptions {
+  /** The value a page script returns (default `{ ran: true }`); a throw fails the script. */
+  scriptResult?: ((script: string) => unknown) | undefined;
+  /**
+   * Gives the port the challenge capability with this answer; without it the port has no
+   * `solveChallenge` (like a browser without captcha solving).
+   */
+  challenge?: ((options: SolveChallengeOptions) => Promise<ChallengeAttempt>) | undefined;
 }
 
 /** A browser port that records requests; it never pretends to be a site (no page content). */
-export function recordingBrowser(): RecordingBrowser {
+export function recordingBrowser(options: RecordingBrowserOptions = {}): RecordingBrowser {
   let tabN = 0;
   const port: RecordingBrowser = {
     scopes: [],
     opened: [],
     scripts: [],
     disposed: 0,
+    challenges: [],
     async status() {
       return { reachable: true, account: "u0" };
     },
     async openSession(scope: BrowserScope): Promise<BrowserSession> {
       port.scopes.push(scope);
+      let last: string | null = null;
       return {
         scope,
         async openTab(url: string) {
@@ -131,6 +154,7 @@ export function recordingBrowser(): RecordingBrowser {
           }
           await scope.lease?.beforePageLoad();
           port.opened.push({ url, hosts: scope.hostnames });
+          last = url;
           tabN += 1;
           return { id: `target-${tabN}`, url };
         },
@@ -140,13 +164,16 @@ export function recordingBrowser(): RecordingBrowser {
         },
         async runScript(script: string) {
           port.scripts.push(script);
-          return { ran: true };
+          return options.scriptResult ? options.scriptResult(script) : { ran: true };
         },
         async fetch() {
           throw new Error("not used");
         },
         async screenshot() {
           return { mimeType: "image/png" as const, base64: "iVBORw0KGgo=" };
+        },
+        lastUrl() {
+          return last;
         },
         async dispose() {
           port.disposed += 1;
@@ -155,7 +182,40 @@ export function recordingBrowser(): RecordingBrowser {
     },
     async shutdown() {},
   };
+  const answer = options.challenge;
+  if (answer !== undefined) {
+    port.solveChallenge = async (o: SolveChallengeOptions) => {
+      port.challenges.push(o);
+      return answer(o);
+    };
+  }
   return port;
+}
+
+/**
+ * The tool list a job's run hands its runtime (key known, so without `resolve_site`); the host is
+ * never called while the list is built, so a host that refuses everything is enough.
+ */
+export function jobToolList(key: string | null = "demo"): AgentTool[] {
+  const refuse = (): never => {
+    throw new Error("not used");
+  };
+  const host: ToolHost = {
+    kind: "add",
+    signal: new AbortController().signal,
+    key: () => key,
+    browser: refuse,
+    staging: refuse,
+    references: {} as ToolHost["references"],
+    validation: {} as ToolHost["validation"],
+    resolveSite: refuse,
+    terminal: () => null,
+    setTerminal: refuse,
+    log: () => undefined,
+    jobActive: () => true,
+    requireApprovedHosts: refuse,
+  };
+  return createOnboardingTools(host);
 }
 
 export interface Harness {
@@ -262,7 +322,7 @@ export async function makeHarness(): Promise<Harness> {
           remove: (key, options) => removeSite(opsDeps, key, options),
         },
         browser,
-        scheduler: new InMemoryScheduler({ maxConcurrentSites: 4, coolDownMs: 600_000 }),
+        scheduler: new InMemoryScheduler({ coolDownMs: 600_000 }),
         repoRoot: dir,
         sitesDir,
         workRoot: join(dir, "data", "jobs", "work"),

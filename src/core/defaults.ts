@@ -40,3 +40,15 @@ export const DEFAULT_MIN_READ_CHARS = 200;
 
 /** Manifest default politeness interval between page loads on one site. */
 export const DEFAULT_MIN_INTERVAL_MS = 1500;
+
+// Captcha attempt defaults, defined only here: the config loader's tunables, the challenge
+// coordinator, and the browser port's solver all fall back to these.
+
+/** Time one automatic captcha attempt may take (`captchaAttemptBudgetMs`). */
+export const DEFAULT_CAPTCHA_ATTEMPT_BUDGET_MS = 45_000;
+
+/** Tool-call budget that must remain for an attempt inside the call (`captchaInlineMinRemainingMs`). */
+export const DEFAULT_CAPTCHA_INLINE_MIN_REMAINING_MS = 40_000;
+
+/** Tool-call budget kept back for the re-run after an attempt (`captchaRerunReserveMs`). */
+export const DEFAULT_CAPTCHA_RERUN_RESERVE_MS = 15_000;

@@ -21,10 +21,10 @@ ChatGPT 화면의 메뉴 이름은 언어 설정이나 시기에 따라 위와 �
 
 ## 설치: AI에게 맡기기 (가장 쉬운 방법)
 
-아래 문장을 Aside 안의 AI, Claude Code, 또는 Codex에 붙여 넣으세요. `https://github.com/contiloop/browser-research-bridge`는 지금 보고 있는 이 GitHub 페이지의 주소(브라우저 주소창에 보이는 주소)로 바꿔 넣으세요.
+아래 문장을 Aside 안의 AI, Claude Code, 또는 Codex에 붙여 넣으세요. `<프로젝트 페이지 주소>`는 지금 보고 있는 이 GitHub 페이지의 주소(브라우저 주소창에 보이는 주소)로 바꿔 넣으세요.
 
 ```text
-이 Mac에 Browser Research Bridge를 설치해 줘. https://github.com/contiloop/browser-research-bridge 에 있는 INSTALL-WITH-AI.md를 읽고 한 단계씩 그대로 따라 해 줘. 내가 직접 해야 한다고 적힌 단계에서는 멈추고 나에게 물어봐. 나와는 한국어로 이야기해 줘.
+이 Mac에 Browser Research Bridge를 설치해 줘. <프로젝트 페이지 주소> 에 있는 INSTALL-WITH-AI.md를 읽고 한 단계씩 그대로 따라 해 줘. 내가 직접 해야 한다고 적힌 단계에서는 멈추고 나에게 물어봐. 나와는 한국어로 이야기해 줘.
 ```
 
 AI는 [INSTALL-WITH-AI.md](INSTALL-WITH-AI.md)(AI용 설치 안내, 영어)를 따릅니다. Mac 비밀번호 입력, 로그인, 런타임 키 만들기, 접속 암호 만들기, ChatGPT 연결 승인처럼 나만 해야 하는 일이 나오면 AI가 멈추고 물어봅니다. 키, 비밀번호, 접속 암호는 AI에게 절대 알려 주지 마세요.
@@ -46,14 +46,14 @@ AI는 [INSTALL-WITH-AI.md](INSTALL-WITH-AI.md)(AI용 설치 안내, 영어)를 �
    aside login
    ```
 
-   프로그램을 내려받습니다:
+   프로그램을 내려받습니다. `<프로젝트 페이지 주소>`는 이 페이지의 주소로 바꾸세요:
 
    ```sh
    cd ~
    ```
 
    ```sh
-   git clone https://github.com/contiloop/browser-research-bridge browser-research-bridge
+   git clone <프로젝트 페이지 주소> browser-research-bridge
    ```
 
    프로그램 폴더를 Finder에서 엽니다:
@@ -83,7 +83,11 @@ Mac에 로그인하면 프로그램이 저절로 시작되어 백그라운드에
 
 ## 업데이트
 
-터미널에 아래 줄을 한 줄씩 붙여 넣으세요:
+**Open Settings.command**를 더블클릭하세요. 새 버전이 있으면 먼저 알려 주고 묻습니다. 지금 업데이트하려면 Return 키를 누르고, 건너뛰려면 `n`을 입력한 뒤 Return 키를 누르세요 (지금 버전으로 열리고, 다음에 다시 묻습니다). 업데이트는 새 버전을 받고, 구성 요소를 설치하고, 백그라운드 서비스를 다시 시작한 뒤 설정 페이지를 엽니다. 설정, 데이터, 이 Mac에만 두는 사이트는 그대로 남습니다.
+
+프로그램 폴더의 파일을 직접 바꾼 적이 있으면 업데이트를 건너뛰고 그 이유를 알려 줍니다. 사이트 추가 도우미가 사이트 작업을 하는 동안에는 업데이트를 미룹니다. 도우미 작업이 끝난 뒤 다시 더블클릭하세요. 구성 요소 설치에 실패하면 인터넷 연결을 확인한 뒤 다시 더블클릭하세요.
+
+직접 업데이트하려면 (Open Settings.command도 같은 단계를 거칩니다) 터미널에 아래 줄을 한 줄씩 붙여 넣으세요:
 
 ```sh
 cd ~/browser-research-bridge

@@ -1,10 +1,16 @@
 /** Composition root wiring: a real public listener on a loopback port, fake browser, stub helpers. */
-import { mkdir } from "node:fs/promises";
+import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { stubHelpers } from "../../test/support/mcp-fixtures.js";
 import { MemoryLogger } from "../../test/support/oauth-harness.js";
-import { fakeBrowser, makeTempDir, writeAdapterFolder } from "../../test/support/site-fixtures.js";
+import {
+  challengeAttempt,
+  fakeBrowser,
+  makeTempDir,
+  writeAdapterFolder,
+} from "../../test/support/site-fixtures.js";
+import type { FakeSolver } from "../../test/support/site-fixtures.js";
 import { createApp } from "./app.js";
 import type { BridgeApp } from "./app.js";
 import { loadConfig } from "./config.js";
@@ -18,7 +24,9 @@ afterEach(async () => {
   cleanup = null;
 });
 
-async function makeBridge(): Promise<{
+async function makeBridge(
+  options: { bridgeJson?: Record<string, unknown>; solveChallenge?: FakeSolver } = {},
+): Promise<{
   bridge: BridgeApp;
   logger: MemoryLogger;
   browser: ReturnType<typeof fakeBrowser>;
@@ -27,12 +35,16 @@ async function makeBridge(): Promise<{
   cleanup = tmp.cleanup;
   await mkdir(join(tmp.dir, "sites"), { recursive: true });
   await writeAdapterFolder(join(tmp.dir, "sites", "alpha"), "alpha");
+  if (options.bridgeJson !== undefined) {
+    await mkdir(join(tmp.dir, "config"), { recursive: true });
+    await writeFile(join(tmp.dir, "config", "bridge.json"), JSON.stringify(options.bridgeJson));
+  }
   const config = loadConfig({
     env: { BRIDGE_PASSPHRASE: "a passphrase for tests", BRIDGE_DATA_DIR: join(tmp.dir, "data") },
     rootDir: tmp.dir,
   });
   const logger = new MemoryLogger();
-  const browser = fakeBrowser();
+  const browser = fakeBrowser({ solveChallenge: options.solveChallenge });
   bridge = createApp({ config, helpers: stubHelpers, logger, browser, repoRoot: process.cwd() });
   return { bridge, logger, browser };
 }
@@ -103,5 +115,55 @@ describe("createApp", () => {
     };
     await expect(bridge.start({ publicPort: 0, probeBrowser: false })).rejects.toThrow("EADDRINUSE");
     expect(shutdowns).toBe(1);
+  });
+
+  it("builds the captcha coordinator from the configuration and wires it into the tools", async () => {
+    const { bridge } = await makeBridge();
+    const { challenges, config } = bridge.services;
+    expect(config.captcha.auto).toBe(true);
+    expect(challenges.enabled).toBe(true);
+    expect(challenges.settings).toEqual({
+      auto: true,
+      attemptBudgetMs: config.tunables.captchaAttemptBudgetMs,
+      inlineMinRemainingMs: config.tunables.captchaInlineMinRemainingMs,
+      rerunReserveMs: config.tunables.captchaRerunReserveMs,
+    });
+  });
+
+  it("captcha.auto false turns the attempts off", async () => {
+    const { bridge, browser } = await makeBridge({
+      bridgeJson: { captcha: { auto: false } },
+      solveChallenge: async () => challengeAttempt(),
+    });
+    expect(bridge.services.challenges.enabled).toBe(false);
+    expect((await bridge.services.challenges.attempt("alpha", null)).ran).toBe(false);
+    expect(browser.challenges).toEqual([]);
+  });
+
+  it("stopping the core abandons a running background attempt", async () => {
+    let aborted = false;
+    const { bridge, browser } = await makeBridge({
+      solveChallenge: (o) =>
+        new Promise((resolve) => {
+          o.scope.signal?.addEventListener(
+            "abort",
+            () => {
+              aborted = true;
+              resolve(challengeAttempt({ solved: false, rounds: 0 }));
+            },
+            { once: true },
+          );
+        }),
+    });
+    await bridge.start({ publicPort: 0, probeBrowser: false });
+    expect(bridge.services.challenges.background("alpha", null)).toBe(true);
+    // The attempt reaches the port once the adapter is loaded.
+    for (let i = 0; i < 200 && browser.challenges.length === 0; i++)
+      await new Promise((r) => setTimeout(r, 10));
+    expect(browser.challenges).toHaveLength(1);
+    await bridge.stop();
+    await bridge.services.challenges.settled();
+    expect(aborted).toBe(true);
+    expect(bridge.services.challenges.background("alpha", null)).toBe(false);
   });
 });

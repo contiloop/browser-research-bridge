@@ -262,6 +262,7 @@ describe("the job service on the Codex runtime (fake process)", () => {
               args: {
                 reason: "login wall",
                 requestedAction: "Log in to demo.example.com in Aside, then click Retry",
+                kind: "login",
               },
             },
           ],
@@ -287,8 +288,26 @@ describe("the job service on the Codex runtime (fake process)", () => {
         await svc.start();
         await svc.whenIdle();
         const paused = svc.get("demo-example") as OnboardingJob;
-        expect(paused).toMatchObject({ state: "awaiting_user", runtime: "codex", sessionId: "thr-1" });
+        expect(paused).toMatchObject({
+          state: "awaiting_user",
+          runtime: "codex",
+          sessionId: "thr-1",
+          blockKind: "login",
+        });
         expect(paused.requestedAction).toBe("Log in to demo.example.com in Aside, then click Retry");
+        // The job's own tool list reaches Codex as dynamic tools, the captcha tool included.
+        const started = (await fake.records()).find(
+          (r) => r["kind"] === "request" && r["method"] === "thread/start",
+        ) as { params: { dynamicTools: { name: string; inputSchema: unknown }[] } };
+        const names = started.params.dynamicTools.map((t) => t.name);
+        expect(names).toContain("browser_solve_captcha");
+        expect(names).toContain("report_blocked");
+        expect(
+          started.params.dynamicTools.find((t) => t.name === "browser_solve_captcha")?.inputSchema,
+        ).toMatchObject({
+          type: "object",
+          required: ["tabId"],
+        });
         await svc.retry("demo-example");
         await svc.whenIdle();
         const failed = svc.get("demo-example") as OnboardingJob;
@@ -312,7 +331,12 @@ describe("the job service on the Codex runtime (fake process)", () => {
       await fake.setScenario({
         resumeEnvironments: [{ environmentId: "local", cwd: "/x", runtimeWorkspaceRoots: ["/x"] }],
         runs: [
-          [{ call: "report_blocked", args: { reason: "login wall", requestedAction: "Log in, then click Retry" } }],
+          [
+            {
+              call: "report_blocked",
+              args: { reason: "login wall", requestedAction: "Log in, then click Retry" },
+            },
+          ],
           [],
           [{ call: "report_failure", args: { reason: "the site has no search" } }],
         ],

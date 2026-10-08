@@ -7,7 +7,7 @@
 import { appendFile, mkdir, readFile, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import { readJsonFile, writeJsonAtomic } from "../storage/json-file.js";
-import { JOB_STATES, isHelperRuntimeId, parseHelperLang } from "./types.js";
+import { JOB_STATES, isHelperRuntimeId, parseBlockKind, parseHelperLang } from "./types.js";
 import type { JobLogLine, JobState, JobStore, OnboardingJob } from "./types.js";
 
 export const JOB_ID_PATTERN = /^[a-z0-9][a-z0-9-]{5,63}$/;
@@ -55,6 +55,8 @@ export function parseJobRecord(raw: unknown): OnboardingJob | null {
     // Records written before these fields existed read as English and "not run on a known runtime".
     lang: parseHelperLang(r["lang"]),
     runtime: isHelperRuntimeId(r["runtime"]) ? r["runtime"] : null,
+    // Records written before `blockKind` existed (or with an unknown value) read as "other".
+    blockKind: parseBlockKind(r["blockKind"]),
     commit: str(r["commit"]),
     createdAt,
     updatedAt: str(r["updatedAt"]) ?? createdAt,

@@ -9,8 +9,10 @@ import {
   sleep,
 } from "../../../test/support/mcp-fixtures.js";
 import type { FakeSiteSpec, McpWorld, WorldOptions } from "../../../test/support/mcp-fixtures.js";
+import { challengeAttempt } from "../../../test/support/site-fixtures.js";
 import { DATE_POST_FILTER_NOTE } from "../../core/merge.js";
 import type { AdapterSearchRequest } from "../../ports/adapter.js";
+import { captchaUnsolvedAction } from "./challenge.js";
 import { SearchService } from "./search-service.js";
 
 let world: McpWorld | null = null;
@@ -142,7 +144,7 @@ describe("SearchService: live outcomes feed the lifecycle", () => {
     expect(w.count("alpha").search).toBe(1);
   });
 
-  it("blocked: true starts the cool-down; the next call is refused with rate_limited", async () => {
+  it("blocked: true does not start a cool-down; the next call reaches the site again", async () => {
     const w = await make([
       {
         key: "alpha",
@@ -164,6 +166,29 @@ describe("SearchService: live outcomes feed the lifecycle", () => {
         action: expect.any(String) as string,
       }),
     ]);
+    expect(w.scheduler.cooldownUntil("alpha")).toBeNull();
+    expect(w.registry.get("alpha")?.status).toBe("active");
+
+    const next = await w.search.search({ query: "q other", mode: "search" });
+    expect(next.siteStatuses[0]).toMatchObject({ site: "alpha", status: "access_denied" });
+    expect(w.count("alpha").search).toBe(2);
+  });
+
+  it("rate_limited starts the cool-down; the next call is refused with rate_limited", async () => {
+    const w = await make([
+      {
+        key: "alpha",
+        search: async () => ({
+          results: [],
+          nextCursor: null,
+          status: "rate_limited",
+          message: "too many requests",
+          blocked: true,
+        }),
+      },
+    ]);
+    const out = await w.search.search({ query: "q", mode: "search" });
+    expect(out.siteStatuses[0]).toMatchObject({ site: "alpha", status: "rate_limited" });
     expect(w.scheduler.cooldownUntil("alpha")).not.toBeNull();
     expect(w.registry.get("alpha")?.status).toBe("active");
 
@@ -390,5 +415,188 @@ describe("SearchService: caching", () => {
     const second = await w.search.search({ query: "q", mode: "search" });
     expect(second.cached).toBe(false);
     expect(w.count("alpha").search).toBe(2);
+  });
+});
+
+describe("SearchService: captcha attempts", () => {
+  const blockedSearch = {
+    results: [],
+    nextCursor: null,
+    status: "access_denied",
+    message: "captcha page",
+    blocked: true,
+  } as const;
+  const HOME = "https://alpha.example.com/";
+
+  it("solved: the attempt runs on the site's homepage, the re-run's results are returned", async () => {
+    const state = { cleared: false };
+    const w = await make(
+      [
+        {
+          key: "alpha",
+          search: async () => (state.cleared ? ok([item("alpha", 1, "2026-10-05")]) : blockedSearch),
+        },
+        { key: "beta", search: async () => ok([item("beta", 1, "2026-10-04")]) },
+      ],
+      {
+        challenge: {
+          solve: async () => {
+            state.cleared = true;
+            return challengeAttempt();
+          },
+        },
+      },
+    );
+    const out = await w.search.search({ query: "election", mode: "search" });
+    expect(out.results.map((r) => r.id)).toEqual(["alpha:1", "beta:1"]);
+    expect(out.siteStatuses).toEqual([
+      { site: "alpha", status: "ok" },
+      { site: "beta", status: "ok" },
+    ]);
+    expect(w.browser.challenges.map((c) => c.url)).toEqual([HOME]);
+    expect(w.count("alpha").search).toBe(2);
+    expect(w.count("beta").search).toBe(1);
+    expect(w.scheduler.cooldownUntil("alpha")).toBeNull();
+  });
+
+  it("unsolved: the original failure with the captcha action naming the solver's message; other sites are unaffected; nothing raises", async () => {
+    const why = "the page shows a challenge the solver cannot handle (block-title)";
+    const w = await make(
+      [
+        { key: "alpha", search: async () => blockedSearch },
+        { key: "beta", search: async () => ok([item("beta", 1, "2026-10-04")]) },
+      ],
+      {
+        challenge: {
+          solve: async () => challengeAttempt({ solved: false, kind: "unknown", rounds: 0, message: why }),
+        },
+      },
+    );
+    const out = await w.search.search({ query: "election", mode: "search" });
+    expect(out.results.map((r) => r.id)).toEqual(["beta:1"]);
+    expect(out.siteStatuses).toEqual([
+      {
+        site: "alpha",
+        status: "access_denied",
+        message: "captcha page",
+        action: captchaUnsolvedAction(HOME, why),
+      },
+      { site: "beta", status: "ok" },
+    ]);
+    expect(w.count("alpha").search).toBe(2);
+    expect(w.browser.challenges).toHaveLength(1);
+    expect(w.scheduler.cooldownUntil("alpha")).toBeNull();
+  });
+
+  it("a solver that throws does not make search raise; the failure carries the captcha action", async () => {
+    const w = await make([{ key: "alpha", search: async () => blockedSearch }], {
+      challenge: {
+        solve: async () => {
+          throw new Error("boom");
+        },
+      },
+    });
+    const out = await w.search.search({ query: "election", mode: "search_sites" });
+    expect(out.siteStatuses).toEqual([
+      {
+        site: "alpha",
+        status: "access_denied",
+        message: "captcha page",
+        action: captchaUnsolvedAction(HOME),
+      },
+    ]);
+    expect(w.count("alpha").search).toBe(1);
+  });
+
+  it("setting off: no attempt, today's failure", async () => {
+    const w = await make([{ key: "alpha", search: async () => blockedSearch }], {
+      challenge: { settings: { auto: false } },
+    });
+    const out = await w.search.search({ query: "election", mode: "search" });
+    expect(out.siteStatuses[0]).toMatchObject({
+      site: "alpha",
+      status: "access_denied",
+      message: "captcha page",
+    });
+    expect(out.siteStatuses[0]?.action).not.toBe(captchaUnsolvedAction(HOME));
+    expect(w.browser.challenges).toEqual([]);
+    expect(w.count("alpha").search).toBe(1);
+  });
+
+  it("a rate_limited throttle page keeps today's cool-down and gets no attempt", async () => {
+    const w = await make(
+      [
+        {
+          key: "alpha",
+          search: async () => ({ ...blockedSearch, status: "rate_limited", message: "429" }),
+        },
+      ],
+      { challenge: {} },
+    );
+    const out = await w.search.search({ query: "election", mode: "search" });
+    expect(out.siteStatuses[0]).toMatchObject({ site: "alpha", status: "rate_limited" });
+    expect(w.browser.challenges).toEqual([]);
+    expect(w.scheduler.cooldownUntil("alpha")).not.toBeNull();
+  });
+
+  it("aims the attempt at the page the adapter's session last showed (the site's search page)", async () => {
+    const SEARCH_PAGE = "https://alpha.example.com/search?q=election";
+    const state = { cleared: false };
+    const w = await make(
+      [
+        {
+          key: "alpha",
+          search: async () => (state.cleared ? ok([item("alpha", 1, "2026-10-05")]) : blockedSearch),
+        },
+      ],
+      {
+        challenge: {
+          solve: async () => {
+            state.cleared = true;
+            return challengeAttempt();
+          },
+        },
+      },
+    );
+    w.browser.lastUrls.set("alpha", SEARCH_PAGE);
+    const out = await w.search.search({ query: "election", mode: "search" });
+    expect(out.results.map((r) => r.id)).toEqual(["alpha:1"]);
+    expect(w.browser.challenges.map((c) => c.url)).toEqual([SEARCH_PAGE]);
+
+    await w.cleanup();
+    // Unsolved: the action points the user at that page too.
+    const w2 = await make([{ key: "alpha", search: async () => blockedSearch }], {
+      challenge: {
+        solve: async () => challengeAttempt({ solved: false, kind: "none", rounds: 0, message: "" }),
+      },
+    });
+    w2.browser.lastUrls.set("alpha", SEARCH_PAGE);
+    const out2 = await w2.search.search({ query: "election", mode: "search" });
+    expect(out2.siteStatuses[0]?.action).toBe(captchaUnsolvedAction(SEARCH_PAGE));
+    // The search query in that URL never reaches the logs.
+    expect(w2.logger.lines.some((l) => l.includes("q=election"))).toBe(false);
+  });
+
+  it("one attempt per site per call: a page walked later in the same call is not attempted again", async () => {
+    const page1 = [1, 2].map((n) => item("alpha", n, `2026-10-0${n}`));
+    let firstCalls = 0;
+    const w = await make(
+      [
+        {
+          key: "alpha",
+          search: async (req) => {
+            if (req.cursor === null) return ++firstCalls === 1 ? blockedSearch : ok(page1, "p2");
+            return blockedSearch;
+          },
+        },
+      ],
+      { challenge: {} },
+    );
+    const out = await w.search.search({ query: "q limit:2 page:2", mode: "search" });
+    expect(w.browser.challenges).toHaveLength(1);
+    expect(out.siteStatuses).toEqual([
+      expect.objectContaining({ site: "alpha", status: "access_denied", message: "captcha page" }),
+    ]);
+    expect(out.siteStatuses[0]?.action).not.toBe(captchaUnsolvedAction(HOME));
   });
 });

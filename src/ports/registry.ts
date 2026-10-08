@@ -25,7 +25,7 @@ export interface LoadedSiteAdapter {
 
 /** A live search/read outcome fed into the lifecycle. */
 export interface LiveOutcome extends Outcome {
-  /** The adapter flagged a block/captcha page (`blocked: true` in its response): start the cool-down. */
+  /** The adapter flagged a block/captcha page (`blocked: true` in its response). It does not start a cool-down; only `rate_limited` does. */
   blocked?: boolean | undefined;
 }
 

@@ -6,10 +6,13 @@ import {
   makeMcpWorld,
   setDegraded,
   setNeedsLogin,
+  sleep,
 } from "../../../test/support/mcp-fixtures.js";
 import type { FakeSiteSpec, McpWorld, WorldOptions } from "../../../test/support/mcp-fixtures.js";
+import { challengeAttempt } from "../../../test/support/site-fixtures.js";
 import { encodeUrlLocalId } from "../../core/ids.js";
 import type { DocumentRef } from "../../core/models.js";
+import { NO_SOLVER_MESSAGE, captchaUnsolvedAction } from "./challenge.js";
 import { perItemBudget } from "./read-service.js";
 
 let world: McpWorld | null = null;
@@ -177,13 +180,46 @@ describe("ReadService.fetch", () => {
     expect(b.document).toBeUndefined();
   });
 
-  it("a blocked page starts the cool-down", async () => {
+  it("a blocked page does not start a cool-down; the next read reaches the site again", async () => {
     const w = await make([
       { key: "alpha", read: async () => ({ status: "access_denied", message: "captcha", blocked: true }) },
     ]);
     await w.read.fetch("alpha:1");
+    expect(w.scheduler.cooldownUntil("alpha")).toBeNull();
+    expect((await w.read.fetch("alpha:2")).status).toBe("access_denied");
+    expect(w.count("alpha").read).toBe(2);
+  });
+
+  it("a rate_limited read starts the cool-down; the next read is refused with rate_limited", async () => {
+    const w = await make([{ key: "alpha", read: async () => ({ status: "rate_limited", message: "429" }) }]);
+    await w.read.fetch("alpha:1");
     expect(w.scheduler.cooldownUntil("alpha")).not.toBeNull();
     expect((await w.read.fetch("alpha:2")).status).toBe("rate_limited");
+    expect(w.count("alpha").read).toBe(1);
+  });
+
+  it("read_documents reads one site's refs in parallel up to the site's pool size", async () => {
+    let inFlight = 0;
+    let peak = 0;
+    const w = await make([
+      {
+        key: "alpha",
+        read: async (ref: DocumentRef) => {
+          inFlight += 1;
+          peak = Math.max(peak, inFlight);
+          await sleep(40);
+          inFlight -= 1;
+          const localId = ref.localId ?? "x";
+          return {
+            status: "ok",
+            document: documentFor("alpha", localId, longText(2000, `alpha-${localId}`)),
+          };
+        },
+      },
+    ]);
+    const out = await w.read.readDocuments(["alpha:1", "alpha:2", "alpha:3", "alpha:4", "alpha:5"]);
+    expect(out.items.map((i) => i.status)).toEqual(["ok", "ok", "ok", "ok", "ok"]);
+    expect(peak).toBe(3);
   });
 
   it("cuts fetch text to the 60k budget at a paragraph boundary with truncated: true", async () => {
@@ -242,5 +278,288 @@ describe("ReadService.readDocuments", () => {
     }
     expect(perItemBudget(120_000, 10_000, 5)).toBe(24_000);
     expect(perItemBudget(20_000, 10_000, 3)).toBe(10_000);
+  });
+});
+
+describe("captcha attempts in live reads", () => {
+  const ARTICLE = "https://alpha.example.com/articles/5";
+  const blockedRead = { status: "access_denied", message: "captcha page", blocked: true } as const;
+
+  /** A site that shows a captcha until `state.cleared`; then reads normally. */
+  function captchaSite(state: { cleared: boolean }): FakeSiteSpec {
+    const ok = reader("alpha")!;
+    return {
+      key: "alpha",
+      read: async (ref, ctx) => (state.cleared ? ok(ref, ctx) : blockedRead),
+    };
+  }
+
+  it("solved: the attempt runs on the read's URL, the re-run confirms, the document is returned", async () => {
+    const state = { cleared: false };
+    const w = await make([captchaSite(state)], {
+      challenge: {
+        solve: async () => {
+          state.cleared = true;
+          return challengeAttempt();
+        },
+      },
+    });
+    const out = await w.read.fetch(ARTICLE);
+    expect(out.status).toBe("ok");
+    expect(out.document?.url).toBe(ARTICLE);
+    expect(w.count("alpha").read).toBe(2);
+    expect(w.browser.challenges.map((c) => c.url)).toEqual([ARTICLE]);
+    expect(w.scheduler.cooldownUntil("alpha")).toBeNull();
+    expect(w.logger.lines.some((l) => l.includes("captcha re-run") && l.includes('"status":"ok"'))).toBe(
+      true,
+    );
+  });
+
+  it("a native id has no URL: the attempt targets the page the adapter last showed, else the homepage", async () => {
+    const state = { cleared: false };
+    const w = await make([captchaSite(state)], {
+      challenge: {
+        solve: async () => {
+          state.cleared = true;
+          return challengeAttempt();
+        },
+      },
+    });
+    w.browser.lastUrls.set("alpha", "https://alpha.example.com/articles/5?view=full");
+    expect((await w.read.fetch("alpha:5")).status).toBe("ok");
+    expect(w.browser.challenges[0]?.url).toBe("https://alpha.example.com/articles/5?view=full");
+  });
+
+  it("a read URL wins over the page the adapter last showed", async () => {
+    const state = { cleared: false };
+    const w = await make([captchaSite(state)], {
+      challenge: {
+        solve: async () => {
+          state.cleared = true;
+          return challengeAttempt();
+        },
+      },
+    });
+    w.browser.lastUrls.set("alpha", "https://alpha.example.com/elsewhere");
+    expect((await w.read.fetch(ARTICLE)).status).toBe("ok");
+    expect(w.browser.challenges.map((c) => c.url)).toEqual([ARTICLE]);
+  });
+
+  it("an Aside without the captcha capability: the action names the solver's message", async () => {
+    const w = await make([{ key: "alpha", read: async () => blockedRead }], {
+      challenge: {
+        solve: async () =>
+          challengeAttempt({
+            solved: false,
+            kind: "unknown",
+            rounds: 0,
+            available: false,
+            message: "captcha solving is not available in this Aside version",
+          }),
+      },
+    });
+    const out = await w.read.fetch(ARTICLE);
+    expect(out.error?.action).toBe(
+      captchaUnsolvedAction(ARTICLE, "captcha solving is not available in this Aside version"),
+    );
+    expect(out.error?.action).toContain("(captcha solving is not available in this Aside version)");
+    expect(w.count("alpha").read).toBe(1);
+  });
+
+  it("a native id with no page shown: the attempt targets the site's homepage", async () => {
+    const state = { cleared: false };
+    const w = await make([captchaSite(state)], {
+      challenge: {
+        solve: async () => {
+          state.cleared = true;
+          return challengeAttempt();
+        },
+      },
+    });
+    expect((await w.read.fetch("alpha:5")).status).toBe("ok");
+    expect(w.browser.challenges[0]?.url).toBe("https://alpha.example.com/");
+  });
+
+  it("unsolved: the re-run is still blocked → the original failure with the captcha action, no cool-down", async () => {
+    const why = "the slider captcha is still shown after 2 rounds";
+    const w = await make([{ key: "alpha", read: async () => blockedRead }], {
+      challenge: {
+        solve: async () => challengeAttempt({ solved: false, kind: "slider", rounds: 2, message: why }),
+      },
+    });
+    const out = await w.read.fetch(ARTICLE);
+    expect(out).toEqual({
+      ref: ARTICLE,
+      status: "access_denied",
+      error: {
+        code: "access_denied",
+        message: "captcha page",
+        site: "alpha",
+        action: captchaUnsolvedAction(ARTICLE, why),
+      },
+    });
+    // One attempt per call: the challenge met again in the re-run is not solved again.
+    expect(w.browser.challenges).toHaveLength(1);
+    expect(w.count("alpha").read).toBe(2);
+    expect(w.scheduler.cooldownUntil("alpha")).toBeNull();
+    expect(w.registry.get("alpha")?.status).toBe("active");
+    // Logs are metadata only: no URL, no page text.
+    expect(w.logger.lines.some((l) => l.includes("captcha re-run"))).toBe(true);
+    expect(w.logger.lines.some((l) => l.includes("https://") || l.includes("answered"))).toBe(false);
+  });
+
+  it("kind none (no widget found, nothing done) still re-runs the read once", async () => {
+    const state = { cleared: false };
+    const w = await make([captchaSite(state)], {
+      challenge: {
+        solve: async () => {
+          state.cleared = true; // the widened reload alone cleared the interstitial
+          return challengeAttempt({ solved: false, kind: "none", rounds: 0 });
+        },
+      },
+    });
+    expect((await w.read.fetch(ARTICLE)).status).toBe("ok");
+    expect(w.count("alpha").read).toBe(2);
+  });
+
+  it("the re-run's own non-blocked verdict is returned as it is (e.g. a login wall behind the captcha)", async () => {
+    let calls = 0;
+    const w = await make(
+      [
+        {
+          key: "alpha",
+          read: async () =>
+            ++calls === 1 ? blockedRead : { status: "auth_required", message: "login wall" },
+        },
+      ],
+      { challenge: {} },
+    );
+    const out = await w.read.fetch(ARTICLE);
+    expect(out.status).toBe("auth_required");
+    expect(out.error?.message).toBe("login wall");
+    expect(w.registry.get("alpha")?.status).toBe("needs_login");
+  });
+
+  it("setting off: no attempt, one adapter call, today's failure and action, no cool-down", async () => {
+    const w = await make([{ key: "alpha", read: async () => blockedRead }], {
+      challenge: { settings: { auto: false } },
+    });
+    const out = await w.read.fetch(ARTICLE);
+    expect(out.status).toBe("access_denied");
+    expect(out.error?.action).not.toBe(captchaUnsolvedAction(ARTICLE));
+    expect(out.error?.action).toContain("Open alpha in Aside");
+    expect(w.browser.challenges).toEqual([]);
+    expect(w.count("alpha").read).toBe(1);
+    expect(w.scheduler.cooldownUntil("alpha")).toBeNull();
+  });
+
+  it("a browser without solveChallenge: no re-run, the failure carries the captcha action, logged unavailable", async () => {
+    const w = await make([{ key: "alpha", read: async () => blockedRead }], { challenge: { solve: null } });
+    const out = await w.read.fetch(ARTICLE);
+    expect(out.status).toBe("access_denied");
+    expect(out.error?.action).toBe(captchaUnsolvedAction(ARTICLE, NO_SOLVER_MESSAGE));
+    expect(w.count("alpha").read).toBe(1);
+    expect(
+      w.logger.lines.some((l) => l.includes("captcha attempt") && l.includes('"result":"unavailable"')),
+    ).toBe(true);
+  });
+
+  it("too little budget left: the failure is returned at once and the attempt runs in the background", async () => {
+    const state = { cleared: false };
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const w = await make([captchaSite(state)], {
+      // Every call has less than the inline minimum left.
+      challenge: {
+        settings: { inlineMinRemainingMs: 200_000 },
+        solve: async () => {
+          await gate;
+          state.cleared = true;
+          return challengeAttempt();
+        },
+      },
+    });
+    const first = await w.read.fetch(ARTICLE);
+    expect(first.status).toBe("access_denied");
+    expect(w.count("alpha").read).toBe(1);
+    expect(w.challenges?.inFlight("alpha")).toBe(true);
+    release();
+    await w.challenges?.settled();
+    expect(w.browser.challenges).toHaveLength(1);
+    // The next call finds the site unblocked.
+    expect((await w.read.fetch(ARTICLE)).status).toBe("ok");
+    expect(w.browser.challenges).toHaveLength(1);
+  });
+
+  it("an attempt that leaves less than the re-run reserve returns the original failure without a re-run", async () => {
+    let nowMs = Date.parse("2026-10-08T10:00:00Z");
+    const state = { cleared: false };
+    const w = await make([captchaSite(state)], {
+      clock: { now: () => new Date(nowMs) },
+      challenge: {
+        solve: async (o) => {
+          expect(o.budgetMs).toBeLessThanOrEqual(45_000);
+          nowMs += 80_000; // the attempt ran long: 10 s of the 90 s call budget remain (reserve 15 s)
+          state.cleared = true;
+          return challengeAttempt();
+        },
+      },
+    });
+    const out = await w.read.fetch(ARTICLE);
+    expect(out.status).toBe("access_denied");
+    expect(out.error?.message).toBe("captcha page");
+    expect(w.count("alpha").read).toBe(1);
+    // The solved state is kept: the next call benefits.
+    expect((await w.read.fetch(ARTICLE)).status).toBe("ok");
+  });
+
+  it("read_documents: a ref that meets the captcha after the site's attempt ended starts no second one", async () => {
+    let attempts = 0;
+    const w = await make(
+      [
+        {
+          key: "alpha",
+          read: async (ref) => {
+            // The second ref meets the block page only after the first ref's attempt is over.
+            if (ref.localId === "2") await sleep(80);
+            return blockedRead;
+          },
+        },
+      ],
+      {
+        challenge: {
+          solve: async () => {
+            attempts += 1;
+            return challengeAttempt({ solved: false, kind: "unknown", rounds: 0, message: "x" });
+          },
+        },
+      },
+    );
+    const out = await w.read.readDocuments(["alpha:1", "alpha:2"]);
+    expect(out.items.map((i) => i.status)).toEqual(["access_denied", "access_denied"]);
+    expect(attempts).toBe(1);
+    expect(w.browser.challenges).toHaveLength(1);
+    // The first ref re-ran after its attempt; the second did not attempt (nor re-run) again.
+    expect(w.count("alpha").read).toBe(3);
+    // A new tool call gets its own attempt.
+    await w.read.readDocuments(["alpha:3"]);
+    expect(attempts).toBe(2);
+  });
+
+  it("read_documents: two reads that meet the captcha at once share one attempt and each re-runs", async () => {
+    const state = { cleared: false };
+    const w = await make([captchaSite(state)], {
+      challenge: {
+        solve: async () => {
+          await sleep(30);
+          state.cleared = true;
+          return challengeAttempt();
+        },
+      },
+    });
+    const out = await w.read.readDocuments(["alpha:1", "alpha:2"]);
+    expect(out.items.map((i) => i.status)).toEqual(["ok", "ok"]);
+    expect(w.browser.challenges).toHaveLength(1);
+    expect(w.count("alpha").read).toBe(4);
   });
 });

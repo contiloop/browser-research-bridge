@@ -16,6 +16,9 @@ import { FileSiteStateStore } from "../../src/adapters/storage/site-state-store.
 import { ReadService } from "../../src/adapters/mcp/read-service.js";
 import { SearchService } from "../../src/adapters/mcp/search-service.js";
 import type { SiteTaskRunner, ToolServiceDeps, ToolTunables } from "../../src/adapters/mcp/deps.js";
+import { ChallengeCoordinator, DEFAULT_CHALLENGE_SETTINGS } from "../../src/adapters/mcp/challenge.js";
+import type { ChallengeSettings } from "../../src/adapters/mcp/challenge.js";
+import type { Clock } from "../../src/ports/clock.js";
 import type {
   AdapterContext,
   AdapterDocument,
@@ -28,8 +31,14 @@ import type {
 } from "../../src/ports/adapter.js";
 import type { DocumentRef } from "../../src/core/models.js";
 import { MemoryLogger } from "./oauth-harness.js";
-import { fakeBrowser, makeTempDir, manifestFor, writeAdapterFolder } from "./site-fixtures.js";
-import type { FakeBrowser } from "./site-fixtures.js";
+import {
+  challengeAttempt,
+  fakeBrowser,
+  makeTempDir,
+  manifestFor,
+  writeAdapterFolder,
+} from "./site-fixtures.js";
+import type { FakeBrowser, FakeSolver } from "./site-fixtures.js";
 
 /** The real helpers with date parsing and text extraction stubbed out (test adapters do not need them). */
 export const stubHelpers: AdapterHelpers = {
@@ -74,6 +83,8 @@ export interface McpWorld {
   deps: ToolServiceDeps;
   search: SearchService;
   read: ReadService;
+  /** The challenge coordinator, when the world was built with `challenge`. */
+  challenges: ChallengeCoordinator | null;
   /** Adapter call counts for a site. */
   count(key: string): { search: number; read: number };
   cleanup(): Promise<void>;
@@ -84,6 +95,13 @@ export interface WorldOptions {
   tunables?: Partial<ToolTunables>;
   /** Disable the result cache (default: enabled). */
   noCache?: boolean;
+  /** Clock of the services and the coordinator (default: the system clock). */
+  clock?: Clock;
+  /**
+   * Builds a challenge coordinator: `solve` scripts the port's `solveChallenge` (default: solved;
+   * null: a port without it); `settings` overrides the defaults (captcha on).
+   */
+  challenge?: { solve?: FakeSolver | null; settings?: Partial<ChallengeSettings> };
 }
 
 export async function makeMcpWorld(options: WorldOptions): Promise<McpWorld> {
@@ -116,7 +134,7 @@ export async function makeMcpWorld(options: WorldOptions): Promise<McpWorld> {
   }
 
   const logger = new MemoryLogger();
-  const scheduler = new InMemoryScheduler({ maxConcurrentSites: 4 });
+  const scheduler = new InMemoryScheduler();
   const fileCache = new FileCache(join(tmp.dir, "data", "cache"));
   const cache = new ResultCache(fileCache);
   const registry = new SiteRegistryService({
@@ -128,8 +146,24 @@ export async function makeMcpWorld(options: WorldOptions): Promise<McpWorld> {
     logger,
   });
   await registry.init();
-  const browser = fakeBrowser();
+  const solve = options.challenge?.solve;
+  const browser = fakeBrowser(
+    options.challenge === undefined || solve === null
+      ? {}
+      : { solveChallenge: solve ?? (async () => challengeAttempt()) },
+  );
   const runtime = { browser, scheduler, helpers: stubHelpers, logger };
+  const challenges =
+    options.challenge === undefined
+      ? null
+      : new ChallengeCoordinator({
+          settings: { ...DEFAULT_CHALLENGE_SETTINGS, ...options.challenge.settings },
+          browser,
+          scheduler,
+          registry,
+          logger,
+          ...(options.clock ? { clock: options.clock } : {}),
+        });
   const runSiteTask: SiteTaskRunner = (site, taskOptions, task) =>
     runAdapterTask(runtime, site, taskOptions, task);
   const deps: ToolServiceDeps = {
@@ -138,6 +172,8 @@ export async function makeMcpWorld(options: WorldOptions): Promise<McpWorld> {
     cache: options.noCache ? null : cache,
     tunables: options.tunables,
     logger,
+    ...(options.clock ? { clock: options.clock } : {}),
+    ...(challenges ? { challenges } : {}),
   };
   return {
     dir: tmp.dir,
@@ -152,8 +188,13 @@ export async function makeMcpWorld(options: WorldOptions): Promise<McpWorld> {
     deps,
     search: new SearchService(deps),
     read: new ReadService(deps),
+    challenges,
     count: (key) => ({ search: calls.get(key)?.search.length ?? 0, read: calls.get(key)?.read.length ?? 0 }),
-    cleanup: tmp.cleanup,
+    cleanup: async () => {
+      challenges?.dispose();
+      await challenges?.settled();
+      await tmp.cleanup();
+    },
   };
 }
 

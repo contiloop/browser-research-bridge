@@ -7,7 +7,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { computeAdapterHash, writeValidationReport } from "../../src/adapters/validation/report.js";
 import type { ValidationReport } from "../../src/adapters/validation/report.js";
-import type { BrowserPort, BrowserScope, BrowserSession } from "../../src/ports/browser.js";
+import type {
+  BrowserPort,
+  BrowserScope,
+  BrowserSession,
+  ChallengeAttempt,
+  SolveChallengeOptions,
+} from "../../src/ports/browser.js";
 import type { Logger } from "../../src/ports/logger.js";
 
 export const silentLogger: Logger = { debug() {}, info() {}, warn() {}, error() {} };
@@ -94,13 +100,34 @@ export async function writeAdapterFolder(
 export interface FakeBrowser extends BrowserPort {
   scopes: BrowserScope[];
   disposed: number;
+  /**
+   * What a session's `lastUrl()` reports, by site key (as if the adapter had loaded that page);
+   * absent → null. Tests set it to stand for the page an adapter last showed.
+   */
+  lastUrls: Map<string, string>;
+  /** Every `solveChallenge` call (only when the port was built with a solver). */
+  challenges: SolveChallengeOptions[];
 }
 
-/** A browser port whose sessions do nothing; adapters under test never call it. */
-export function fakeBrowser(): FakeBrowser {
+/** A scripted challenge solver for {@link fakeBrowser}; it never touches a page. */
+export type FakeSolver = (options: SolveChallengeOptions) => Promise<ChallengeAttempt>;
+
+/** A solver result: `solved` (checkbox, 1 round) unless overridden. */
+export function challengeAttempt(patch: Partial<ChallengeAttempt> = {}): ChallengeAttempt {
+  return { solved: true, kind: "checkbox", rounds: 1, message: "answered", available: true, ...patch };
+}
+
+/**
+ * A browser port whose sessions do nothing; adapters under test never call it. With `solveChallenge`,
+ * the port also offers the optional challenge operation and records its calls; without it, the port
+ * has no `solveChallenge` at all (like an older browser).
+ */
+export function fakeBrowser(options: { solveChallenge?: FakeSolver | undefined } = {}): FakeBrowser {
   const port: FakeBrowser = {
     scopes: [],
     disposed: 0,
+    lastUrls: new Map(),
+    challenges: [],
     async status() {
       return { reachable: true, account: "u0" };
     },
@@ -117,6 +144,7 @@ export function fakeBrowser(): FakeBrowser {
         runScript: async () => unsupported(),
         fetch: async () => unsupported(),
         screenshot: async () => unsupported(),
+        lastUrl: () => port.lastUrls.get(scope.siteKey) ?? null,
         dispose: async () => {
           port.disposed += 1;
         },
@@ -124,5 +152,12 @@ export function fakeBrowser(): FakeBrowser {
     },
     async shutdown() {},
   };
+  const solve = options.solveChallenge;
+  if (solve) {
+    port.solveChallenge = (challenge: SolveChallengeOptions) => {
+      port.challenges.push(challenge);
+      return solve(challenge);
+    };
+  }
   return port;
 }

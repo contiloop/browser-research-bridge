@@ -19,10 +19,10 @@ Browser Research Bridge is a program for your Mac that lets ChatGPT search and r
 
 ## Install: let an AI do it (easiest)
 
-Paste this sentence into the AI in Aside, into Claude Code, or into Codex:
+Paste this sentence into the AI in Aside, into Claude Code, or into Codex. Replace `<project page address>` with the address of this page (the address in your browser's address bar when you look at this project on GitHub):
 
 ```text
-Install Browser Research Bridge on this Mac for me. Read and follow INSTALL-WITH-AI.md from https://github.com/contiloop/browser-research-bridge step by step, stop and ask me whenever it says only I can do something, and talk to me in my language.
+Install Browser Research Bridge on this Mac for me. Read and follow INSTALL-WITH-AI.md from <project page address> step by step, stop and ask me whenever it says only I can do something, and talk to me in my language.
 ```
 
 The AI follows [INSTALL-WITH-AI.md](INSTALL-WITH-AI.md). It stops and asks you whenever something only you may do comes up: typing your Mac password, signing in, creating the runtime key, creating the access passphrase, and approving ChatGPT's connection. Never give it a key, a password, or the passphrase.
@@ -44,14 +44,14 @@ The AI follows [INSTALL-WITH-AI.md](INSTALL-WITH-AI.md). It stops and asks you w
    aside login
    ```
 
-   Get the program:
+   Get the program. Replace `<project page address>` with the address of this page:
 
    ```sh
    cd ~
    ```
 
    ```sh
-   git clone https://github.com/contiloop/browser-research-bridge browser-research-bridge
+   git clone <project page address> browser-research-bridge
    ```
 
    Open the program's folder in Finder:
@@ -81,7 +81,11 @@ The program starts by itself when you log in to your Mac and keeps running in th
 
 ## Update
 
-Paste these lines in Terminal, one at a time:
+Double-click **Open Settings.command**. When a new version is available, it says so and asks first: press Return to update now, or type `n` and press Return to skip (it opens the current version and asks again next time). The update downloads the new version, installs its components, restarts the background service, and opens the settings page. Your settings, your data, and sites you keep only on this Mac are kept.
+
+The opener skips the update, and says why, when you changed files in the program's folder yourself. While the site-add helper is working on a site, it waits: double-click again after the helper is done. If installing the components fails, check the internet connection and double-click the opener again.
+
+To update by hand instead (the opener does the same steps), paste these lines in Terminal, one at a time:
 
 ```sh
 cd ~/browser-research-bridge
@@ -166,7 +170,7 @@ Documentation: [operations](docs/operations.md) (setup order, configuration, lau
 ## 2. Install from source
 
 ```sh
-git clone https://github.com/contiloop/browser-research-bridge.git browser-research-bridge
+git clone <repository URL> browser-research-bridge
 cd browser-research-bridge
 npm install                                  # exact versions pinned in package.json and package-lock.json
 cp .env.example .env && chmod 600 .env
@@ -326,6 +330,7 @@ Every adapter must pass a real-site validation (no mocks) before it is loaded ([
 
 ```sh
 npm run browser:check                         # Aside reachable and the shim enforced
+npm run browser:captcha-check -- <url>        # one captcha attempt on a page that shows a captcha; prints one JSON line
 npm run site:validate -- <key>                # full: static check, sample search (+ page 2), sample read, gated-page check; writes sites/<key>/validation.json
 npm run site:validate -- <key> --light        # health-check form; prints only
 npm run site:validate -- <key> --staging      # validate sites/<key>/.staging/
@@ -335,22 +340,23 @@ Exit code 0 means passed. Run the full form after any manual edit of `sites/<key
 
 ## 8. Troubleshooting
 
-| Symptom                                                       | Cause and fix                                                                                                                                                                                                                                                                   |
-| ------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Banner or page: setup mode, `passphrase_missing`/`_too_short` | Set the passphrase on the settings page (Getting started step 1), or in `.env` and restart.                                                                                                                                                                                     |
-| Setup mode, `config_invalid`                                  | A settings file has a mistake; the message names the file and value. Fix it and save on the page, or press **Restart the program**.                                                                                                                                             |
-| Setup mode, `start_failed` with `EADDRINUSE`                  | Port 8787 is taken (often a second bridge). Stop it, or change `publicPort` and the tunnel target. If the settings-page port 8788 is taken, the process exits with code 1.                                                                                                      |
-| `401` on `/mcp`                                               | Expected without a token. From a connected client: the token expired and could not be refreshed, was revoked on the page, the tunnel address was removed from `oauth.extraResources`, or `PUBLIC_URL` changed. Remove and re-add the connector, then consent again.             |
-| Claude: "Couldn't reach the MCP server"                       | The tunnel or the bridge is down, or the quick-tunnel URL changed. `curl -s -o /dev/null -w '%{http_code}\n' -X POST "$PUBLIC_URL/mcp"`; anything but `401` means the path is broken. Restart in Path B order and re-add the connector if the URL changed.                      |
-| ChatGPT cannot create or use the connector                    | Managed connection: the Connection area shows the state and the last problem; **Try again** restarts the tool. Hand-made connection: `tunnel-client doctor --profile <profile> --explain` and `curl -fsS http://127.0.0.1:8080/readyz`. The connector must use the same tunnel. |
-| Consent page: "redirect_uri is not allowed by this bridge"    | Add the client's callback URL to `redirectUriAllowlist` in `config/bridge.json` and restart.                                                                                                                                                                                    |
-| Consent page: too many failed attempts                        | Lockout after wrong passphrases (5 per IP with `trustedProxyHeader`, else 20 globally). Wait 15 minutes.                                                                                                                                                                        |
-| `browser_unavailable`                                         | Aside is not running, the Aside CLI is signed out, or `aside` is not found. Open Aside, run `aside login`, check `aside account`, then `npm run browser:check`. Under launchd `ASIDE_CLI` must be the absolute path (the installer sets it).                                    |
-| Site `needs_login` / status `auth_required`                   | The site's login in Aside expired. Log in again in Aside (same account), then **Check now**.                                                                                                                                                                                    |
-| Site `degraded` / `adapter_error`                             | Three consecutive adapter errors or a failed health check. Read the last failure, try **Check now**, then **Repair**.                                                                                                                                                           |
-| `rate_limited` / `access_denied` with a block page            | The site throttled or showed a captcha. The bridge leaves it alone for 10 minutes; solve any captcha in Aside if it persists.                                                                                                                                                   |
-| A helper job fails at once                                    | The page's helper check (Getting started step 4) shows the runtime and the reason. Claude: sign in to Claude Code or set `ANTHROPIC_API_KEY`; Codex: `codex login`. A usage limit fails the job; Retry later.                                                                   |
-| Settings page shows 401/403                                   | Double-click `Open Settings.command`, or open the newest link (each process start issues a new token; it is in `data/admin-token`). Use `127.0.0.1` or `localhost`, not another hostname.                                                                                       |
+| Symptom                                                         | Cause and fix                                                                                                                                                                                                                                                                   |
+| --------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Banner or page: setup mode, `passphrase_missing`/`_too_short`   | Set the passphrase on the settings page (Getting started step 1), or in `.env` and restart.                                                                                                                                                                                     |
+| Setup mode, `config_invalid`                                    | A settings file has a mistake; the message names the file and value. Fix it and save on the page, or press **Restart the program**.                                                                                                                                             |
+| Setup mode, `start_failed` with `EADDRINUSE`                    | Port 8787 is taken (often a second bridge). Stop it, or change `publicPort` and the tunnel target. If the settings-page port 8788 is taken, the process exits with code 1.                                                                                                      |
+| `401` on `/mcp`                                                 | Expected without a token. From a connected client: the token expired and could not be refreshed, was revoked on the page, the tunnel address was removed from `oauth.extraResources`, or `PUBLIC_URL` changed. Remove and re-add the connector, then consent again.             |
+| Claude: "Couldn't reach the MCP server"                         | The tunnel or the bridge is down, or the quick-tunnel URL changed. `curl -s -o /dev/null -w '%{http_code}\n' -X POST "$PUBLIC_URL/mcp"`; anything but `401` means the path is broken. Restart in Path B order and re-add the connector if the URL changed.                      |
+| ChatGPT cannot create or use the connector                      | Managed connection: the Connection area shows the state and the last problem; **Try again** restarts the tool. Hand-made connection: `tunnel-client doctor --profile <profile> --explain` and `curl -fsS http://127.0.0.1:8080/readyz`. The connector must use the same tunnel. |
+| Consent page: "redirect_uri is not allowed by this bridge"      | Add the client's callback URL to `redirectUriAllowlist` in `config/bridge.json` and restart.                                                                                                                                                                                    |
+| Consent page: too many failed attempts                          | Lockout after wrong passphrases (5 per IP with `trustedProxyHeader`, else 20 globally). Wait 15 minutes.                                                                                                                                                                        |
+| `browser_unavailable`                                           | Aside is not running, the Aside CLI is signed out, or `aside` is not found. Open Aside, run `aside login`, check `aside account`, then `npm run browser:check`. Under launchd `ASIDE_CLI` must be the absolute path (the installer sets it).                                    |
+| Site `needs_login` / status `auth_required`                     | The site's login in Aside expired. Log in again in Aside (same account), then **Check now**.                                                                                                                                                                                    |
+| Site `degraded` / `adapter_error`                               | Three consecutive adapter errors or a failed health check. Read the last failure, try **Check now**, then **Repair**.                                                                                                                                                           |
+| `rate_limited`                                                  | The site throttled. The bridge leaves it alone for 10 minutes. If it happens with several calls at once, lower `tunables.maxConcurrentPerSite`.                                                                                                                                 |
+| `access_denied` "The captcha could not be solved automatically" | The site showed a captcha or block page and the bridge's one automatic attempt did not clear it (Settings → Captchas). Open the named page in Aside, solve it, then retry.                                                                                                      |
+| A helper job fails at once                                      | The page's helper check (Getting started step 4) shows the runtime and the reason. Claude: sign in to Claude Code or set `ANTHROPIC_API_KEY`; Codex: `codex login`. A usage limit fails the job; Retry later.                                                                   |
+| Settings page shows 401/403                                     | Double-click `Open Settings.command`, or open the newest link (each process start issues a new token; it is in `data/admin-token`). Use `127.0.0.1` or `localhost`, not another hostname.                                                                                       |
 
 More in [docs/operations.md](docs/operations.md).
 

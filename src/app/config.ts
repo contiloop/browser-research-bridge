@@ -3,17 +3,24 @@
  * `config/bridge.json`, which overrides the built-in defaults below (which mirror
  * `config/bridge.example.json`). Refuses to produce a config without a valid passphrase.
  *
- * Dependency-free on purpose (Node built-ins and the pure settings rules of `src/core/settings.ts`)
- * so the composition root can call it first.
+ * Dependency-free on purpose (Node built-ins, the pure settings rules of `src/core/settings.ts`, and
+ * the shared captcha defaults of `src/core/defaults.ts`) so the composition root can call it first.
  */
 import { readFileSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
 import {
+  DEFAULT_CAPTCHA_ATTEMPT_BUDGET_MS,
+  DEFAULT_CAPTCHA_INLINE_MIN_REMAINING_MS,
+  DEFAULT_CAPTCHA_RERUN_RESERVE_MS,
+} from "../core/defaults.js";
+import {
   DEFAULT_ASIDE_ACCOUNT,
+  DEFAULT_CAPTCHA_AUTO,
   DEFAULT_HELPER_RUNTIME,
   HELPER_RUNTIME_SETTINGS,
   MIN_PASSPHRASE_LENGTH,
   checkChatgptSetting,
+  isCaptchaAutoSetting,
   isHelperRuntimeSetting,
   passphraseProblem,
   type ChatgptConnectionSetting,
@@ -38,10 +45,21 @@ export interface Tunables {
   documentMaxChars: number;
   toolCallBudgetMs: number;
   adapterStepTimeoutMs: number;
-  maxConcurrentSites: number;
+  /** Tasks of one site that run at once (tool calls share this pool; exclusive tasks hold the site alone). */
+  maxConcurrentPerSite: number;
+  /** Browser tasks that run at once across all sites. */
+  maxConcurrentTasks: number;
+  /** Minimum gap between the starts of two tasks on one site. */
+  concurrentStaggerMs: number;
   defaultMinIntervalMs: number;
   coolDownSeconds: number;
   warmTabTtlSeconds: number;
+  /** Time one automatic captcha attempt may take. */
+  captchaAttemptBudgetMs: number;
+  /** Tool-call budget that must remain for a captcha to be attempted inside the call. */
+  captchaInlineMinRemainingMs: number;
+  /** Tool-call budget kept back for re-running the call after a solved captcha. */
+  captchaRerunReserveMs: number;
   consecutiveAdapterErrorsToDegrade: number;
   healthCheckIntervalSeconds: number;
   minReadChars: number;
@@ -83,6 +101,10 @@ export interface BridgeConfig {
   };
   /** `config/bridge.json` → `chatgpt`: the program-managed ChatGPT connection, or null (absent or `null`). */
   chatgpt: ChatgptConnectionSetting | null;
+  captcha: {
+    /** `config/bridge.json` → `captcha.auto` (default true; no environment override). */
+    auto: boolean;
+  };
   /** Locations of external executables; each defaults to the name on `PATH`. */
   executables: {
     /** `TUNNEL_CLIENT_BIN`, default `tunnel-client`. */
@@ -127,10 +149,15 @@ export const DEFAULT_TUNABLES: Readonly<Tunables> = Object.freeze({
   documentMaxChars: 100_000,
   toolCallBudgetMs: 90_000,
   adapterStepTimeoutMs: 120_000,
-  maxConcurrentSites: 4,
+  maxConcurrentPerSite: 3,
+  maxConcurrentTasks: 8,
+  concurrentStaggerMs: 500,
   defaultMinIntervalMs: 1500,
   coolDownSeconds: 600,
   warmTabTtlSeconds: 300,
+  captchaAttemptBudgetMs: DEFAULT_CAPTCHA_ATTEMPT_BUDGET_MS,
+  captchaInlineMinRemainingMs: DEFAULT_CAPTCHA_INLINE_MIN_REMAINING_MS,
+  captchaRerunReserveMs: DEFAULT_CAPTCHA_RERUN_RESERVE_MS,
   consecutiveAdapterErrorsToDegrade: 3,
   healthCheckIntervalSeconds: 86_400,
   minReadChars: 200,
@@ -142,6 +169,12 @@ export const DEFAULT_TUNABLES: Readonly<Tunables> = Object.freeze({
   maxRegisteredClients: 50,
   clientPurgeAfterDays: 7,
 });
+
+/**
+ * Tunables that may also be 0; every other tunable must be positive. `concurrentStaggerMs: 0` turns
+ * off the gap between the starts of overlapping tasks on one site.
+ */
+const ZERO_ALLOWED_TUNABLES: ReadonlySet<string> = new Set<keyof Tunables>(["concurrentStaggerMs"]);
 
 export const DEFAULT_REDIRECT_URI_ALLOWLIST: readonly string[] = Object.freeze([
   "https://claude.ai/api/mcp/auth_callback",
@@ -185,6 +218,7 @@ const TOP_LEVEL_KEYS = new Set([
   "onboarding",
   "oauth",
   "chatgpt",
+  "captcha",
   "tunables",
 ]);
 
@@ -249,6 +283,10 @@ export function loadConfig(options: LoadConfigOptions = {}): BridgeConfig {
   };
 
   const chatgpt = chatgptSetting(json["chatgpt"]);
+  const captchaRaw = objectOrEmpty(json["captcha"], "captcha");
+  const captchaAuto = captchaRaw["auto"] === undefined ? DEFAULT_CAPTCHA_AUTO : captchaRaw["auto"];
+  if (!isCaptchaAutoSetting(captchaAuto)) throw new ConfigError("captcha.auto must be a boolean");
+  const captcha = { auto: captchaAuto };
   const executables = {
     tunnelClient: envValue("TUNNEL_CLIENT_BIN") ?? "tunnel-client",
     codex: envValue("CODEX_BIN") ?? "codex",
@@ -270,8 +308,9 @@ export function loadConfig(options: LoadConfigOptions = {}): BridgeConfig {
       warnings.push(`unknown tunable "${key}" ignored`);
       continue;
     }
-    if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
-      throw new ConfigError(`tunables.${key} must be a positive number`);
+    const zeroAllowed = ZERO_ALLOWED_TUNABLES.has(key);
+    if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || (value === 0 && !zeroAllowed)) {
+      throw new ConfigError(`tunables.${key} must be a ${zeroAllowed ? "non-negative" : "positive"} number`);
     }
     tunables[key as keyof Tunables] = value;
   }
@@ -306,6 +345,7 @@ export function loadConfig(options: LoadConfigOptions = {}): BridgeConfig {
     git: { autoCommit },
     onboarding,
     chatgpt,
+    captcha,
     executables,
     oauth,
     tunables,

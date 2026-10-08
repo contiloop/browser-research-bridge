@@ -13,7 +13,13 @@ import { stubHelpers } from "../../test/support/mcp-fixtures.js";
 import { MemoryLogger } from "../../test/support/oauth-harness.js";
 import { fakeBrowser } from "../../test/support/site-fixtures.js";
 import { HelperRuntimes } from "../adapters/onboarding/index.js";
-import type { AgentRunner, HelperRuntime } from "../adapters/onboarding/index.js";
+import type {
+  AgentRunner,
+  HelperCheckCode,
+  HelperRuntime,
+  HelperRuntimeId,
+  RuntimeProbe,
+} from "../adapters/onboarding/index.js";
 import { FileTokenStore, tokenStorePath } from "../adapters/storage/index.js";
 import type {
   ConnectionDiagnostics,
@@ -36,6 +42,16 @@ const OLD = "the old passphrase 1";
 const NEW = `a "new" passphrase # with 'quotes' and 한글`;
 const KEY = "sk-runtime-key-SECRET-0123456789";
 const TUNNEL = `tunnel_${"0123456789abcdef".repeat(2)}`;
+
+/** A fake `pbcopy` that records its standard input and argument count (the real one is never run). */
+function fakePbcopy(dir: string): { command: string; out: string; args: string } {
+  mkdirSync(dir, { recursive: true });
+  const paths = { command: join(dir, "pbcopy"), out: join(dir, "out"), args: join(dir, "args") };
+  writeFileSync(paths.command, `#!/bin/sh\nprintf '%s' "$#" > '${paths.args}'\ncat > '${paths.out}'\n`, {
+    mode: 0o755,
+  });
+  return paths;
+}
 
 async function freePort(): Promise<number> {
   const server = createServer();
@@ -95,17 +111,29 @@ class FakeTool implements ConnectionTool {
   }
 }
 
-/** A helper runtime whose check is scripted and makes no model call. */
-function fakeRuntime(checks: { count: number }): HelperRuntime {
+interface Checks {
+  /** Checks made on any runtime. */
+  count: number;
+  byRuntime: Record<HelperRuntimeId, number>;
+  probe: Record<HelperRuntimeId, RuntimeProbe>;
+  code: HelperCheckCode;
+}
+
+/** A helper runtime whose probe and check are scripted and make no model call. */
+function fakeRuntime(id: HelperRuntimeId, checks: Checks): HelperRuntime {
   return {
-    id: "claude",
-    label: "Claude",
-    signInHint: "sign in to Claude Code on this Mac",
+    id,
+    label: id === "claude" ? "Claude" : "Codex",
+    signInHint: `sign in to ${id} on this Mac`,
     runner: {} as AgentRunner,
-    probe: async () => ({ installed: true, signedIn: null }),
+    probe: async () => ({ ...checks.probe[id] }),
     check: async () => {
       checks.count++;
-      return { code: "ok", message: "round trip passed" };
+      checks.byRuntime[id]++;
+      return {
+        code: checks.code,
+        message: checks.code === "ok" ? "round trip passed" : "usage limit reached",
+      };
     },
   };
 }
@@ -115,7 +143,10 @@ describe("settings-page API through the process", () => {
   let logger: MemoryLogger;
   let cores: BridgeApp[];
   let proc: BridgeProcess | null;
-  let checks: { count: number };
+  let checks: Checks;
+  /** The runtimes the cores register (`["claude"]` unless a test adds Codex). */
+  let shipped: HelperRuntimeId[];
+  let clip: { command: string; out: string; args: string };
   let cookie: string;
   const bodies: string[] = [];
 
@@ -127,7 +158,14 @@ describe("settings-page API through the process", () => {
     logger = new MemoryLogger();
     cores = [];
     proc = null;
-    checks = { count: 0 };
+    checks = {
+      count: 0,
+      byRuntime: { claude: 0, codex: 0 },
+      probe: { claude: { installed: true, signedIn: null }, codex: { installed: true, signedIn: true } },
+      code: "ok",
+    };
+    shipped = ["claude"];
+    clip = fakePbcopy(join(root, "clip"));
     bodies.length = 0;
   });
   afterEach(async () => {
@@ -149,7 +187,7 @@ describe("settings-page API through the process", () => {
       onboarding: {
         runtimes: new HelperRuntimes({
           configured: config.onboarding.runtime,
-          runtimes: [fakeRuntime(checks)],
+          runtimes: shipped.map((id) => fakeRuntime(id, checks)),
         }),
       },
     });
@@ -166,6 +204,8 @@ describe("settings-page API through the process", () => {
       probeBrowser: false,
       connectionTool: new FakeTool(join(root, "tool")),
       chatgptTargetFallback: { env: {}, rootDir: root },
+      helperAutoCheckDelayMs: 0,
+      clipboardCommand: clip.command,
     });
     const res = await fetch(proc.openUrl()!, { redirect: "manual" });
     cookie = (res.headers.get("set-cookie") ?? "").split(";")[0]!;
@@ -186,8 +226,11 @@ describe("settings-page API through the process", () => {
         body: body === undefined ? null : JSON.stringify(body),
       }),
     );
-  const settled = () =>
-    vi.waitFor(() => expect(proc!.controller.isBusy()).toBe(false), { timeout: 5000, interval: 10 });
+  const settled = async () => {
+    await vi.waitFor(() => expect(proc!.controller.isBusy()).toBe(false), { timeout: 5000, interval: 10 });
+    // The automatic helper check of the core that just started (delay 0 here).
+    await proc!.helperChecks.settled();
+  };
   const noSecretAnywhere = () => {
     const all = [...bodies, ...logger.lines].join("\n");
     for (const secret of [OLD, NEW, KEY]) expect(all).not.toContain(secret);
@@ -371,26 +414,98 @@ describe("settings-page API through the process", () => {
     expect(await tokenFile().listClients()).toHaveLength(2);
   });
 
-  it("the last helper check survives a core restart", async () => {
+  it("the automatic helper check runs once after the start, is kept in data/, and is not repeated", async () => {
     writeEnv(`BRIDGE_PASSPHRASE='${OLD}'\n`);
-    await boot();
-    expect((await get("helper")).json).toMatchObject({
+    const first = await boot();
+    await settled();
+    expect(checks.count).toBe(1);
+    const helper = await get("helper");
+    expect(helper.json).toMatchObject({
       configured: "auto",
       supported: ["claude"],
       runtimes: { claude: { installed: true, signedIn: null }, codex: null },
       wouldUse: "claude",
-      lastCheck: null,
+      lastCheck: { runtime: "claude", ok: true, code: "ok", message: "round trip passed" },
     });
-    const check = await send("POST", "helper/check");
-    expect(check).toMatchObject({
-      status: 200,
-      json: { runtime: "claude", ok: true, code: "ok", message: "round trip passed" },
+    const lastCheck = (helper.json as { lastCheck: Record<string, unknown> }).lastCheck;
+    expect(JSON.parse(readFileSync(join(root, "data", "helper-check.json"), "utf8"))).toEqual({
+      version: 1,
+      at: lastCheck["at"],
+      runtime: "claude",
+      result: "ok",
+      message: "round trip passed",
     });
-    expect(checks.count).toBe(1);
+    expect(logger.lines.some((l) => l.includes("helper check") && l.includes('"trigger":"automatic"'))).toBe(
+      true,
+    );
+
+    // A core restart: an ok is recorded for the runtime in use, so no new request.
     expect((await send("POST", "restart", {})).json).toEqual({ restarting: true });
     await settled();
     expect(cores).toHaveLength(2);
-    expect(((await get("helper")).json as { lastCheck: unknown }).lastCheck).toEqual(check.json);
+    expect(checks.count).toBe(1);
+    expect(((await get("helper")).json as { lastCheck: unknown }).lastCheck).toEqual(lastCheck);
+
+    // A new process over the same data folder reads the record and does not check again.
+    await first.stop();
+    await boot();
+    await settled();
+    expect(checks.count).toBe(1);
+    expect(((await get("helper")).json as { lastCheck: unknown }).lastCheck).toEqual(lastCheck);
+
+    // The Check button still runs a real check and replaces the record.
+    const manual = await send("POST", "helper/check");
+    expect(manual).toMatchObject({ status: 200, json: { runtime: "claude", ok: true, code: "ok" } });
+    expect(checks.count).toBe(2);
+    expect(((await get("helper")).json as { lastCheck: unknown }).lastCheck).toEqual(manual.json);
+    noSecretAnywhere();
+  });
+
+  it("after the helper runtime setting changes, the automatic check runs on the runtime now in use", async () => {
+    shipped = ["claude", "codex"];
+    writeEnv(`BRIDGE_PASSPHRASE='${OLD}'\n`);
+    await boot();
+    await settled();
+    expect(checks.byRuntime).toEqual({ claude: 1, codex: 0 });
+    expect((await send("PUT", "settings", { helperRuntime: "codex" })).status).toBe(202);
+    await settled();
+    expect(checks.byRuntime).toEqual({ claude: 1, codex: 1 });
+    expect((await get("helper")).json).toMatchObject({ wouldUse: "codex", lastCheck: { runtime: "codex" } });
+    // Saving something else restarts the core but spends no request.
+    expect((await send("PUT", "settings", { asideAccount: "u2" })).status).toBe(202);
+    await settled();
+    expect(checks.byRuntime).toEqual({ claude: 1, codex: 1 });
+  });
+
+  it("no automatic check while the runtime's probe says it is not installed or not signed in", async () => {
+    shipped = ["claude", "codex"];
+    writeConfig({ publicPort: await freePort(), onboarding: { runtime: "codex" } });
+    checks.probe.codex = { installed: true, signedIn: false };
+    writeEnv(`BRIDGE_PASSPHRASE='${OLD}'\n`);
+    await boot();
+    await settled();
+    checks.probe.codex = { installed: false, signedIn: null };
+    expect((await send("POST", "restart", {})).status).toBe(202);
+    await settled();
+    expect(checks.count).toBe(0);
+    expect((await get("helper")).json).toMatchObject({ wouldUse: null, lastCheck: null });
+    expect(existsSync(join(root, "data", "helper-check.json"))).toBe(false);
+  });
+
+  it("a failed automatic check is recorded and retried only at the next core start", async () => {
+    checks.code = "limit_reached";
+    writeEnv(`BRIDGE_PASSPHRASE='${OLD}'\n`);
+    await boot();
+    await settled();
+    expect(checks.count).toBe(1);
+    expect((await get("helper")).json).toMatchObject({
+      lastCheck: { runtime: "claude", ok: false, code: "limit_reached" },
+    });
+    checks.code = "ok";
+    expect((await send("POST", "restart", {})).status).toBe(202);
+    await settled();
+    expect(checks.count).toBe(2);
+    expect((await get("helper")).json).toMatchObject({ lastCheck: { ok: true, code: "ok" } });
   });
 
   it("helper runtime and browser account are saved to bridge.json and restart the core", async () => {
@@ -440,5 +555,87 @@ describe("settings-page API through the process", () => {
       json: { error: "not_configured" },
     });
     noSecretAnywhere();
+  });
+
+  it("Copy passphrase puts the .env passphrase on the clipboard through pbcopy's input only", async () => {
+    writeEnv(`BRIDGE_PASSPHRASE='${OLD}'\n`);
+    await boot();
+    expect(await send("POST", "settings/passphrase/clipboard")).toEqual({ status: 200, json: { ok: true } });
+    expect(readFileSync(clip.out, "utf8")).toBe(OLD);
+    expect(readFileSync(clip.args, "utf8")).toBe("0");
+    // After a change on the page it copies the new value, also while the core restarts.
+    expect((await send("PUT", "settings", { passphrase: NEW })).status).toBe(202);
+    expect((await send("POST", "settings/passphrase/clipboard")).status).toBe(200);
+    expect(readFileSync(clip.out, "utf8")).toBe(NEW);
+    await settled();
+    noSecretAnywhere();
+  });
+
+  it("Copy passphrase: not_set in setup mode, locked when set outside .env, unavailable without pbcopy", async () => {
+    writeEnv("BRIDGE_PASSPHRASE=short\n");
+    const p = await boot();
+    expect(p.controller.status().mode).toBe("setup");
+    expect(await send("POST", "settings/passphrase/clipboard")).toMatchObject({
+      status: 409,
+      json: { error: "not_set" },
+    });
+    await p.stop();
+
+    writeEnv(`BRIDGE_PASSPHRASE='${OLD}'\n`);
+    await boot({ BRIDGE_PASSPHRASE: "set by the service definition" });
+    expect(await send("POST", "settings/passphrase/clipboard")).toMatchObject({
+      status: 409,
+      json: { error: "locked", fields: { passphrase: "locked" } },
+    });
+    expect(existsSync(clip.out)).toBe(false);
+    await proc!.stop();
+
+    clip.command = join(root, "no-such-pbcopy");
+    await boot();
+    expect(await send("POST", "settings/passphrase/clipboard")).toMatchObject({
+      status: 500,
+      json: { error: "unavailable" },
+    });
+    // Refused without the cookie or with a foreign Origin.
+    const url = `${proc!.dashboard.url}/api/settings/passphrase/clipboard`;
+    expect((await fetch(url, { method: "POST", headers: { origin: proc!.dashboard.url } })).status).toBe(403);
+    expect(
+      (await fetch(url, { method: "POST", headers: { cookie, origin: "https://evil.example" } })).status,
+    ).toBe(403);
+    noSecretAnywhere();
+  });
+
+  it("captchaAuto: read, saved to captcha.auto in bridge.json, restarts the core, refused when invalid", async () => {
+    writeEnv(`BRIDGE_PASSPHRASE='${OLD}'\n`);
+    await boot();
+    expect((await get("settings")).json).toMatchObject({ captchaAuto: true });
+    expect(await send("PUT", "settings", { captchaAuto: true })).toEqual({
+      status: 200,
+      json: { changed: [], restarting: false, appsDisconnected: null },
+    });
+    expect(await send("PUT", "settings", { captchaAuto: "off" })).toMatchObject({
+      status: 400,
+      json: { error: "invalid", fields: { captchaAuto: "bad_value" } },
+    });
+    expect(await send("PUT", "settings", { captchaAuto: false })).toEqual({
+      status: 202,
+      json: { changed: ["captchaAuto"], restarting: true, appsDisconnected: null },
+    });
+    await settled();
+    expect(cores).toHaveLength(2);
+    expect(cores[1]!.services.config.captcha.auto).toBe(false);
+    const json = JSON.parse(readFileSync(join(root, "config", "bridge.json"), "utf8")) as Record<
+      string,
+      unknown
+    >;
+    expect(json["captcha"]).toEqual({ auto: false });
+    expect((await get("settings")).json).toMatchObject({ captchaAuto: false });
+
+    writeFileSync(join(root, "config", "bridge.json"), "{ not json");
+    expect(await send("PUT", "settings", { captchaAuto: true })).toMatchObject({
+      status: 409,
+      json: { error: "file_unreadable" },
+    });
+    expect((await get("settings")).json).toMatchObject({ captchaAuto: null });
   });
 });

@@ -23,6 +23,7 @@ export const VALUE_SETS = {
   chatgptState: ["not_configured", "external", "stopped", "starting", "ready", "failed"],
   helperRuntime: ["auto", "claude", "codex"],
   helperCheckCode: ["ok", "not_installed", "not_signed_in", "limit_reached", "failed"],
+  blockKind: ["login", "captcha", "consent", "subscription", "other"],
   errorCode: [
     "invalid",
     "busy",
@@ -42,6 +43,8 @@ export const VALUE_SETS = {
     "conflict",
     "too_large",
     "server_error",
+    "not_set",
+    "unavailable",
   ],
   fieldCode: ["too_short", "empty", "unsupported_characters", "bad_format", "bad_value", "locked"],
 };
@@ -66,7 +69,7 @@ const en = {
   outcomeStatus: {
     ok: "worked",
     empty: "worked, but found nothing",
-    auth_required: "you need to log in to the site in Aside",
+    auth_required: "you need to log in to the site in the Aside browser",
     unsupported: "not supported by this site",
     access_denied: "the site refused access",
     rate_limited: "the site asked to slow down; try again later",
@@ -101,6 +104,13 @@ const en = {
     limit_reached: "Your subscription's usage limit is reached. Try again later.",
     failed: "The check did not succeed.",
   },
+  blockKind: {
+    login: "Needs you to log in to the site",
+    captcha: "A captcha (a test that checks a person is visiting) is in the way",
+    consent: "Needs you to accept something on the site, such as its terms or cookies",
+    subscription: "Needs a subscription to the site",
+    other: "Needs something else from you",
+  },
   errorCode: {
     invalid: "Some of what you entered is not accepted.",
     busy: "The program is restarting right now. Try again in a moment.",
@@ -120,6 +130,9 @@ const en = {
     conflict: "This cannot be done right now.",
     too_large: "What you entered is too long.",
     server_error: "Something went wrong inside the program.",
+    not_set: "No access passphrase is set yet. Set one in step 1 of Getting started.",
+    unavailable:
+      "The clipboard of this Mac could not be used. Copy the access passphrase from where you keep it instead.",
   },
   fieldCode: {
     too_short: "Too short: use at least 12 characters.",
@@ -151,7 +164,7 @@ const ko = {
   outcomeStatus: {
     ok: "정상",
     empty: "정상이지만 찾은 내용이 없음",
-    auth_required: "Aside에서 이 사이트에 로그인해야 함",
+    auth_required: "Aside 브라우저에서 이 사이트에 로그인해야 함",
     unsupported: "이 사이트에서 지원하지 않음",
     access_denied: "사이트가 접근을 거부함",
     rate_limited: "사이트가 요청을 줄여 달라고 함. 나중에 다시 시도하세요",
@@ -186,6 +199,13 @@ const ko = {
     limit_reached: "구독 사용 한도에 도달했습니다. 나중에 다시 시도하세요.",
     failed: "확인에 실패했습니다.",
   },
+  blockKind: {
+    login: "사이트에 로그인해 주어야 함",
+    captcha: "캡차(사람이 방문했는지 확인하는 테스트)가 가로막고 있음",
+    consent: "사이트에서 약관이나 쿠키 같은 것에 동의해 주어야 함",
+    subscription: "사이트 구독이 필요함",
+    other: "그 밖의 조치가 필요함",
+  },
   errorCode: {
     invalid: "입력한 내용 중 받아들일 수 없는 것이 있습니다.",
     busy: "지금 프로그램이 다시 시작하는 중입니다. 잠시 후 다시 시도하세요.",
@@ -205,6 +225,8 @@ const ko = {
     conflict: "지금은 할 수 없습니다.",
     too_large: "입력한 내용이 너무 깁니다.",
     server_error: "프로그램 내부에서 문제가 생겼습니다.",
+    not_set: "아직 접속 암호가 정해져 있지 않습니다. 시작하기의 1단계에서 정하세요.",
+    unavailable: "이 Mac의 클립보드를 쓸 수 없습니다. 접속 암호를 보관해 둔 곳에서 직접 복사하세요.",
   },
   fieldCode: {
     too_short: "너무 짧습니다. 12자 이상으로 입력하세요.",

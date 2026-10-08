@@ -130,7 +130,9 @@ async function main(argv: readonly string[]): Promise<number> {
     warmTabTtlMs: 0,
   });
   const scheduler = new InMemoryScheduler({
-    maxConcurrentSites: config.tunables.maxConcurrentSites,
+    maxConcurrentPerSite: config.tunables.maxConcurrentPerSite,
+    maxConcurrentTasks: config.tunables.maxConcurrentTasks,
+    concurrentStaggerMs: config.tunables.concurrentStaggerMs,
     coolDownMs: config.tunables.coolDownSeconds * 1000,
   });
   const validator = new SiteValidator({

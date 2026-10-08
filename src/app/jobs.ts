@@ -100,6 +100,8 @@ export function createOnboardingJobs(
     asideAccount: config.asideAccount,
     defaultMinIntervalMs: config.tunables.defaultMinIntervalMs,
     stepBudgetMs: config.tunables.adapterStepTimeoutMs + 30_000,
+    captchaAttemptBudgetMs: config.tunables.captchaAttemptBudgetMs,
+    captchaAuto: config.captcha.auto,
     clock: deps.clock,
     logger,
   });

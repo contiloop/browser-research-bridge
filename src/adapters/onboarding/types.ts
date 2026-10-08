@@ -26,6 +26,20 @@ export function isHelperRuntimeId(value: unknown): value is HelperRuntimeId {
   return typeof value === "string" && (HELPER_RUNTIME_IDS as readonly string[]).includes(value);
 }
 
+/**
+ * What blocks a paused job, as the helper reported it with `report_blocked({ kind })`; the settings page
+ * offers the Aside-AI login text only for `login`. Pauses the service writes itself are `other`.
+ */
+export const BLOCK_KINDS = ["login", "captcha", "consent", "subscription", "other"] as const;
+export type BlockKind = (typeof BLOCK_KINDS)[number];
+
+/** A known block kind stays; anything else (missing, unknown) is `other`. */
+export function parseBlockKind(value: unknown): BlockKind {
+  return typeof value === "string" && (BLOCK_KINDS as readonly string[]).includes(value)
+    ? (value as BlockKind)
+    : "other";
+}
+
 /** A job that may still run (Remove cancels it; a second Add/Repair for the site is refused). */
 export function isActiveJobState(state: JobState): boolean {
   return state === "queued" || state === "running" || state === "awaiting_user";
@@ -70,6 +84,11 @@ export interface OnboardingJob {
   lang?: HelperLang | undefined;
   /** Runtime the job last ran on; null before its first run. Read it with {@link jobRuntime}. */
   runtime?: HelperRuntimeId | null | undefined;
+  /**
+   * What blocks the job while it is `awaiting_user` (`other` in every other state). Written by the
+   * service and filled (`"other"`) by the store for old records; read it with {@link jobBlockKind}.
+   */
+  blockKind?: BlockKind | undefined;
   /** Commit of the promoted folder (`site: add|repair <key>`), when one was made. */
   commit: string | null;
   createdAt: string;
@@ -84,6 +103,10 @@ export function jobLang(job: Pick<OnboardingJob, "lang">): HelperLang {
 
 export function jobRuntime(job: Pick<OnboardingJob, "runtime">): HelperRuntimeId | null {
   return job.runtime ?? null;
+}
+
+export function jobBlockKind(job: Pick<OnboardingJob, "blockKind">): BlockKind {
+  return job.blockKind ?? "other";
 }
 
 export type JobLogLevel = "info" | "warn" | "error";

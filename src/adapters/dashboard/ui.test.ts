@@ -1,6 +1,7 @@
 /**
- * The settings page's plain modules (ui/*.js): both languages complete, a label for every closed
- * value set, the Aside instruction texts' stop rules, and the pure page logic.
+ * The settings page's plain modules (ui/*.js): both languages complete and short, a label for every
+ * closed value set, the Aside instruction texts' stop rules (including the login text), and the pure
+ * page logic.
  */
 import { readFile } from "node:fs/promises";
 import { webcrypto } from "node:crypto";
@@ -11,6 +12,7 @@ import { HELPER_RUNTIME_IDS, JOB_STATES } from "../onboarding/types.js";
 import { CHATGPT_ERROR_CODES, CHATGPT_FIELD_CODES } from "../../app/chatgpt-connection.js";
 import { RUN_PROBLEM_CODES } from "../../app/run-mode.js";
 import { SETTINGS_FIELD_CODES } from "../../ports/settings-store.js";
+import { DEFAULT_TUNABLES } from "../../app/config.js";
 import { API_ERROR_CODES } from "./api.js";
 
 type Dict = Record<string, string>;
@@ -25,11 +27,17 @@ interface LabelsModule {
   LABELS: Record<string, Record<string, Dict>>;
   label(lang: string, set: string, value: unknown): string;
 }
+interface LoginTarget {
+  kind: "url" | "host";
+  address: string;
+}
 interface InstructionsModule {
   LINKS: Record<string, string>;
   COMMANDS: Record<string, string>;
   INSTRUCTION_TEXTS: Record<string, Record<string, string>>;
   asideText(lang: string, which: string, options?: { tunnelId?: unknown }): string;
+  loginTarget(site: { loginUrl?: unknown; hostnames?: unknown; input?: unknown }): LoginTarget | null;
+  loginText(lang: string, target: unknown): string | null;
 }
 interface Step {
   id: string;
@@ -42,6 +50,16 @@ interface StateModule {
   pickLanguage(remembered: unknown, browserLanguage: unknown): string;
   gettingStarted(data: Record<string, unknown>): Step[];
   firstOpenStep(steps: Step[]): string | null;
+  helperReady(helper: unknown): boolean;
+  helperNeedsPoll(status: unknown, helper: unknown): boolean;
+  nextStep(
+    steps: Step[],
+    data: Record<string, unknown>,
+  ): { id: string | null; say: string; action: string | null };
+  BLOCK_KINDS: string[];
+  blockKind(job: unknown): string;
+  jobPausedForLogin(job: unknown): boolean;
+  offersLoginHelp(site: unknown): boolean;
   chatgptSubsteps(chatgpt: unknown): { id: string; state: string }[];
   siteGuidance(site: Record<string, unknown>): { say: string; primary: string | null };
   formatBytes(n: unknown): string;
@@ -56,6 +74,21 @@ const instructions = await importUi<InstructionsModule>("instructions.js");
 const state = await importUi<StateModule>("state.js");
 
 const LANGS = ["ko", "en"] as const;
+
+/**
+ * Sentences in a page text, counted conservatively: every `.`, `。`, `?`, or `!` (or a run of them)
+ * that ends the text or is followed by a space, a closing quote, or a bracket. Web addresses,
+ * {placeholders}, and dots inside a word (`reuters.com`, `Open Settings.command`, `1.5`) do not end a
+ * sentence; an ellipsis (…) does not either.
+ */
+function sentenceCount(text: string): number {
+  const plain = text
+    // An address ends before trailing punctuation, which may still end the sentence.
+    .replace(/https?:\/\/\S+?(?=[.,;:!?。)"'”’]*(?:\s|$))/g, "ADDRESS")
+    .replace(/\{\w+\}/g, "VALUE")
+    .replace(/(\w)\.(?=\w)/g, "$1");
+  return (plain.match(/[.。?!？！]+(?=[\s"'”’)\]]|$)/g) ?? []).length;
+}
 
 describe("page wording (i18n.js)", () => {
   it("has exactly Korean and English", () => {
@@ -77,12 +110,108 @@ describe("page wording (i18n.js)", () => {
   it("every key the page script uses exists", async () => {
     const source = await readFile(uiUrl("app.js"), "utf8");
     const used = new Set([...source.matchAll(/\btx\("([\w.]+)"/g)].map((m) => m[1]!));
+    // `more("id", "key")`: the "More" disclosures.
+    const moreKeys = [...source.matchAll(/\bmore\("[^"]+", "([\w.]+)"\)/g)].map((m) => m[1]!);
+    expect(moreKeys.length).toBeGreaterThanOrEqual(5);
+    for (const key of moreKeys) {
+      expect(key, key).toMatch(/\.more$/);
+      used.add(key);
+    }
     used.delete("step.why.");
     for (const step of ["done", "todo", "unknown"]) used.add(`step.${step}`);
     for (const why of ["need_passphrase", "core_off", "restarting", "no_data"]) used.add(`step.why.${why}`);
     for (const id of ["start", "sites", "connection", "settings"]) used.add(`nav.${id}`);
-    for (const key of used) expect(i18n.DICTIONARIES["en"], key).toHaveProperty([key]);
+    for (const key of [
+      "helper.runtime.ready",
+      "helper.runtime.unknownSignIn",
+      "helper.runtime.notSignedIn",
+      "helper.runtime.missing",
+      "helper.runtime.notShipped",
+    ])
+      used.add(key);
+    // The "what to do next" sentences (state.js nextStep) and the per-site sentences (siteGuidance).
+    for (const key of [
+      "start.allDone",
+      "next.coreOff",
+      "step.why.restarting",
+      "step.why.no_data",
+      "next.passphrase",
+      "next.aside",
+      "next.chatgpt",
+      "next.helper",
+      "next.helperInstall",
+      "next.sites",
+      "next.sitesAdd",
+      "next.sitesFix",
+      "site.do.working",
+      "site.do.awaiting",
+      "site.do.jobFailed",
+      "site.do.login",
+      "site.do.loginNoUrl",
+      "site.do.degraded",
+      "site.do.failed",
+      "site.do.onboarding",
+      "site.do.fine",
+      "site.do.checkFirst",
+      "site.do.unknown",
+    ])
+      used.add(key);
+    for (const lang of LANGS) {
+      for (const key of used) expect(i18n.DICTIONARIES[lang], `${lang} ${key}`).toHaveProperty([key]);
+    }
     expect(used.size).toBeGreaterThan(100);
+  });
+
+  it("is short: at most two sentences per text (one for the page intro); longer background only in `.more` keys", () => {
+    // The counter itself: addresses, commands, and dotted names are not sentence ends.
+    expect(sentenceCount("Open https://www.reuters.com/a.b?x=1. Then press Check now.")).toBe(2);
+    expect(sentenceCount("Double-click “Open Settings.command” in the folder.")).toBe(1);
+    expect(sentenceCount("Log in to reuters.com in the Aside browser (step 5).")).toBe(1);
+    expect(sentenceCount("Remove {site}? It is deleted. For good!")).toBe(3);
+    expect(sentenceCount("저장했습니다. 다시 시작하는 중입니다…")).toBe(1);
+    for (const lang of LANGS) {
+      const dict = i18n.DICTIONARIES[lang]!;
+      expect(sentenceCount(dict["app.intro"]!), `${lang} app.intro`).toBe(1);
+      for (const [key, text] of Object.entries(dict)) {
+        if (key.endsWith(".more")) continue;
+        expect(sentenceCount(text), `${lang} ${key}: ${text}`).toBeLessThanOrEqual(2);
+      }
+      for (const [set, table] of Object.entries(labels.LABELS[lang]!)) {
+        for (const [value, text] of Object.entries(table)) {
+          expect(sentenceCount(text), `${lang} ${set} ${value}`).toBeLessThanOrEqual(2);
+        }
+      }
+    }
+    // Every step of Getting started and every area has its short explanation.
+    const en = i18n.DICTIONARIES["en"]!;
+    for (const key of [
+      "step1.explain",
+      "step2.explain",
+      "step3.explain",
+      "step4.explain",
+      "step5.explain",
+      "sites.explain",
+      "conn.explain",
+      "cap.explain",
+      "rt.explain",
+      "lang.explain",
+    ]) {
+      expect(en, key).toHaveProperty([key]);
+    }
+  });
+
+  it("names things one way: Aside is always the Aside browser (or the Aside AI), in both languages", () => {
+    for (const [key, text] of Object.entries(i18n.DICTIONARIES["en"]!)) {
+      for (const m of text.matchAll(/\bAside\b(?! browser| AI|'s settings)/g)) {
+        expect.fail(`en ${key}: "Aside" at ${m.index} without "browser" or "AI": ${text}`);
+      }
+      expect(text, key).not.toMatch(/\bthe program's main part\b/);
+    }
+    for (const [key, text] of Object.entries(i18n.DICTIONARIES["ko"]!)) {
+      for (const m of text.matchAll(/Aside(?! 브라우저| AI|의 명령줄| 설정)/g)) {
+        expect.fail(`ko ${key}: "Aside" at ${m.index} without "브라우저" or "AI": ${text}`);
+      }
+    }
   });
 
   it("explains each term a non-coder may not know where it first appears", () => {
@@ -92,12 +221,37 @@ describe("page wording (i18n.js)", () => {
     expect(ko["app.intro"]).toContain("설정 페이지");
     expect(en["step1.explain"]).toMatch(/access passphrase is/);
     expect(ko["step1.explain"]).toMatch(/접속 암호는/);
-    expect(en["conn.tunnelExplain"]).toMatch(/tunnel: a private passage/);
-    expect(ko["conn.tunnelExplain"]).toMatch(/터널은/);
+    expect(en["conn.explain"]).toMatch(/tunnel: a private passage/);
+    expect(ko["conn.explain"]).toMatch(/터널은/);
+    expect(en["conn.explain"]).toMatch(/connection tool/);
+    expect(ko["conn.explain"]).toMatch(/연결 도구/);
     expect(en["sub.c.explain"]).toMatch(/runtime key is/);
     expect(ko["sub.c.explain"]).toMatch(/런타임 키는/);
+    expect(en["sub.e.explain"]).toMatch(/connector is/);
+    expect(ko["sub.e.explain"]).toMatch(/커넥터는/);
     expect(en["step4.explain"]).toMatch(/helper is/);
     expect(ko["step4.explain"]).toMatch(/도우미는/);
+    expect(en["cap.explain"]).toMatch(/captcha is/);
+    expect(ko["cap.explain"]).toMatch(/캡차는/);
+    expect(en["aside.explain"]).toMatch(/Aside AI, the AI inside the Aside browser/);
+    expect(ko["aside.explain"]).toMatch(/Aside 브라우저 안의 AI인 Aside AI/);
+    expect(en["login.explain"]).toMatch(/Aside AI, the AI inside the Aside browser/);
+    expect(ko["login.explain"]).toMatch(/Aside 브라우저 안의 AI인 Aside AI/);
+  });
+
+  it("says next to the captcha switch where a captcha picture goes (spec 6.5)", () => {
+    expect(i18n.DICTIONARIES["en"]!["cap.switch"]).toBe("Solve captchas automatically");
+    expect(i18n.DICTIONARIES["en"]!["cap.note"]).toBe(
+      "Checkbox and slider captchas are solved in the Aside browser on this Mac. For text captchas, the picture of the captcha is sent to the AI model configured in Aside's settings.",
+    );
+    expect(i18n.DICTIONARIES["ko"]!["cap.note"]).toMatch(/Aside 브라우저 안에서/);
+    expect(i18n.DICTIONARIES["ko"]!["cap.note"]).toMatch(/Aside 설정에 지정된 AI 모델로 전송/);
+  });
+
+  it("Copy passphrase answers in plain words", () => {
+    expect(i18n.DICTIONARIES["en"]!["sub.f.copy"]).toBe("Copy passphrase");
+    expect(i18n.DICTIONARIES["en"]!["sub.f.copied"]).toBe("Copied; paste it on the approval page.");
+    expect(i18n.DICTIONARIES["ko"]!["sub.f.copied"]).toMatch(/승인 페이지에 붙여 넣으세요/);
   });
 
   it("fills placeholders and falls back to the key", () => {
@@ -117,6 +271,8 @@ describe("labels of closed value sets (labels.js)", () => {
     chatgptState: ["not_configured", "external", "stopped", "starting", "ready", "failed"],
     helperRuntime: ["auto", ...HELPER_RUNTIME_IDS],
     helperCheckCode: HELPER_CHECK_CODES,
+    // The kinds a paused helper job gives (spec 6.2); the page reads a missing one as `other`.
+    blockKind: ["login", "captcha", "consent", "subscription", "other"],
   };
 
   it("each set has the members of the server's set (and the expected counts)", () => {
@@ -136,12 +292,18 @@ describe("labels of closed value sets (labels.js)", () => {
       chatgptState: 6,
       helperRuntime: 3,
       helperCheckCode: 5,
+      blockKind: 5,
     });
+    expect([...state.BLOCK_KINDS].sort()).toEqual([...labels.VALUE_SETS["blockKind"]!].sort());
   });
 
   it("errorCode, fieldCode, and problemCode are exactly the codes the server answers with", () => {
     const sorted = (values: Iterable<string>): string[] => [...new Set(values)].sort();
     expect(sorted(labels.VALUE_SETS["errorCode"]!)).toEqual(sorted(API_ERROR_CODES));
+    // The codes of "Copy passphrase" (POST settings/passphrase/clipboard) are labelled too.
+    for (const code of ["not_set", "locked", "unavailable"]) {
+      expect(labels.VALUE_SETS["errorCode"], code).toContain(code);
+    }
     // Every ChatGPT connection code reaches the page as itself, except prepare_failed (a 500 server_error).
     for (const code of CHATGPT_ERROR_CODES.filter((c) => c !== "prepare_failed")) {
       expect(labels.VALUE_SETS["errorCode"], code).toContain(code);
@@ -256,6 +418,104 @@ describe("Aside instruction texts (instructions.js)", () => {
     expect(injected).toContain("the tunnel I just created");
   });
 
+  describe("the login text (a needs_login site, or a job paused for a login)", () => {
+    const reuters = {
+      loginUrl: "https://www.reuters.com/account/sign-in/",
+      hostnames: ["reuters.com"],
+    };
+    const loginRequired = {
+      en: [
+        "Do not open or operate the program's local settings page",
+        "Use only the password that is already saved in this browser for this site",
+        "Never ask me for a password or a code",
+        "If no password is saved for this site, stop and tell me.",
+        "If the site asks for a code (for example one sent by text message or email, or one from an authenticator app), stop and tell me.",
+        "When the site shows that I am logged in, stop and tell me.",
+        "worded differently",
+      ],
+      ko: [
+        "로컬 설정 페이지",
+        "열지도, 조작하지도 마세요",
+        "이미 저장된 비밀번호만 쓰세요",
+        "저에게 비밀번호나 인증 코드를 묻지 마세요",
+        "이 사이트에 저장된 비밀번호가 없으면 멈추고 저에게 알려 주세요.",
+        "사이트가 인증 코드(문자나 이메일로 받는 코드, 인증 앱의 코드 등)를 요구하면 멈추고 저에게 알려 주세요.",
+        "로그인된 것이 보이면 멈추고 저에게 알려 주세요.",
+        "다르게 적혀 있을 수 있습니다",
+      ],
+    } as const;
+    const loopback = [
+      "http://127.0.0.1:8788/?token=abc",
+      "http://localhost:8788/",
+      "http://[::1]:8788/",
+      "https://user:secret@www.reuters.com/login",
+      "https://www.reuters.com:8443/login",
+      "javascript:alert(1)",
+      "https://192.168.1.10/login",
+      "https://intranet/login",
+      "https://router.local/login",
+    ];
+
+    it("names the site's login address and keeps its stop sentences in both languages", () => {
+      const target = instructions.loginTarget(reuters);
+      expect(target).toEqual({ kind: "url", address: "https://www.reuters.com/account/sign-in/" });
+      for (const lang of LANGS) {
+        const text = instructions.loginText(lang, target)!;
+        expect(text).toContain("https://www.reuters.com/account/sign-in/");
+        for (const sentence of loginRequired[lang]) expect(text, `${lang}: ${sentence}`).toContain(sentence);
+      }
+    });
+
+    it("falls back to the site's first hostname, then the host of the job's address", () => {
+      expect(
+        instructions.loginTarget({ loginUrl: null, hostnames: ["reuters.com", "x.reuters.com"] }),
+      ).toEqual({
+        kind: "host",
+        address: "reuters.com",
+      });
+      expect(instructions.loginTarget({ hostnames: [], input: "https://blog.example.com/path" })).toEqual({
+        kind: "host",
+        address: "blog.example.com",
+      });
+      expect(instructions.loginTarget({ hostnames: [], input: "Reuters" })).toBeNull();
+      expect(instructions.loginTarget({})).toBeNull();
+      expect(instructions.loginText("en", null)).toBeNull();
+      for (const lang of LANGS) {
+        const text = instructions.loginText(lang, instructions.loginTarget({ hostnames: ["reuters.com"] }))!;
+        expect(text).toContain("https://reuters.com/");
+        for (const sentence of loginRequired[lang]) expect(text, `${lang}: ${sentence}`).toContain(sentence);
+      }
+    });
+
+    it("never carries a settings-page address, a loopback or private host, credentials, or a secret", () => {
+      for (const bad of loopback) {
+        const target = instructions.loginTarget({
+          loginUrl: bad,
+          hostnames: [bad, "localhost", "127.0.0.1"],
+        });
+        expect(target, bad).toBeNull();
+        expect(instructions.loginText("en", { kind: "url", address: bad }), bad).toBeNull();
+        expect(instructions.loginText("en", { kind: "host", address: bad }), bad).toBeNull();
+      }
+      for (const lang of LANGS) {
+        for (const site of [
+          reuters,
+          { hostnames: ["reuters.com"] },
+          { loginUrl: loopback[0], hostnames: ["reuters.com"] },
+        ]) {
+          const text = instructions.loginText(lang, instructions.loginTarget(site))!;
+          expect(text).toBeTruthy();
+          expect(text).not.toMatch(/127\.0\.0\.1|localhost|:8788|:8787|token=|admin-token|\[::1\]/i);
+          expect(text).not.toMatch(/sk-[a-z0-9]|BRIDGE_PASSPHRASE|\.env\b|runtime-key\b|secret/i);
+          expect(text).not.toMatch(/<[^>]*(key|passphrase|secret|password)[^>]*>|\{\w+\}/i);
+          for (const url of text.match(/https?:\/\/\S+/g) ?? []) {
+            expect(new URL(url).hostname).toMatch(/(^|\.)reuters\.com$/);
+          }
+        }
+      }
+    });
+  });
+
   it("link to the official pages recorded for the connection tool", () => {
     expect(instructions.LINKS).toEqual({
       tunnels: "https://platform.openai.com/settings/organization/tunnels",
@@ -299,6 +559,16 @@ describe("page logic (state.js)", () => {
     expect(source).not.toMatch(/Math\.random/);
   });
 
+  it("the page script copies the passphrase only through the program, and shows no concurrency tunable", async () => {
+    const source = await readFile(uiUrl("app.js"), "utf8");
+    expect(source).toContain('"/settings/passphrase/clipboard", { method: "POST" }');
+    // The page never reads the clipboard back, so the passphrase cannot reach it that way.
+    expect(source).not.toMatch(/clipboard\.read/);
+    // Tunables (concurrency, budgets, limits) are file-only settings (spec 4.1, 8).
+    for (const key of Object.keys(DEFAULT_TUNABLES)) expect(source, key).not.toContain(key);
+    expect(source).toContain("captchaAuto");
+  });
+
   it("picks the language: remembered, else Korean for a Korean browser, else English", () => {
     expect(state.pickLanguage("en", "ko-KR")).toBe("en");
     expect(state.pickLanguage(null, "ko-KR")).toBe("ko");
@@ -333,7 +603,7 @@ describe("page logic (state.js)", () => {
       settings: settingsWith(true),
       browser: { reachable: true, account: "u0" },
       chatgpt: { state: "ready", connectedApps: 1 },
-      helper: { lastCheck: { ok: true } },
+      helper: { wouldUse: "claude", lastCheck: { ok: true, runtime: "claude", code: "ok" } },
       sites: [{ key: "reuters", status: "active", lastCheckedAt: "2026-10-07T00:00:00Z" }],
     };
     expect(state.gettingStarted(base).every((s) => s.state === "done")).toBe(true);
@@ -342,13 +612,159 @@ describe("page logic (state.js)", () => {
     expect(state.firstOpenStep(state.gettingStarted(notChecked))).toBe("sites");
     const noApp = { ...base, chatgpt: { state: "ready", connectedApps: 0 } };
     expect(state.firstOpenStep(state.gettingStarted(noApp))).toBe("chatgpt");
-    const noHelper = { ...base, helper: { lastCheck: null } };
+    const noHelper = { ...base, helper: { wouldUse: "claude", lastCheck: null } };
     expect(state.firstOpenStep(state.gettingStarted(noHelper))).toBe("helper");
+    // A successful check on another runtime than the one a job would use now does not count.
+    const otherRuntime = {
+      ...base,
+      helper: { wouldUse: "codex", lastCheck: { ok: true, runtime: "claude", code: "ok" } },
+    };
+    expect(state.firstOpenStep(state.gettingStarted(otherRuntime))).toBe("helper");
     const config = {
       ...base,
       status: { mode: "setup", problem: { code: "config_invalid", message: "x" }, restartedAt: null },
     };
     expect(state.gettingStarted(config)[1]).toEqual({ id: "aside", state: "unknown", why: "core_off" });
+  });
+
+  it("helper ready: the last check succeeded on the runtime a site added now would use", () => {
+    const ok = { at: "2026-10-08T00:00:00Z", runtime: "claude", ok: true, code: "ok", message: null };
+    expect(state.helperReady({ wouldUse: "claude", lastCheck: ok })).toBe(true);
+    expect(state.helperReady({ wouldUse: "codex", lastCheck: ok })).toBe(false);
+    expect(state.helperReady({ wouldUse: null, lastCheck: { ...ok, runtime: null } })).toBe(false);
+    expect(state.helperReady({ wouldUse: "claude", lastCheck: { ...ok, ok: false, code: "failed" } })).toBe(
+      false,
+    );
+    expect(state.helperReady({ wouldUse: "claude", lastCheck: null })).toBe(false);
+    expect(state.helperReady(null)).toBe(false);
+  });
+
+  it("the regular poll re-reads the helper while its check result can still change (the automatic check)", async () => {
+    const ok = { at: "2026-10-08T00:00:00Z", runtime: "claude", ok: true, code: "ok", message: null };
+    const off = { mode: "setup", problem: null, restartedAt: null };
+    expect(state.helperNeedsPoll(running, null)).toBe(true);
+    expect(state.helperNeedsPoll(running, { wouldUse: "claude", lastCheck: null })).toBe(true);
+    expect(
+      state.helperNeedsPoll(running, { wouldUse: "claude", lastCheck: { ...ok, ok: false, code: "failed" } }),
+    ).toBe(true);
+    expect(state.helperNeedsPoll(running, { wouldUse: "codex", lastCheck: ok })).toBe(true);
+    expect(state.helperNeedsPoll(running, { wouldUse: "claude", lastCheck: ok })).toBe(false);
+    expect(state.helperNeedsPoll(off, null)).toBe(false);
+    expect(state.helperNeedsPoll(null, null)).toBe(false);
+    // The page script's 5-second poll calls it and, every sixth tick, reloads `/api/helper` (refresh() alone does not).
+    const source = await readFile(uiUrl("app.js"), "utf8");
+    expect(source).toMatch(
+      /setInterval\(\(\) => \{\s*if \(!restartWaiter && !signedOut\) void poll\(\);\s*\}, POLL_MS\);/,
+    );
+    const pollFn = /async function poll\(\) \{\n([\s\S]*?)\n\}\n/.exec(source)?.[1] ?? "";
+    expect(pollFn).toMatch(
+      /await refresh\(\);[\s\S]*if \(helperPollTick === 0 && helperNeedsPoll\(data\.status, data\.helper\)\) \{\s*await loadHelper\(\);\s*render\(\);/,
+    );
+    const loadHelperFn = /async function loadHelper\(\) \{\n([\s\S]*?)\n\}\n/.exec(source)?.[1] ?? "";
+    expect(loadHelperFn).toContain('load("/helper")');
+  });
+
+  it("what to do next: the first step not done, with its one action", () => {
+    const base = {
+      status: running,
+      settings: settingsWith(true),
+      browser: { reachable: true, account: "u0" },
+      chatgpt: { state: "ready", connectedApps: 1 },
+      helper: { wouldUse: "claude", lastCheck: { ok: true, runtime: "claude", code: "ok" } },
+      sites: [
+        {
+          key: "reuters",
+          status: "active",
+          lastCheckedAt: "2026-10-07T00:00:00Z",
+          actions: ["repair", "check", "remove"],
+        },
+      ],
+    };
+    const next = (data: Record<string, unknown>) => {
+      const n = state.nextStep(state.gettingStarted(data), data);
+      return [n.id, n.say, n.action];
+    };
+    expect(next(base)).toEqual([null, "start.allDone", null]);
+    expect(
+      next({
+        status: { mode: "setup", problem: { code: "passphrase_missing", message: "x" }, restartedAt: null },
+        settings: settingsWith(false),
+      }),
+    ).toEqual(["passphrase", "next.passphrase", "passphrase"]);
+    expect(next({ ...base, settings: null })).toEqual(["passphrase", "step.why.no_data", "reload"]);
+    expect(next({ ...base, browser: { reachable: false } })).toEqual(["aside", "next.aside", "checkBrowser"]);
+    expect(next({ ...base, chatgpt: { state: "ready", connectedApps: 0 } })).toEqual([
+      "chatgpt",
+      "next.chatgpt",
+      "showChatgpt",
+    ]);
+    expect(next({ ...base, helper: { wouldUse: "claude", lastCheck: null } })).toEqual([
+      "helper",
+      "next.helper",
+      "checkHelper",
+    ]);
+    expect(next({ ...base, helper: { wouldUse: null, lastCheck: null } })).toEqual([
+      "helper",
+      "next.helperInstall",
+      "checkHelper",
+    ]);
+    const reuters = base.sites[0]!;
+    expect(next({ ...base, sites: [{ ...reuters, status: "needs_login" }] })).toEqual([
+      "sites",
+      "next.sites",
+      "checkReuters",
+    ]);
+    expect(next({ ...base, sites: [{ ...reuters, lastCheckedAt: null }] })).toEqual([
+      "sites",
+      "next.sites",
+      "checkReuters",
+    ]);
+    expect(
+      next({ ...base, sites: [{ ...reuters, status: "failed", actions: ["repair", "remove"] }] }),
+    ).toEqual(["sites", "next.sitesFix", "openSites"]);
+    expect(next({ ...base, sites: [] })).toEqual(["sites", "next.sitesAdd", "openSites"]);
+    const off = { mode: "setup", problem: { code: "config_invalid", message: "x" }, restartedAt: null };
+    expect(next({ ...base, status: off })).toEqual(["aside", "next.coreOff", null]);
+    const restarting = { mode: "restarting", problem: null, restartedAt: null };
+    expect(next({ ...base, status: restarting })).toEqual(["aside", "step.why.restarting", null]);
+    // Every sentence it can choose exists in both languages.
+    for (const lang of LANGS) {
+      for (const key of [
+        "start.allDone",
+        "next.passphrase",
+        "next.aside",
+        "next.chatgpt",
+        "next.helper",
+        "next.helperInstall",
+        "next.sites",
+        "next.sitesFix",
+        "next.sitesAdd",
+        "next.coreOff",
+        "step.why.restarting",
+        "step.why.no_data",
+      ]) {
+        expect(i18n.DICTIONARIES[lang], `${lang} ${key}`).toHaveProperty([key]);
+      }
+    }
+  });
+
+  it("offers the login text on a needs_login site and on a job paused for a login only", () => {
+    expect(state.blockKind({ blockKind: "login" })).toBe("login");
+    expect(state.blockKind({})).toBe("other");
+    expect(state.blockKind(null)).toBe("other");
+    expect(state.blockKind({ blockKind: "" })).toBe("other");
+    expect(state.jobPausedForLogin({ state: "awaiting_user", blockKind: "login" })).toBe(true);
+    expect(state.jobPausedForLogin({ state: "awaiting_user", blockKind: "captcha" })).toBe(false);
+    expect(state.jobPausedForLogin({ state: "awaiting_user" })).toBe(false);
+    expect(state.jobPausedForLogin({ state: "running", blockKind: "login" })).toBe(false);
+    expect(state.offersLoginHelp({ status: "needs_login", job: null })).toBe(true);
+    expect(state.offersLoginHelp({ status: "active", job: null })).toBe(false);
+    expect(
+      state.offersLoginHelp({ status: "onboarding", job: { state: "awaiting_user", blockKind: "login" } }),
+    ).toBe(true);
+    expect(
+      state.offersLoginHelp({ status: "onboarding", job: { state: "awaiting_user", blockKind: "consent" } }),
+    ).toBe(false);
   });
 
   it("ChatGPT sub-steps: install first, then the web steps, then connected", () => {

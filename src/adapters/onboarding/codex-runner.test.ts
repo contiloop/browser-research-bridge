@@ -26,6 +26,7 @@ import {
   toDynamicTools,
 } from "./codex-runner.js";
 import { classifyRoundTrip } from "./helper-runtime.js";
+import { jobToolList } from "./test-fixtures.js";
 import type { AgentTool } from "./types.js";
 
 const tool = (name: string): AgentTool => ({
@@ -161,6 +162,25 @@ describe("thread and turn parameters", () => {
       threadId: "thr-9",
       input: [{ type: "text", text: "go", text_elements: [] }],
       environments: [],
+    });
+  });
+
+  it("the job's tool list reaches Codex unchanged, browser_solve_captcha and report_blocked's kind included", () => {
+    const tools = jobToolList();
+    const p = buildThreadStartParams({ ...request, tools }, null);
+    const dynamic = p["dynamicTools"] as { name: string; inputSchema: Record<string, unknown> }[];
+    expect(dynamic.map((t) => t.name)).toEqual(tools.map((t) => t.name));
+    expect(dynamic.find((t) => t.name === "browser_solve_captcha")?.inputSchema).toMatchObject({
+      type: "object",
+      required: ["tabId"],
+      properties: { tabId: { type: "string" } },
+    });
+    const blocked = dynamic.find((t) => t.name === "report_blocked")?.inputSchema;
+    expect(blocked).toMatchObject({
+      required: ["reason", "requestedAction"],
+      properties: {
+        kind: { type: "string", enum: ["login", "captcha", "consent", "subscription", "other"] },
+      },
     });
   });
 

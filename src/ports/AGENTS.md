@@ -2,7 +2,7 @@
 
 ## Scope
 
-The contracts between the core and its adapters: `adapter.ts` (site adapter module, `AdapterContext`, helper API, completeness input), `browser.ts` (browser port, scoped session, tabs, cookie-bearing fetch), `manifest.ts` (zod schema of `sites/<key>/manifest.json`), `registry.ts` (registered sites, loaded adapters, live outcomes), `scheduler.ts` (site lock, lease, politeness, cool-down), `cache.ts`, `site-store.ts` (site state and the site committer), `settings-store.ts` (settings files: set-only secrets, field codes, locked, classified configuration problems, page location), `token-store.ts` (OAuth persistence; `revokeToken` returns true only for the call that revoked the token, `markTokenIssued` updates a client's last-issued time without rewriting the record), `clock.ts`, `logger.ts`, `json.ts`, `connection-tool.ts` (the program-managed connection tool for ChatGPT: detect, prepare key file and profile, run with readiness and restart, diagnose, remove key; the runtime key is accepted by `prepare` only and never returned). Barrel: `index.ts`.
+The contracts between the core and its adapters: `adapter.ts` (site adapter module, `AdapterContext`, helper API, completeness input), `browser.ts` (browser port, scoped session, tabs, cookie-bearing fetch, and the optional `solveChallenge` captcha attempt with its `ChallengeAttempt` result, reachable from bridge code only), `manifest.ts` (zod schema of `sites/<key>/manifest.json`), `registry.ts` (registered sites, loaded adapters, live outcomes), `scheduler.ts` (per-site pool with `exclusive` tasks, `holders(site)`, lease with per-task politeness, cool-down), `cache.ts`, `site-store.ts` (site state and the site committer), `settings-store.ts` (settings files: set-only secrets, field codes, locked, classified configuration problems, page location), `token-store.ts` (OAuth persistence; `revokeToken` returns true only for the call that revoked the token, `markTokenIssued` updates a client's last-issued time without rewriting the record), `clock.ts`, `logger.ts`, `json.ts`, `connection-tool.ts` (the program-managed connection tool for ChatGPT: detect, prepare key file and profile, run with readiness and restart, diagnose, remove key; the runtime key is accepted by `prepare` only and never returned). Barrel: `index.ts`.
 
 Not in scope: implementations, defaults beyond schema defaults, I/O.
 
@@ -19,6 +19,7 @@ Not in scope: implementations, defaults beyond schema defaults, I/O.
 - `ConnectionTool` failure messages are the implementation's own wording, never raw tool output, and never contain the runtime key.
 - `TokenStore` only ever sees hashes of tokens, codes, and client secrets.
 - `BrowserSession` never attaches to user tabs; `dispose()` closes the session's tabs except a warm tab the port may keep.
+- `BrowserSession.lastUrl()` is the last on-site page URL the session loaded (null before any load); the challenge coordinator targets it for a search's attempt.
 
 ## Patterns
 

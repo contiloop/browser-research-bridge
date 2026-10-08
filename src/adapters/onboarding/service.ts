@@ -105,6 +105,10 @@ export interface OnboardingJobServiceOptions {
   defaultMinIntervalMs?: number | undefined;
   /** Budget of one agent browser step, lock wait included (default 150 s). */
   stepBudgetMs?: number | undefined;
+  /** Time budget of one `browser_solve_captcha` attempt (`captchaAttemptBudgetMs`, default 45 s). */
+  captchaAttemptBudgetMs?: number | undefined;
+  /** `captcha.auto`: false makes `browser_solve_captcha` answer "turned off" (default true). */
+  captchaAuto?: boolean | undefined;
   /** How long the helper check may take (default 180 s). */
   checkTimeoutMs?: number | undefined;
   /** How long Cancel waits for a running agent to stop (default 60 s). */
@@ -623,6 +627,7 @@ export class OnboardingJobService {
     job.finishedAt = null;
     job.reason = null;
     job.requestedAction = null;
+    job.blockKind = "other";
     job.lang = jobLang(job);
     if (selection.ok) job.runtime = selection.runtime.id;
     else job.runtime = recorded;
@@ -760,12 +765,13 @@ export class OnboardingJobService {
       job.reason = terminal.reason;
       job.requestedAction = terminal.requestedAction;
       job.pendingHosts = terminal.pendingHosts ?? [];
+      job.blockKind = terminal.blockKind ?? "other";
       await this.save(job);
       this.appendLog(
         job,
         "job",
         "warn",
-        `Waiting for the user: ${terminal.reason} — ${terminal.requestedAction}`,
+        `Waiting for the user (${job.blockKind}): ${terminal.reason} — ${terminal.requestedAction}`,
       );
       return;
     }
@@ -794,7 +800,7 @@ export class OnboardingJobService {
       return this.conclude(
         job,
         run,
-        { kind: "blocked", ...pause, pendingHosts: unapproved },
+        { kind: "blocked", ...pause, pendingHosts: unapproved, blockKind: "other" },
         { sessionId: null, outcome: "completed", message: null, turns: 0, costUsd: null },
       );
     }
@@ -844,6 +850,7 @@ export class OnboardingJobService {
     job.state = "failed";
     job.reason = reason;
     job.requestedAction = null;
+    job.blockKind = "other";
     job.finishedAt = this.nowIso();
     await this.save(job);
     this.appendLog(job, "job", "error", `Failed: ${reason}`);
@@ -857,6 +864,7 @@ export class OnboardingJobService {
     job.state = "cancelled";
     job.reason = reason;
     job.requestedAction = null;
+    job.blockKind = "other";
     job.finishedAt = this.nowIso();
     await this.save(job);
     this.appendLog(job, "job", "warn", `Cancelled: ${reason}`);
@@ -1071,6 +1079,7 @@ export class OnboardingJobService {
       pendingHosts: [],
       lang: input.lang,
       runtime: null,
+      blockKind: "other",
       commit: null,
       createdAt: at,
       updatedAt: at,
@@ -1148,6 +1157,8 @@ class RunHost implements ToolHost {
         signal: this.signal,
         note: (m) => this.log("job", "info", m),
         pauseForApproval: (hosts) => this.pauseForApproval(hosts),
+        challengeBudgetMs: o.captchaAttemptBudgetMs,
+        challengesEnabled: o.captchaAuto,
       });
     }
     return this.agentBrowser;
@@ -1188,7 +1199,7 @@ class RunHost implements ToolHost {
 
   private pauseForApproval(hosts: readonly string[]): void {
     const pause = hostApprovalRequest(this.job.hostnames, hosts, jobLang(this.job));
-    this.setTerminal({ kind: "blocked", ...pause, pendingHosts: [...hosts] });
+    this.setTerminal({ kind: "blocked", ...pause, pendingHosts: [...hosts], blockKind: "other" });
   }
 
   async dispose(): Promise<void> {

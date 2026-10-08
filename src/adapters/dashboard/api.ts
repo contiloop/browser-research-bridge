@@ -6,10 +6,12 @@
  * OAuth revoke, cache clear. Responses never carry the admin token, the passphrase, or OAuth token
  * values (only token ids, which are storage hashes).
  *
- * Settings page: `status`, `settings` (GET/PUT), `restart`, `chatgpt` (GET/DELETE,
- * `setup`, `retry`), `helper` (GET, `check`). Secrets (the passphrase, the tunnel runtime key) are
- * received and handed on, never returned or logged. The last helper check is kept here, outside the
- * core, so it survives core restarts.
+ * Settings page: `status`, `settings` (GET/PUT), `settings/passphrase/clipboard` (POST), `restart`,
+ * `chatgpt` (GET/DELETE, `setup`, `retry`), `helper` (GET, `check`). Secrets (the passphrase, the
+ * tunnel runtime key) are received and handed on, never returned or logged; "Copy passphrase" puts
+ * the stored passphrase on the clipboard from the server process and answers only what happened.
+ * The last helper check lives outside the core (the source's `helperChecks`, persisted under
+ * `data/` by src/app), so it survives core and process restarts.
  */
 import { Hono } from "hono";
 import type { Context } from "hono";
@@ -20,6 +22,7 @@ import {
   OnboardingRequestError,
   isActiveJobState,
   isHelperRuntimeId,
+  jobBlockKind,
   jobLang,
   jobRuntime,
   parseHelperLang,
@@ -31,7 +34,14 @@ import type { SettingsWriteResult } from "../../ports/settings-store.js";
 import type { RegistrySite } from "../registry/index.js";
 import type { BrowserStatus } from "../../ports/browser.js";
 import { CoreNotRunningError, lazyDashboardDeps, toDashboardSource } from "./deps.js";
-import type { DashboardDeps, DashboardSource, PageSettingsChange, SettingsPreview } from "./deps.js";
+import type {
+  DashboardDeps,
+  DashboardSource,
+  HelperCheckLog,
+  PageSettingsChange,
+  PassphraseClipboardResult,
+  SettingsPreview,
+} from "./deps.js";
 
 const SERVING = new Set(["active", "needs_login", "degraded"]);
 const REPAIRABLE = new Set(["active", "degraded", "failed"]);
@@ -101,6 +111,7 @@ function jobSummary(job: OnboardingJob): Record<string, unknown> {
     finishedAt: job.finishedAt,
     lang: jobLang(job),
     runtime: jobRuntime(job),
+    blockKind: jobBlockKind(job),
   };
 }
 
@@ -177,6 +188,7 @@ interface Answer {
   body: Record<string, unknown>;
 }
 
+/** The string fields of `PUT settings` (`captchaAuto` is the one boolean field). */
 const PAGE_FIELDS = ["passphrase", "helperRuntime", "asideAccount"] as const;
 
 /**
@@ -203,6 +215,10 @@ export const API_ERROR_CODES = [
   "conflict",
   "too_large",
   "server_error",
+  // Only `POST settings/passphrase/clipboard` answers with these (409 `not_set`, 500 `unavailable`;
+  // its `locked` is the shared code).
+  "not_set",
+  "unavailable",
 ] as const;
 export type ApiErrorCode = (typeof API_ERROR_CODES)[number];
 
@@ -261,6 +277,43 @@ function writeAnswer(result: Extract<SettingsWriteResult, { ok: false }>): Answe
   }
 }
 
+/** `POST settings/passphrase/clipboard` answers (never the value). */
+function clipboardAnswer(result: PassphraseClipboardResult): Answer {
+  switch (result) {
+    case "ok":
+      return { status: 200, body: { ok: true } };
+    case "not_set":
+      return failure(409, "not_set", "no valid access passphrase is set yet; set one first");
+    case "locked":
+      return failure(
+        409,
+        "locked",
+        "passphrase is set outside the settings files (service definition or shell) and cannot be copied here",
+        { passphrase: "locked" },
+      );
+    case "unavailable":
+      return failure(
+        500,
+        "unavailable",
+        "the clipboard of this Mac could not be used (pbcopy is missing or failed)",
+      );
+  }
+}
+
+/** The last helper check kept in memory for the life of the page (when the source keeps none). */
+function memoryHelperCheckLog(logger: DashboardSource["logger"]): HelperCheckLog {
+  let last: HelperCheckResult | null = null;
+  return {
+    last: () => Promise.resolve(last),
+    async run(jobs) {
+      const result = await jobs.helperCheck();
+      last = result;
+      logger.info("helper check", { runtime: result.runtime, code: result.code, trigger: "manual" });
+      return result;
+    },
+  };
+}
+
 const JOB_RUNNING_MESSAGE =
   "a site-add or repair job is running; it will be interrupted (send confirmInterrupt: true to continue)";
 
@@ -301,8 +354,8 @@ export function createApi(input: DashboardDeps | DashboardSource, options: ApiOp
 
   // ------------------------------------------------------------------ settings page helpers
 
-  /** The last helper check of this process (outlives core restarts). */
-  let lastCheck: HelperCheckResult | null = null;
+  /** The last helper check (outlives core restarts; persisted by the process when it provides one). */
+  const helperChecks = source.helperChecks ?? memoryHelperCheckLog(logger);
 
   const respond = (c: Context, answer: Answer): Response => c.json(answer.body, answer.status);
 
@@ -397,6 +450,11 @@ export function createApi(input: DashboardDeps | DashboardSource, options: ApiOp
       if (!known || (runtime !== "auto" && !supportedRuntimes().includes(runtime))) {
         fields["helperRuntime"] = "bad_value";
       }
+    }
+    const captchaAuto = body["captchaAuto"];
+    if (captchaAuto !== undefined) {
+      if (typeof captchaAuto !== "boolean") fields["captchaAuto"] = "bad_value";
+      else change.captchaAuto = captchaAuto;
     }
     const disconnect = body["disconnectApps"];
     if (disconnect !== undefined && typeof disconnect !== "boolean") fields["disconnectApps"] = "bad_value";
@@ -643,6 +701,7 @@ export function createApi(input: DashboardDeps | DashboardSource, options: ApiOp
       passphrase: { ...view.passphrase },
       helperRuntime: { value: view.helperRuntime.value, supported: supportedRuntimes() },
       asideAccount: { value: view.asideAccount.value, locked: view.asideAccount.locked },
+      captchaAuto: view.captchaAuto.value,
       info: { ...page.info(), ...(options.adminPort ? { adminPort: options.adminPort() } : {}) },
     });
   });
@@ -687,6 +746,18 @@ export function createApi(input: DashboardDeps | DashboardSource, options: ApiOp
       };
     });
     return respond(c, answer);
+  });
+
+  // Copy passphrase: the value goes from the server process to this Mac's clipboard only. Answers in
+  // every mode (the core is not involved); the request carries no body that matters.
+  api.post("/settings/passphrase/clipboard", async (c) => {
+    const copy = source.copyPassphrase;
+    if (!copy) return respond(c, failure(404, "not_found", "copying the passphrase is not available"));
+    const result = await copy();
+    const event =
+      result === "ok" ? "passphrase copied to the clipboard" : "passphrase not copied to the clipboard";
+    logger.info(event, { result });
+    return respond(c, clipboardAnswer(result));
   });
 
   api.post("/restart", async (c) => {
@@ -755,14 +826,10 @@ export function createApi(input: DashboardDeps | DashboardSource, options: ApiOp
     return c.json({ restarting: true }, 202);
   });
 
-  api.get("/helper", async (c) => c.json(await deps.jobs.helperStatus(lastCheck)));
+  api.get("/helper", async (c) => c.json(await deps.jobs.helperStatus(await helperChecks.last())));
 
-  api.post("/helper/check", async (c) => {
-    const result = await deps.jobs.helperCheck();
-    lastCheck = result;
-    logger.info("helper check", { runtime: result.runtime, code: result.code });
-    return c.json(result);
-  });
+  // The Check button: one real round trip, recorded as the last check (logged by the log).
+  api.post("/helper/check", async (c) => c.json(await helperChecks.run(deps.jobs)));
 
   api.notFound((c) => c.json({ error: "not_found" }, 404));
   return api;

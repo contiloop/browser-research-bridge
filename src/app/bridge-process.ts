@@ -1,22 +1,29 @@
 /**
  * The bridge process: the settings page (dashboard listener, started once, loopback only) plus the
  * core under run-mode control. The page's source carries the run-mode control, the settings store,
- * the settings-page support (`settings-page.ts`), and the ChatGPT connection service. Order: settings-page location from the store → bind the settings
- * page (a bind failure throws: main.ts exits 1) → attempt the core start (a configuration or start
- * problem leaves the process up in `setup`). `main.ts` adds the adapter helpers, the console
- * logger, and the signal handlers; tests call this with a fake browser and port 0.
+ * the settings-page support (`settings-page.ts`, with the `captchaAuto` preview added), the ChatGPT
+ * connection service, the persisted helper check (`helper-check.ts` over `data/helper-check.json`,
+ * whose automatic check is scheduled from the core-started hook and cancelled from the
+ * core-stopping hook), and "Copy passphrase" (`copyPassphraseToClipboard`). Order: settings-page
+ * location from the store → bind the settings page (a bind failure throws: main.ts exits 1) → attempt
+ * the core start (a configuration or start problem leaves the process up in `setup`). `main.ts` adds
+ * the adapter helpers, the console logger, and the signal handlers; tests call this with a fake
+ * browser and port 0.
  */
 import { adminTokenPath, createAdminListener } from "../adapters/dashboard/index.js";
-import type { AdminListener, DashboardSource } from "../adapters/dashboard/index.js";
+import type { AdminListener, DashboardSource, SettingsPageSupport } from "../adapters/dashboard/index.js";
+import { FileHelperCheckStore, helperCheckPath } from "../adapters/storage/index.js";
 import type { ConnectionTool } from "../ports/connection-tool.js";
 import type { Logger } from "../ports/logger.js";
 import type { EnvironmentMap } from "../ports/settings-store.js";
 import type { BridgeApp } from "./app.js";
 import { ChatgptConnectionService, createConfigTargetResolver } from "./chatgpt-connection.js";
 import type { BridgeConfig } from "./config.js";
+import { HelperChecks } from "./helper-check.js";
 import type { RunningListener } from "./public-server.js";
 import { RunModeController } from "./run-mode.js";
 import { createSettingsPageSupport } from "./settings-page.js";
+import { copyPassphraseToClipboard, previewCaptchaAuto } from "./settings.js";
 import type { BridgeSettingsStore } from "./settings.js";
 
 export interface StartBridgeProcessOptions {
@@ -46,6 +53,10 @@ export interface StartBridgeProcessOptions {
     { env: EnvironmentMap; rootDir: string; configPath?: string | undefined } | undefined;
   /** Tunable tunnel-service address prefix (default in `chatgpt-connection.ts`). */
   tunnelResourcePrefix?: string | undefined;
+  /** Delay of the automatic helper check after each core start (default 30 s; tests use 0). */
+  helperAutoCheckDelayMs?: number | undefined;
+  /** The clipboard tool of "Copy passphrase" (default `/usr/bin/pbcopy`; tests pass a fake). */
+  clipboardCommand?: string | undefined;
 }
 
 export interface BridgeProcess {
@@ -53,6 +64,8 @@ export interface BridgeProcess {
   readonly settings: BridgeSettingsStore;
   /** The ChatGPT connection service (`GET/POST/DELETE chatgpt…`), or null without a connection tool. */
   readonly chatgpt: ChatgptConnectionService | null;
+  /** The persisted last helper check and the automatic check after each core start. */
+  readonly helperChecks: HelperChecks;
   /** Where the settings page listens. */
   readonly dashboard: RunningListener;
   readonly tokenFile: string;
@@ -83,14 +96,29 @@ export async function startBridgeProcess(options: StartBridgeProcessOptions): Pr
           logger,
           tunnelResourcePrefix: options.tunnelResourcePrefix,
         });
+  // Before the first start, so the first core gets its automatic helper check too.
+  const helperChecks = new HelperChecks({
+    store: new FileHelperCheckStore(helperCheckPath(location.dataDir)),
+    logger,
+    delayMs: options.helperAutoCheckDelayMs,
+  });
+  controller.onCoreStarted((core) => helperChecks.scheduleAutomatic(core.services.jobs));
+  controller.onCoreStopping(() => helperChecks.cancelAutomatic());
+  const support = createSettingsPageSupport({ store, fallback: options.chatgptTargetFallback });
+  const settingsPage: SettingsPageSupport = {
+    ...support,
+    preview: (change) => previewCaptchaAuto(store.read(), change, support.preview(change)),
+  };
   const source: DashboardSource = {
     logger,
     location,
     core: () => controller.services(),
     runMode: controller,
     settings: store,
-    settingsPage: createSettingsPageSupport({ store, fallback: options.chatgptTargetFallback }),
+    settingsPage,
     chatgpt,
+    helperChecks,
+    copyPassphrase: () => copyPassphraseToClipboard({ store, command: options.clipboardCommand }),
   };
   const listener: AdminListener = createAdminListener(source, {
     port: options.adminPort,
@@ -108,6 +136,7 @@ export async function startBridgeProcess(options: StartBridgeProcessOptions): Pr
     controller,
     settings: store,
     chatgpt,
+    helperChecks,
     dashboard,
     tokenFile: adminTokenPath(location.dataDir),
     openUrl: () => listener.openUrl(),

@@ -1,6 +1,7 @@
-/* Pure page logic of the settings page: the Getting started checklist, ChatGPT sub-step states,
- * the "what to do now" choice per site, the passphrase generator, and the language choice.
- * No DOM and no network, so the unit tests import it directly. */
+/* Pure page logic of the settings page: the Getting started checklist and its "what to do next"
+ * line, the helper's readiness, ChatGPT sub-step states, the "what to do now" choice per site, when a
+ * site or a paused job offers the Aside AI login text, the passphrase generator, and the language
+ * choice. No DOM and no network, so the unit tests import it directly. */
 
 /** Characters of a generated passphrase: letters and digits without look-alikes (0/O, 1/l/I). */
 export const PASSPHRASE_ALPHABET = "abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789";
@@ -73,7 +74,7 @@ export function gettingStarted(data) {
   steps.push(
     blocked("helper") ??
       (data.helper
-        ? { id: "helper", state: data.helper.lastCheck?.ok === true ? "done" : "todo", why: null }
+        ? { id: "helper", state: helperReady(data.helper) ? "done" : "todo", why: null }
         : { id: "helper", state: "unknown", why: "no_data" }),
   );
   steps.push(
@@ -89,9 +90,94 @@ export function gettingStarted(data) {
   return steps;
 }
 
+/**
+ * Step 4 is done only when the last helper check (persisted, from the automatic check or the Check
+ * button) succeeded on the runtime a site added now would use: an `ok` on Claude does not cover Codex.
+ */
+export function helperReady(helper) {
+  const last = helper?.lastCheck;
+  return (
+    last?.ok === true &&
+    typeof helper?.wouldUse === "string" &&
+    helper.wouldUse !== "" &&
+    last.runtime === helper.wouldUse
+  );
+}
+
+/**
+ * Whether the regular poll should also re-read the helper state: while the core runs and no `ok` check
+ * covers the runtime a job would use (no check yet, a failed one, or one on another runtime). The
+ * automatic check 30 s after a core start then shows up on a page that is already open.
+ */
+export function helperNeedsPoll(status, helper) {
+  return status?.mode === "running" && !helperReady(helper);
+}
+
 /** The id of the first step that is not done, or null when all are done. */
 export function firstOpenStep(steps) {
   return steps.find((s) => s.state !== "done")?.id ?? null;
+}
+
+/**
+ * The one sentence and the one action at the top of Getting started: what to do next.
+ * Returns `{ id, say, action }`: `id` the step (null when all are done), `say` a dictionary key,
+ * `action` one of `passphrase` (go to the passphrase field), `checkBrowser`, `showChatgpt`,
+ * `checkHelper`, `checkReuters`, `openSites`, `reload`, or null (nothing to press here).
+ */
+export function nextStep(steps, data) {
+  const step = steps.find((s) => s.state !== "done");
+  if (!step) return { id: null, say: "start.allDone", action: null };
+  if (step.state === "unknown") {
+    if (step.why === "core_off") return { id: step.id, say: "next.coreOff", action: null };
+    if (step.why === "restarting") return { id: step.id, say: "step.why.restarting", action: null };
+    if (step.why === "need_passphrase")
+      return { id: "passphrase", say: "next.passphrase", action: "passphrase" };
+    return { id: step.id, say: "step.why.no_data", action: "reload" };
+  }
+  switch (step.id) {
+    case "passphrase":
+      return { id: step.id, say: "next.passphrase", action: "passphrase" };
+    case "aside":
+      return { id: step.id, say: "next.aside", action: "checkBrowser" };
+    case "chatgpt":
+      return { id: step.id, say: "next.chatgpt", action: "showChatgpt" };
+    case "helper":
+      return {
+        id: step.id,
+        say: data?.helper && !data.helper.wouldUse ? "next.helperInstall" : "next.helper",
+        action: "checkHelper",
+      };
+    case "sites": {
+      const reuters = Array.isArray(data?.sites) ? data.sites.find((s) => s.key === "reuters") : undefined;
+      if (!reuters) return { id: step.id, say: "next.sitesAdd", action: "openSites" };
+      const canCheck = Array.isArray(reuters.actions) && reuters.actions.includes("check");
+      if (canCheck && (reuters.status === "needs_login" || reuters.status === "active")) {
+        return { id: step.id, say: "next.sites", action: "checkReuters" };
+      }
+      return { id: step.id, say: "next.sitesFix", action: "openSites" };
+    }
+    default:
+      return { id: step.id, say: "step.why.no_data", action: "reload" };
+  }
+}
+
+/** The kinds a paused helper job gives for its pause (`blockKind`); a missing value reads as `other`. */
+export const BLOCK_KINDS = ["login", "captcha", "consent", "subscription", "other"];
+
+/** A job's `blockKind`: the value as received, or `other` when the field is missing or empty. */
+export function blockKind(job) {
+  const kind = job?.blockKind;
+  return typeof kind === "string" && kind !== "" ? kind : "other";
+}
+
+/** A helper job paused because it needs the user to log in to the site. */
+export function jobPausedForLogin(job) {
+  return job?.state === "awaiting_user" && blockKind(job) === "login";
+}
+
+/** Whether a site card offers the Aside AI login text: the site needs a login, or its job is paused for one. */
+export function offersLoginHelp(site) {
+  return site?.status === "needs_login" || jobPausedForLogin(site?.job);
 }
 
 /**

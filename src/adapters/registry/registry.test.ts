@@ -228,12 +228,12 @@ describe("SiteRegistryService", () => {
       expect(await cache.get("read", "alpha:1")).toBe("doc");
     });
 
-    it("rate_limited and blocked pages start the scheduler cool-down; a paywall does not", async () => {
+    it("only rate_limited starts the scheduler cool-down; a paywall or a flagged block page does not", async () => {
       await registry.recordOutcome("alpha", { status: "access_denied", message: "paywall" });
-      expect(cooldowns).toEqual([]);
       await registry.recordOutcome("alpha", { status: "access_denied", message: "captcha", blocked: true });
+      expect(cooldowns).toEqual([]);
       await registry.recordOutcome("alpha", { status: "rate_limited", message: "429" });
-      expect(cooldowns.map((c) => c.site)).toEqual(["alpha", "alpha"]);
+      expect(cooldowns.map((c) => c.site)).toEqual(["alpha"]);
       expect(registry.get("alpha")?.status).toBe("active");
     });
 

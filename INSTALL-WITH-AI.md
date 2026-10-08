@@ -4,7 +4,7 @@ You are an AI agent (for example the AI inside the Aside browser, Claude Code, o
 
 The person pasted a sentence like this to start you:
 
-> Install Browser Research Bridge on this Mac for me. Read and follow INSTALL-WITH-AI.md from https://github.com/contiloop/browser-research-bridge step by step, stop and ask me whenever it says only I can do something, and talk to me in my language.
+> Install Browser Research Bridge on this Mac for me. Read and follow INSTALL-WITH-AI.md from <project page address> step by step, stop and ask me whenever it says only I can do something, and talk to me in my language.
 
 ## What you are installing
 
@@ -30,7 +30,7 @@ Each time you reach one of these, stop, tell the person exactly what to do and w
 ### Never do these
 
 - Never read, print, copy, or write down a secret: the file `.env` in the program's folder, any file under `~/.config/browser-research-bridge/` (the stored runtime key), `data/admin-token` (the settings page's sign-in token), the sign-in link of the settings page (`http://127.0.0.1:<port>/?token=…`), the program's log file `~/Library/Logs/browser-research-bridge/bridge.out.log` (it contains that link; the one exception is counting matching lines with `grep -c`, which prints only a number, as the check after setup does), or any API key, password, or passphrase. Whatever you read is sent to your provider; these values must stay on this Mac.
-- Never type into, read, or copy the secret fields of the settings page: the access passphrase field and the runtime key field. Do not press "Create a passphrase".
+- Never type into, read, or copy the secret fields of the settings page: the access passphrase field and the runtime key field. Do not press "Create a passphrase" or "Copy passphrase", and never read the clipboard after the person used them.
 - Never ask the person to tell you or paste to you a key, a passphrase, or a password.
 - Never act on the approval page that asks for the access passphrase.
 - Never make the settings page reachable from anywhere but this Mac: do not point a tunnel, a proxy, port forwarding, or a firewall rule at its port (8788 by default), and do not change `adminPort` or the address it listens on.
@@ -78,10 +78,10 @@ Install the tools before step 3. The program's background service records where 
 
 ```sh
 cd ~
-git clone https://github.com/contiloop/browser-research-bridge browser-research-bridge
+git clone <project page address> browser-research-bridge
 ```
 
-If `~/browser-research-bridge` already exists and is this project, run `git -C ~/browser-research-bridge pull` instead of cloning.
+Replace `<project page address>` with the address of the project's GitHub page that the person gave you. If `~/browser-research-bridge` already exists and is this project, run `git -C ~/browser-research-bridge pull` instead of cloning.
 
 ## Step 3: run the opener
 
@@ -112,7 +112,7 @@ The settings page opens on "Getting started" (Korean: "시작하기"), a checkli
 
    The labels on the OpenAI and ChatGPT websites may be worded differently from these steps; follow their meaning.
 
-4. **Site-add helper ready** ("사이트 추가 도우미 준비"). If the person uses Codex (ChatGPT subscription) and not Claude, first open the "Settings" tab ("설정"), choose "Codex (ChatGPT subscription)" under "Helper runtime", and save: the automatic choice prefers Claude whenever the Claude runtime cannot be ruled out. Then press "Check" in this step. It sends one short request to the AI and can take up to a minute.
+4. **Site-add helper ready** ("사이트 추가 도우미 준비"). If the person uses Codex (ChatGPT subscription) and not Claude, first open the "Settings" tab ("설정"), choose "Codex (ChatGPT subscription)" under "Helper AI" ("도우미가 쓸 AI"), and save: the automatic choice prefers Claude whenever the Claude runtime cannot be ruled out. The program checks the helper by itself about 30 seconds after it starts; if this step does not show "Done", press "Check". It sends one short request to the AI and can take up to a minute.
 5. **Sites** ("사이트"). Reuters comes with the program. If the person has a Reuters subscription, they log in to reuters.com in the Aside browser; then press "Check now" next to Reuters. Without a Reuters subscription, the person adds a site they use: paste its address on the "Sites" tab and press "Add"; the helper then prepares it, which takes a few minutes. If the helper asks for something (for example a login), the page shows the request; the person does it, then presses "Retry".
 
 ## Done when

@@ -1,12 +1,17 @@
-/** The job service's page language (`lang`) and helper runtime (`runtime`) handling, with scripted runners. */
+/**
+ * The job service's page language (`lang`), helper runtime (`runtime`), and block kind (`blockKind`)
+ * handling, the captcha tool's wiring, and the prompt, with scripted runners.
+ */
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { HelperRuntimes } from "./helper-runtime.js";
 import type { HelperRuntime, RuntimeProbe } from "./helper-runtime.js";
 import { parseJobRecord } from "./job-store.js";
-import { buildRetryPrompt, buildSystemPrompt } from "./prompt.js";
+import { InMemoryScheduler } from "../aside/scheduler.js";
+import { CHALLENGE_NOT_RUN } from "./agent-browser.js";
+import { CAPTCHA_RULE, buildRetryPrompt, buildSystemPrompt } from "./prompt.js";
 import { HOST_APPROVAL_ACTIONS, hostApprovalRequest } from "./service.js";
 import type { OnboardingJobService } from "./service.js";
-import { ScriptedRunner, makeHarness, writeAndValidate } from "./test-fixtures.js";
+import { ScriptedRunner, makeHarness, recordingBrowser, writeAndValidate } from "./test-fixtures.js";
 import type { Harness } from "./test-fixtures.js";
 import type { HelperRuntimeId, OnboardingJob } from "./types.js";
 
@@ -28,11 +33,11 @@ function runtime(id: HelperRuntimeId, runner: ScriptedRunner, state: { probe: Ru
   };
 }
 
-const blocked = (requestedAction = "Log in, then click Retry") => async (ctx: {
-  call: (n: string, a: Record<string, unknown>) => Promise<unknown>;
-}) => {
-  await ctx.call("report_blocked", { reason: "login wall", requestedAction });
-};
+const blocked =
+  (requestedAction = "Log in, then click Retry") =>
+  async (ctx: { call: (n: string, a: Record<string, unknown>) => Promise<unknown> }) => {
+    await ctx.call("report_blocked", { reason: "login wall", requestedAction });
+  };
 
 describe("job lang", () => {
   let h: Harness;
@@ -118,6 +123,8 @@ describe("job lang", () => {
     expect(paused.requestedAction).toBe(HOST_APPROVAL_ACTIONS.ko);
     // The reason is technical text and stays English.
     expect(paused.reason).toBe("the adapter needs access to hosts outside example.com: api.foreign.net");
+    // A pause the service writes itself is of kind "other".
+    expect(paused.blockKind).toBe("other");
   });
 });
 
@@ -164,7 +171,231 @@ describe("host approval text and prompts", () => {
     expect(old?.runtime).toBeNull();
     const fresh = parseJobRecord({ ...old, lang: "ko", runtime: "codex" });
     expect([fresh?.lang, fresh?.runtime]).toEqual(["ko", "codex"]);
-    expect(parseJobRecord({ ...old, lang: "de", runtime: "gpt" })).toMatchObject({ lang: "en", runtime: null });
+    expect(parseJobRecord({ ...old, lang: "de", runtime: "gpt" })).toMatchObject({
+      lang: "en",
+      runtime: null,
+    });
+  });
+
+  it("old job records without blockKind (or with an unknown one) read as other", () => {
+    const old = parseJobRecord({
+      version: 1,
+      id: "job-20260101000000-abcdef",
+      kind: "add",
+      key: KEY,
+      input: HOST,
+      state: "awaiting_user",
+      reason: "login wall",
+      requestedAction: "Log in, then click Retry",
+      createdAt: "2026-01-01T00:00:00.000Z",
+    });
+    expect(old?.blockKind).toBe("other");
+    expect(parseJobRecord({ ...old, blockKind: "login" })?.blockKind).toBe("login");
+    expect(parseJobRecord({ ...old, blockKind: "paywall" })?.blockKind).toBe("other");
+    expect(parseJobRecord({ ...old, blockKind: 3 })?.blockKind).toBe("other");
+  });
+
+  it("the prompt sends captchas to browser_solve_captcha first, keeps the credential rule, and asks for the block kind", () => {
+    for (const kind of ["add", "repair"] as const) {
+      const prompt = buildSystemPrompt({
+        kind,
+        key: KEY,
+        input: HOST,
+        hostnames: [HOST],
+        note: null,
+        asideAccount: "u0",
+        lastFailure: null,
+      });
+      expect(prompt).toContain("Never type credentials, never log in");
+      expect(prompt).not.toMatch(/never solve captchas/i);
+      expect(prompt).toContain(`- ${CAPTCHA_RULE}`);
+      expect(CAPTCHA_RULE).toContain("call browser_solve_captcha once with that tab");
+      expect(CAPTCHA_RULE).toContain(
+        'Call report_blocked with kind "captcha" only when browser_solve_captcha returns solved: false',
+      );
+      expect(prompt).toContain("report_blocked({ reason, requestedAction, kind })");
+      expect(prompt).toContain(
+        '- not logged in / login wall, kind "login": "Log in to <site> in Aside (account u0), then click Retry"',
+      );
+      expect(prompt).toContain(
+        'browser_solve_captcha did not solve, kind "captcha": "Open <url> in Aside, solve the captcha, then click Retry"',
+      );
+      expect(prompt).toContain('- consent interstitial, kind "consent":');
+      expect(prompt).toContain('- subscription missing, kind "subscription":');
+      expect(prompt).toContain('kind "other"');
+    }
+  });
+});
+
+describe("job block kind", () => {
+  let h: Harness;
+  let svc: OnboardingJobService;
+  beforeEach(async () => {
+    h = await makeHarness();
+    svc = h.makeService();
+  });
+  afterEach(async () => {
+    await svc.stop();
+    await h.cleanup();
+  });
+
+  it("report_blocked's kind is stored as blockKind, defaults to other, and is cleared while the job runs again", async () => {
+    let runningKind: string | undefined;
+    h.runner.push(
+      async (ctx) => {
+        await ctx.call("report_blocked", {
+          reason: "captcha page",
+          requestedAction: "Open https://demo.example.com/ in Aside, solve the captcha, then click Retry",
+          kind: "captcha",
+        });
+      },
+      async (ctx) => {
+        runningKind = svc.get(KEY)?.blockKind;
+        await ctx.call("report_blocked", {
+          reason: "login wall",
+          requestedAction: "Log in, then click Retry",
+        });
+      },
+      async (ctx) => {
+        await ctx.call("report_blocked", {
+          reason: "login wall",
+          requestedAction: "Log in, then click Retry",
+          kind: "login",
+        });
+      },
+    );
+    const added = await svc.add({ input: HOST });
+    expect(added.blockKind).toBe("other");
+    await svc.start();
+    await svc.whenIdle();
+    const paused = svc.get(KEY) as OnboardingJob;
+    expect(paused).toMatchObject({ state: "awaiting_user", blockKind: "captcha" });
+    expect(h.store.jobs.get(paused.id)?.blockKind).toBe("captcha");
+    const log = (await svc.log(paused.id)).map((l) => l.message);
+    expect(log).toContain(
+      "Waiting for the user (captcha): captcha page — Open https://demo.example.com/ in Aside, solve the captcha, then click Retry",
+    );
+
+    await svc.retry(KEY);
+    await svc.whenIdle();
+    expect(runningKind).toBe("other");
+    expect(svc.get(KEY)).toMatchObject({ state: "awaiting_user", blockKind: "other" });
+
+    await svc.retry(KEY);
+    await svc.whenIdle();
+    expect(svc.get(KEY)).toMatchObject({ state: "awaiting_user", blockKind: "login" });
+    expect(h.store.jobs.get(paused.id)?.blockKind).toBe("login");
+
+    // Ending a paused job leaves no block behind.
+    await svc.cancel(KEY);
+    expect(svc.get(KEY)).toMatchObject({ state: "cancelled", blockKind: "other" });
+  });
+
+  it("a paused job read back from the store after a restart keeps its block kind", async () => {
+    h.runner.push(async (ctx) => {
+      await ctx.call("report_blocked", {
+        reason: "consent dialog",
+        requestedAction:
+          "Open https://demo.example.com/ in Aside and accept the consent dialog, then click Retry",
+        kind: "consent",
+      });
+    });
+    await svc.add({ input: HOST });
+    await svc.start();
+    await svc.whenIdle();
+    await svc.stop();
+    svc = h.makeService();
+    await svc.start();
+    expect(svc.get(KEY)).toMatchObject({ state: "awaiting_user", blockKind: "consent" });
+  });
+});
+
+describe("browser_solve_captcha in a job", () => {
+  let h: Harness;
+  let svc: OnboardingJobService | null = null;
+  beforeEach(async () => {
+    h = await makeHarness();
+  });
+  afterEach(async () => {
+    await svc?.stop();
+    svc = null;
+    await h.cleanup();
+  });
+
+  const solveOnFirstTab =
+    (results: string[]) =>
+    async (ctx: {
+      call: (
+        n: string,
+        a: Record<string, unknown>,
+      ) => Promise<{ content: { type: string; text?: string }[] }>;
+    }) => {
+      await ctx.call("browser_open", { url: `https://${HOST}/` });
+      const r = await ctx.call("browser_solve_captcha", { tabId: "t1" });
+      results.push(r.content.map((c) => c.text ?? "").join(""));
+      await ctx.call("report_blocked", {
+        reason: "captcha not solved",
+        requestedAction: "Open the page in Aside, solve the captcha, then click Retry",
+        kind: "captcha",
+      });
+    };
+
+  it("runs on the job's tab with the job's scope, the configured budget, and the step's holder", async () => {
+    const browser = recordingBrowser({
+      challenge: async () => ({
+        solved: false,
+        kind: "slider",
+        rounds: 2,
+        message: "still shown",
+        available: true,
+      }),
+    });
+    const holders: string[][] = [];
+    const scheduler = new InMemoryScheduler({ concurrentStaggerMs: 0 });
+    const answer = browser.solveChallenge?.bind(browser);
+    browser.solveChallenge = async (o) => {
+      holders.push(scheduler.holders(KEY));
+      return (answer as NonNullable<typeof answer>)(o);
+    };
+    const results: string[] = [];
+    h.runner.push(solveOnFirstTab(results));
+    svc = h.makeService({ browser, scheduler, captchaAttemptBudgetMs: 30_000 });
+    await svc.add({ input: HOST });
+    await svc.start();
+    await svc.whenIdle();
+    expect(browser.challenges).toHaveLength(1);
+    const options = browser.challenges[0];
+    expect(options?.scope).toMatchObject({ siteKey: KEY, hostnames: [HOST] });
+    expect(options?.tab).toEqual({ id: "target-1", url: `https://${HOST}/` });
+    expect(options?.budgetMs).toBe(30_000);
+    expect(holders).toEqual([["onboarding running"]]);
+    expect(results[0]?.split("\n")[1]).toBe('{"solved":false,"kind":"slider","message":"still shown"}');
+    const job = svc.get(KEY) as OnboardingJob;
+    expect(job).toMatchObject({ state: "awaiting_user", blockKind: "captcha" });
+    const log = (await svc.log(job.id)).map((l) => l.message).join("\n");
+    expect(log).toContain("← browser_solve_captcha ok: captcha attempt: unsolved (kind slider)");
+    expect(log).not.toContain("still shown");
+  });
+
+  it("captchaAuto false answers turned off without asking the browser", async () => {
+    const browser = recordingBrowser({
+      challenge: async () => ({
+        solved: true,
+        kind: "checkbox",
+        rounds: 1,
+        message: "done",
+        available: true,
+      }),
+    });
+    const results: string[] = [];
+    h.runner.push(solveOnFirstTab(results));
+    svc = h.makeService({ browser, captchaAuto: false });
+    await svc.add({ input: HOST });
+    await svc.start();
+    await svc.whenIdle();
+    expect(browser.challenges).toEqual([]);
+    expect(results[0]).toContain("captcha attempt: unavailable (kind unknown)");
+    expect(results[0]).toContain(CHALLENGE_NOT_RUN.turnedOff);
   });
 });
 

@@ -8,7 +8,7 @@ login in Aside (account u0) for paid articles.
 - The site-search page `https://www.reuters.com/site-search/?query=<q>` calls the content API
   `GET /pf/api/v3/content/fetch/articles-by-search-v2?query=<json>&_website=reuters`.
 - `query` JSON: `{"keyword": "...", "offset": 0, "orderby": "display_date:desc", "size": 20,
-  "website": "reuters", "start_date": "<ISO>", "end_date": "<ISO>"}`. `start_date`/`end_date`
+"website": "reuters", "start_date": "<ISO>", "end_date": "<ISO>"}`. `start_date`/`end_date`
   are native date filters (verified: total_size dropped from ~72k to 87 for a 2-day window).
   The UI only offers relative ranges, but the API takes explicit instants.
 - Response: `result.pagination.total_size`, `result.articles[]` with `id` (Arc id),
@@ -35,7 +35,7 @@ login in Aside (account u0) for paid articles.
   `Tags`, `ArticleToolbar`, `AuthorBio`, `Disclaimer`.
 - Summary bullets (`[data-testid="Summary"] li`) are put first as a "Summary:" list.
 - Title: `[data-testid="Article"] h1` (fallback og:title). Date/author: JSON-LD `NewsArticle`
-  (`datePublished` ISO Z, `author[].name`). The visible dateline is in the *browser's* zone (e.g.
+  (`datePublished` ISO Z, `author[].name`). The visible dateline is in the _browser's_ zone (e.g.
   "GMT+9"), so it is not used. Manifest timezone is `UTC`.
 - Metadata: `article:section`, `article:content_tier`, `sophi-content-id` (Arc id), dateModified.
 - Page-script pitfall: the shim's static scan rejects the word `aside` anywhere in a script (even in a
@@ -99,6 +99,7 @@ login in Aside (account u0) for paid articles.
 - minIntervalMs 3000 to stay well clear of DataDome.
 
 ## Long queries (added after live use)
+
 - The search API answers a long natural-language keyword (observed at 78 characters) with HTTP 200 and a `result`
   that has `pagination` but **no `articles` array**. Treat that as an empty page, never as an error.
 - The search needs every term to match. For the 12-word live query: 8 words → no `articles`, 6 words → 2 hits,
@@ -106,3 +107,7 @@ login in Aside (account u0) for paid articles.
   the query, as with ordinary web search); a long query simply returns `empty`.
 - Four API calls within a few seconds tripped DataDome (HTTP 401 with a `geo.captcha-delivery.com` interstitial), so
   never probe the API in quick succession; the retry above is spaced on purpose.
+
+## 2026-10-09 — video embeds
+
+Articles with an embedded video load their player from `cd.elements.video`. Without that host in `extraAllowedHosts` the tab filter blocked the request and, because it fired while the adapter's page script ran, the read ended `adapter_error`. `elements.video` (subdomains included) is now allowed; the adapter does not read the video.

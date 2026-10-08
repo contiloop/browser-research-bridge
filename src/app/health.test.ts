@@ -10,6 +10,7 @@ import { FileSiteStateStore } from "../adapters/storage/site-state-store.js";
 import type { Outcome } from "../core/models.js";
 import { OutcomeError } from "../core/outcome.js";
 import { HealthChecker } from "./health.js";
+import type { HealthCheckOutcome } from "./health.js";
 
 describe("HealthChecker", () => {
   let tmp: { dir: string; cleanup: () => Promise<void> };
@@ -94,7 +95,7 @@ describe("HealthChecker", () => {
   it("runs only when the site is idle", async () => {
     let release!: () => void;
     const busy = scheduler.runForSite(
-      { site: "alpha", holder: "repair running", acquireTimeoutMs: 1000, minIntervalMs: 0 },
+      { site: "alpha", holder: "repair running", acquireTimeoutMs: 1000, minIntervalMs: 0, exclusive: true },
       () => new Promise<void>((resolve) => (release = resolve)),
     );
     await Promise.resolve();
@@ -105,6 +106,23 @@ describe("HealthChecker", () => {
     expect(calls.map((c) => c.key)).toEqual(["beta"]);
     release();
     await busy;
+  });
+
+  it("skips a site while pooled tool calls run on it and names them", async () => {
+    const releases: (() => void)[] = [];
+    const busy = ["search", "fetch"].map((holder) =>
+      scheduler.runForSite(
+        { site: "alpha", holder, acquireTimeoutMs: 1000, minIntervalMs: 0 },
+        () => new Promise<void>((resolve) => releases.push(resolve)),
+      ),
+    );
+    await new Promise((r) => setTimeout(r, 0));
+    expect(scheduler.holders("alpha")).toEqual(["search", "fetch"]);
+    const r = await checker().runNow("alpha");
+    expect(r).toEqual({ site: "alpha", ran: false, skipped: "site busy: search, fetch", status: "active" });
+    releases.forEach((release) => release());
+    await Promise.all(busy);
+    expect((await checker().runNow("alpha")).ran).toBe(true);
   });
 
   it("the timer pass skips cooling-down sites; Check now does not", async () => {
@@ -149,5 +167,120 @@ describe("HealthChecker", () => {
     await new Promise((r) => setTimeout(r, 50));
     h.stop();
     expect(calls.map((c) => c.key)).toEqual(["alpha", "beta"]);
+  });
+
+  describe("captcha attempts on Check now", () => {
+    const BLOCKED = { status: "access_denied", message: "captcha page", blocked: { url: null } } as const;
+    const ACTION =
+      "The captcha could not be solved automatically. Open https://alpha.example.com/ in Aside, solve it, then retry";
+    let attempts: { key: string; url: string | null }[];
+    let checks: HealthCheckOutcome[];
+    let ran: boolean;
+    let solverMessage: string | undefined;
+    let order: string[];
+
+    const withChallenges = (enabled = true) =>
+      new HealthChecker({
+        registry,
+        scheduler,
+        intervalMs: 86_400_000,
+        clock: { now: () => new Date(nowMs) },
+        logger: silentLogger,
+        check: async () => {
+          order.push("check");
+          return checks.shift() ?? { status: "ok" };
+        },
+        challenges: {
+          enabled,
+          attempt: async (key, url) => {
+            order.push("attempt");
+            // The light check (an exclusive task) has ended: the site is free for the pool task.
+            expect(scheduler.isIdle(key)).toBe(true);
+            attempts.push({ key, url });
+            return {
+              ran,
+              result: ran ? "unsolved" : "unavailable",
+              url: url ?? "https://alpha.example.com/",
+              action: ACTION,
+              ...(solverMessage !== undefined ? { message: solverMessage } : {}),
+            };
+          },
+        },
+      });
+
+    beforeEach(() => {
+      attempts = [];
+      checks = [];
+      ran = true;
+      solverMessage = undefined;
+      order = [];
+    });
+
+    it("blocked → one attempt → the light check once more; the second result sets the status", async () => {
+      checks = [{ ...BLOCKED, blocked: { url: "https://alpha.example.com/a/1" } }, { status: "ok" }];
+      await registry.recordHealthCheck("alpha", { status: "adapter_error", message: "old" });
+      const r = await withChallenges().runNow("alpha");
+      expect(order).toEqual(["check", "attempt", "check"]);
+      expect(attempts).toEqual([{ key: "alpha", url: "https://alpha.example.com/a/1" }]);
+      expect(r).toEqual({ site: "alpha", ran: true, outcome: { status: "ok" }, status: "active" });
+    });
+
+    it("still blocked after the attempt → the second result with the captcha action (degraded, no cool-down)", async () => {
+      checks = [{ ...BLOCKED }, { ...BLOCKED, message: "captcha again" }];
+      const r = await withChallenges().runNow("alpha");
+      expect(order).toEqual(["check", "attempt", "check"]);
+      expect(attempts).toEqual([{ key: "alpha", url: null }]);
+      expect(r.outcome).toEqual({ status: "access_denied", message: "captcha again", action: ACTION });
+      expect(registry.get("alpha")).toMatchObject({ status: "degraded", lastFailure: "captcha again" });
+      expect(scheduler.cooldownUntil("alpha")).toBeNull();
+    });
+
+    it("names the solver's message in the failure the site card shows (e.g. no vision model in Aside)", async () => {
+      solverMessage = "text captcha: no vision model is configured in Aside";
+      checks = [{ ...BLOCKED }, { ...BLOCKED }];
+      const r = await withChallenges().runNow("alpha");
+      const message = "captcha page (captcha attempt: text captcha: no vision model is configured in Aside)";
+      expect(r.outcome).toEqual({ status: "access_denied", message, action: ACTION });
+      expect(registry.get("alpha")).toMatchObject({ status: "degraded", lastFailure: message });
+
+      ran = false;
+      solverMessage = "captcha solving is not available in this Aside version";
+      checks = [{ ...BLOCKED }];
+      const r2 = await withChallenges().runNow("alpha");
+      expect(r2.outcome?.message).toBe(
+        "captcha page (captcha attempt: captcha solving is not available in this Aside version)",
+      );
+    });
+
+    it("an attempt that could not run (no capability) keeps the first result, with the captcha action", async () => {
+      ran = false;
+      checks = [{ ...BLOCKED }];
+      const r = await withChallenges().runNow("alpha");
+      expect(order).toEqual(["check", "attempt"]);
+      expect(r.outcome).toEqual({ status: "access_denied", message: "captcha page", action: ACTION });
+    });
+
+    it("scheduled checks never attempt", async () => {
+      checks = [{ ...BLOCKED }, { status: "ok" }];
+      const pass = await withChallenges().runDue();
+      expect(attempts).toEqual([]);
+      expect(pass.find((x) => x.site === "alpha")?.outcome).toEqual({
+        status: "access_denied",
+        message: "captcha page",
+      });
+    });
+
+    it("the setting off: Check now behaves as before", async () => {
+      checks = [{ ...BLOCKED }, { status: "ok" }];
+      const r = await withChallenges(false).runNow("alpha");
+      expect(order).toEqual(["check"]);
+      expect(r.outcome).toEqual({ status: "access_denied", message: "captcha page" });
+    });
+
+    it("a failure that is not a block page gets no attempt", async () => {
+      checks = [{ status: "auth_required", message: "login wall" }];
+      await withChallenges().runNow("alpha");
+      expect(order).toEqual(["check"]);
+    });
   });
 });

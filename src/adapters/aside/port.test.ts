@@ -10,7 +10,7 @@ function spyLogger() {
   return { logger, warn };
 }
 
-function setup(options: { warmTabTtlMs?: number } = {}) {
+function setup(options: { warmTabTtlMs?: number; maxWarmTabsPerSite?: number } = {}) {
   const repl = new FakeAsideRepl();
   const { logger, warn } = spyLogger();
   const port = new AsideBrowserPort({
@@ -18,6 +18,7 @@ function setup(options: { warmTabTtlMs?: number } = {}) {
     logger,
     warmTabTtlMs: options.warmTabTtlMs ?? 0,
     stepTimeoutMs: 5000,
+    maxWarmTabsPerSite: options.maxWarmTabsPerSite,
   });
   return { repl, port, warn };
 }
@@ -178,6 +179,28 @@ describe("AsideBrowserPort", () => {
     expect(v).toEqual({ title: "Example Domain", n: 42, gmail: "undefined" });
   });
 
+  it("remembers the last on-site page its tabs showed (lastUrl), never a fetch or an off-site page", async () => {
+    const { port, repl } = setup();
+    const session = await port.openSession(scope);
+    expect(session.lastUrl()).toBeNull();
+    // A redirect on the site: the final main-frame URL counts.
+    repl.redirects.set("https://example.com/search?q=x", "https://www.example.com/search/?q=x");
+    await session.openTab("https://example.com/search?q=x");
+    expect(session.lastUrl()).toBe("https://www.example.com/search/?q=x");
+    await session.runScript(`await page.goto("https://example.com/search?q=x&page=2"); return 1;`);
+    expect(session.lastUrl()).toBe("https://example.com/search?q=x&page=2");
+    repl.responses.set("https://example.com/api", { status: 200, body: "{}" });
+    await session.fetch("https://example.com/api");
+    expect(session.lastUrl()).toBe("https://example.com/search?q=x&page=2");
+    // A server redirect off the site fails the step and is not remembered.
+    repl.redirects.set("https://example.com/out", "https://evil.test/landing");
+    await expect(session.openTab("https://example.com/out")).rejects.toMatchObject({
+      status: "adapter_error",
+    });
+    expect(session.lastUrl()).toBe("https://example.com/search?q=x&page=2");
+    await session.dispose();
+  });
+
   it("shadows REPL globals it did not know about by retrying once", async () => {
     const { port, repl } = setup();
     const session = await port.openSession(scope);
@@ -235,6 +258,46 @@ describe("AsideBrowserPort", () => {
 
     await new Promise((r) => setTimeout(r, 200));
     expect(repl.pages.size).toBe(0);
+    await port.shutdown();
+  });
+
+  it("keeps up to maxWarmTabsPerSite warm tabs per site; parallel sessions each take a free one", async () => {
+    const { port, repl } = setup({ warmTabTtlMs: 60_000, maxWarmTabsPerSite: 3 });
+    // Four parallel sessions of one site, each with its own tab.
+    const sessions = await Promise.all([1, 2, 3, 4].map(() => port.openSession(scope)));
+    const tabs = await Promise.all(sessions.map((s, i) => s.openTab(`https://example.com/${i}`)));
+    expect(new Set(tabs.map((t) => t.id)).size).toBe(4);
+    for (const s of sessions) await s.dispose();
+    // Three stay warm: keeping a fourth closes the oldest warm tab.
+    expect(repl.pages.size).toBe(3);
+    expect(repl.closedTabs).toEqual([tabs[0]!.id]);
+
+    // Three new parallel sessions reuse the three warm tabs, one each; a fourth opens a new tab.
+    const again = await Promise.all([1, 2, 3, 4].map(() => port.openSession(scope)));
+    const reused = await Promise.all(again.map((s, i) => s.openTab(`https://example.com/again/${i}`)));
+    const warmIds = new Set(tabs.slice(1).map((t) => t.id));
+    expect(reused.filter((t) => warmIds.has(t.id))).toHaveLength(3);
+    expect(new Set(reused.map((t) => t.id)).size).toBe(4);
+    expect(repl.pages.size).toBe(4);
+    for (const s of again) await s.dispose();
+    expect(repl.pages.size).toBe(3);
+
+    // Another site's warm tabs are kept separately and never shared.
+    const other = await port.openSession({ siteKey: "other", hostnames: ["other.test"] });
+    const t = await other.openTab("https://other.test/");
+    expect(reused.some((r) => r.id === t.id)).toBe(false);
+    await other.dispose();
+    expect(repl.pages.size).toBe(4);
+    await port.shutdown();
+    expect(repl.pages.size).toBe(0);
+  });
+
+  it("keeps up to 3 warm tabs per site by default (the default pool size)", async () => {
+    const { port, repl } = setup({ warmTabTtlMs: 60_000 });
+    const sessions = await Promise.all([1, 2, 3, 4].map(() => port.openSession(scope)));
+    await Promise.all(sessions.map((s, i) => s.openTab(`https://example.com/${i}`)));
+    for (const s of sessions) await s.dispose();
+    expect(repl.pages.size).toBe(3);
     await port.shutdown();
   });
 

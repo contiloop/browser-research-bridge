@@ -2,17 +2,28 @@
  * All server data is inserted as text (textContent / text nodes), never as HTML: job logs may quote
  * web page text. Secrets typed into fields (the access passphrase, the runtime key) are sent once
  * to the local API, cleared from the field after the program accepted them, and never put in
- * browser storage; only the page language is remembered (localStorage). */
+ * browser storage; only the page language is remembered (localStorage). "Copy passphrase" asks the
+ * program to put the stored passphrase on this Mac's clipboard; the value never reaches the page.
+ *
+ * Layout rules: Getting started is the home and starts with one "what to do next" sentence and its
+ * one action; each explanation is at most two sentences, with longer background behind "More";
+ * developer detail is behind "Details"; statuses are plain words on a coloured badge. */
 /* global document, window, fetch, EventSource, navigator, localStorage, crypto, setTimeout, clearTimeout, setInterval */
 import { DICTIONARIES, t } from "./i18n.js";
 import { label } from "./labels.js";
-import { COMMANDS, LINKS, asideText } from "./instructions.js";
+import { COMMANDS, LINKS, asideText, loginTarget, loginText } from "./instructions.js";
 import {
+  blockKind,
   chatgptSubsteps,
   firstOpenStep,
   formatBytes,
   generatePassphrase,
   gettingStarted,
+  helperNeedsPoll,
+  helperReady,
+  jobPausedForLogin,
+  nextStep,
+  offersLoginHelp,
   pickLanguage,
   siteGuidance,
 } from "./state.js";
@@ -154,6 +165,18 @@ function codeLine(command) {
 
 function disclosure(id, summary, ...children) {
   return h("details", { class: "details", "data-id": id }, h("summary", {}, summary), ...children);
+}
+
+/** Background that is not needed to act, behind "More". */
+function moreBox(id, ...children) {
+  const box = disclosure(`more:${id}`, tx("common.more"), ...children);
+  box.classList.add("more");
+  return box;
+}
+
+/** A longer explanation behind "More" (dictionary keys ending in `.more`). */
+function more(id, key) {
+  return moreBox(id, h("p", { class: "muted small" }, tx(key)));
 }
 
 /** Developer detail behind "Details": a definition list of [label, value] pairs (nulls left out). */
@@ -368,6 +391,18 @@ async function loadAll() {
   await Promise.all([loadHelper(), loadCache()]);
   render();
   void loadBrowser();
+}
+
+/** One regular poll: the mode and lists, plus the helper state while its check result may still change. */
+let helperPollTick = 0;
+async function poll() {
+  await refresh();
+  // The helper state is re-read every sixth poll (about 30 s): its probe runs local commands.
+  helperPollTick = (helperPollTick + 1) % 6;
+  if (helperPollTick === 0 && helperNeedsPoll(data.status, data.helper)) {
+    await loadHelper();
+    render();
+  }
 }
 
 let restartWaiter = null;
@@ -588,6 +623,7 @@ function passphraseForm() {
       input.type = "text";
       toggle.textContent = tx("common.hide");
       created.hidden = false;
+      markDirty();
     },
     "secondary",
   );
@@ -631,11 +667,17 @@ function passphraseForm() {
           toggle.textContent = tx("common.show");
           created.hidden = true;
           disconnect.checked = false;
+          markDirty();
         },
       });
     },
-    "primary",
+    "secondary",
   );
+  // The Save button stands out once there is something to save.
+  function markDirty() {
+    save.className = input.value === "" ? "secondary" : "primary";
+  }
+  input.addEventListener("input", markDirty);
   // A form, so the browser treats the password field as part of one (no submit by Enter: Save does it).
   const form = h(
     "form",
@@ -646,6 +688,9 @@ function passphraseForm() {
   const root = h("div", { class: "component" }, state, form, msg);
   return {
     root,
+    focus() {
+      if (!fields.hidden) input.focus();
+    },
     update(settings) {
       const pass = settings?.passphrase;
       if (!pass) {
@@ -688,11 +733,17 @@ async function saveSettings(body, ctx) {
   }
 }
 
+/** A Save button that stands out only while its setting has an unsaved change. */
+function markSave(save, dirty) {
+  save.className = dirty ? "primary" : "secondary";
+}
+
 function runtimeForm() {
   const select = h("select", { id: "rt-select" });
   let dirty = false;
   select.addEventListener("change", () => {
     dirty = true;
+    markSave(save, true);
   });
   const note = h("p", { class: "muted small", hidden: true }, tx("rt.onlyClaude"));
   const msg = h("div", { hidden: true });
@@ -705,16 +756,17 @@ function runtimeForm() {
           msg,
           onAccepted: () => {
             dirty = false;
+            markSave(save, false);
           },
         },
       ),
-    "primary",
+    "secondary",
   );
   const root = h(
     "div",
     { class: "component" },
     h("p", { class: "muted" }, tx("rt.explain")),
-    h("label", { for: "rt-select" }, tx("rt.title")),
+    h("label", { for: "rt-select", class: "visually-hidden" }, tx("rt.title")),
     h("div", { class: "input-row" }, select, save),
     note,
     msg,
@@ -733,6 +785,7 @@ function runtimeForm() {
         select.dataset.sig = sig;
         select.replaceChildren(...options.map((value) => h("option", { value }, lb("helperRuntime", value))));
         dirty = false;
+        markSave(save, false);
       }
       if (!dirty && rt.value) select.value = rt.value;
       note.hidden = !(rt.supported?.length === 1 && rt.supported[0] === "claude");
@@ -751,6 +804,7 @@ function accountForm() {
   let dirty = false;
   input.addEventListener("input", () => {
     dirty = true;
+    markSave(save, true);
   });
   const fieldError = h("p", { class: "field-error", hidden: true });
   const locked = h("p", { class: "muted small", hidden: true }, tx("acct.locked"));
@@ -765,16 +819,17 @@ function accountForm() {
           fieldEls: { asideAccount: fieldError },
           onAccepted: () => {
             dirty = false;
+            markSave(save, false);
           },
         },
       ),
-    "primary",
+    "secondary",
   );
   const root = h(
     "div",
     { class: "component" },
     h("p", { class: "muted" }, tx("acct.explain")),
-    h("label", { for: "acct-input" }, tx("acct.title")),
+    h("label", { for: "acct-input", class: "visually-hidden" }, tx("acct.title")),
     h("div", { class: "input-row" }, input, save),
     fieldError,
     locked,
@@ -789,6 +844,59 @@ function accountForm() {
       input.disabled = acct.locked === true;
       save.hidden = acct.locked === true;
       locked.hidden = acct.locked !== true;
+    },
+  };
+}
+
+/** Settings → "Solve captchas automatically" (`captchaAuto`), saved with a restart like the others. */
+function captchaForm() {
+  const box = h("input", { type: "checkbox", id: "cap-auto", role: "switch" });
+  let dirty = false;
+  box.addEventListener("change", () => {
+    dirty = true;
+    markSave(save, true);
+  });
+  const unknown = h("p", { class: "muted small", hidden: true }, tx("cap.unknown"));
+  const fieldError = h("p", { class: "field-error", hidden: true });
+  const msg = h("div", { hidden: true });
+  const save = button(
+    tx("common.save"),
+    () =>
+      saveSettings(
+        { captchaAuto: box.checked },
+        {
+          msg,
+          fieldEls: { captchaAuto: fieldError },
+          onAccepted: () => {
+            dirty = false;
+            markSave(save, false);
+          },
+        },
+      ),
+    "secondary",
+  );
+  const root = h(
+    "div",
+    { class: "component" },
+    h("p", { class: "muted" }, tx("cap.explain")),
+    h("div", { class: "check-row switch-row" }, box, h("label", { for: "cap-auto" }, tx("cap.switch")), save),
+    h("p", { class: "note small" }, tx("cap.note")),
+    unknown,
+    fieldError,
+    msg,
+  );
+  return {
+    root,
+    update(settings) {
+      // An older program without the setting: the switch stays hidden.
+      root.hidden = !settings || !Object.prototype.hasOwnProperty.call(settings, "captchaAuto");
+      if (root.hidden) return;
+      const value = settings.captchaAuto;
+      if (!dirty) {
+        box.checked = value === true;
+        box.indeterminate = value !== true && value !== false;
+      }
+      unknown.hidden = value === true || value === false;
     },
   };
 }
@@ -850,31 +958,32 @@ function addSiteForm() {
   };
 }
 
+/** The helper's state: the last check (automatic or the Check button) first, then what it would use. */
 function helperBox() {
   const body = h("div", { class: "stack" });
   const msg = h("div", { hidden: true });
   let checking = false;
-  const checkButton = button(
-    tx("step4.check"),
-    async () => {
-      checking = true;
-      formMessage(msg, "info", tx("step4.checking"));
-      try {
-        await api("/helper/check", { method: "POST" });
-        formMessage(msg, null);
-      } catch (error) {
-        formMessage(msg, "error", errorText(error), errorDetails(error));
-      } finally {
-        checking = false;
-      }
-      await loadHelper();
-      render();
-    },
-    "primary",
-  );
+  const check = async () => {
+    if (checking || !coreRunning()) return;
+    checking = true;
+    render();
+    formMessage(msg, "info", tx("step4.checking"));
+    try {
+      await api("/helper/check", { method: "POST" });
+      formMessage(msg, null);
+    } catch (error) {
+      formMessage(msg, "error", errorText(error), errorDetails(error));
+    } finally {
+      checking = false;
+    }
+    await loadHelper();
+    render();
+  };
+  const checkButton = button(tx("step4.check"), check, "secondary");
   const root = h("div", { class: "component" }, body, h("div", { class: "row" }, checkButton), msg);
   return {
     root,
+    check,
     update(helper) {
       checkButton.hidden = !coreRunning();
       checkButton.disabled = checking || !coreRunning();
@@ -893,23 +1002,43 @@ function helperBox() {
           return h("li", {}, tx(key, { name }));
         });
         const last = helper.lastCheck;
+        const ready = helperReady(helper);
+        // An `ok` on another runtime than the one a job would use now does not count.
+        const otherRuntime = last?.ok === true && !ready && Boolean(helper.wouldUse);
+        const lastLine = last
+          ? h(
+              "p",
+              { class: "status-row" },
+              ready
+                ? badge("done", tx("helper.works"))
+                : otherRuntime
+                  ? badge("todo", tx("helper.recheck"))
+                  : badge("bad", tx("helper.notWorking")),
+              " ",
+              tx("helper.lastCheck", { time: when(last.at), result: lb("helperCheckCode", last.code) }),
+            )
+          : h("p", { class: "muted" }, tx("helper.noCheck"));
         return [
-          h("ul", { class: "plain-list" }, rows),
+          lastLine,
+          otherRuntime
+            ? h(
+                "p",
+                { class: "warn" },
+                tx("helper.otherRuntime", {
+                  checked: lb("helperRuntime", last.runtime),
+                  runtime: lb("helperRuntime", helper.wouldUse),
+                }),
+              )
+            : null,
           helper.wouldUse
             ? h("p", {}, tx("helper.wouldUse", { runtime: lb("helperRuntime", helper.wouldUse) }))
             : h("p", { class: "warn" }, tx("helper.noneAvailable")),
           helper.wouldUse === "claude" ? h("p", { class: "muted small" }, tx("helper.dataClaude")) : null,
           helper.wouldUse === "codex" ? h("p", { class: "muted small" }, tx("helper.dataCodex")) : null,
-          last
-            ? h(
-                "p",
-                { class: last.ok ? "good" : "warn" },
-                tx("helper.lastCheck", { time: when(last.at), result: lb("helperCheckCode", last.code) }),
-              )
-            : h("p", { class: "muted" }, tx("helper.noCheck")),
+          moreBox("helper-runtimes", h("ul", { class: "plain-list" }, rows)),
           last
             ? detailList("helper-check", [
-                [tx("site.d.runtime"), last.runtime],
+                [tx("site.d.runtime"), lb("helperRuntime", last.runtime)],
                 [tx("conn.details.message"), last.message],
               ])
             : null,
@@ -944,6 +1073,7 @@ function asideHelper(id, getText) {
     id,
     tx("aside.title"),
     h("p", { class: "muted small" }, tx("aside.explain")),
+    more(id, "aside.more"),
     pre,
     copyButton(() => pre.textContent, tx("aside.copy")),
   );
@@ -955,6 +1085,76 @@ function asideHelper(id, getText) {
       if (pre.textContent !== text) pre.textContent = text;
     },
   };
+}
+
+/** The Aside AI login text for one site (a `needs_login` card or a job paused for a login), or null. */
+function loginHelper(id, target) {
+  const text = loginText(lang, target);
+  if (text === null) return null;
+  const box = disclosure(
+    id,
+    tx("login.title"),
+    h("p", { class: "muted small" }, tx("login.explain")),
+    h("pre", { class: "instruction" }, text),
+    copyButton(text, tx("aside.copy")),
+  );
+  box.classList.add("aside-helper");
+  return box;
+}
+
+/** Where the login text sends the Aside AI for a site: its login address, else its first hostname. */
+function siteLoginTarget(site) {
+  const hostnames =
+    Array.isArray(site.hostnames) && site.hostnames.length > 0 ? site.hostnames : site.job?.hostnames;
+  return loginTarget({ loginUrl: site.loginUrl, hostnames, input: site.job?.input });
+}
+
+/** The same for a job, through its site when the site is registered. */
+function jobLoginTarget(job) {
+  const site = Array.isArray(data.sites) ? data.sites.find((s) => s.key === job.key) : undefined;
+  if (site) return siteLoginTarget({ ...site, job });
+  return loginTarget({ loginUrl: null, hostnames: job.hostnames, input: job.input });
+}
+
+/** "Copy passphrase" in ChatGPT step f: the program puts the passphrase on this Mac's clipboard. */
+function copyPassphraseBox() {
+  const msg = h("div", { hidden: true });
+  const copy = button(
+    tx("sub.f.copy"),
+    async () => {
+      formMessage(msg, null);
+      try {
+        await api("/settings/passphrase/clipboard", { method: "POST" });
+        formMessage(msg, "ok", tx("sub.f.copied"));
+      } catch (error) {
+        // Only the code's own wording (the `locked` field text would repeat it).
+        const text = error instanceof ApiError ? lb("errorCode", error.code) : errorText(error);
+        formMessage(msg, "error", text, errorDetails(error));
+      }
+    },
+    "secondary",
+  );
+  const root = h(
+    "div",
+    { class: "stack" },
+    h("div", { class: "row" }, copy),
+    h("p", { class: "muted small" }, tx("sub.f.copyNote")),
+    msg,
+  );
+  return {
+    root,
+    update(current) {
+      copy.className = current ? "primary" : "secondary";
+    },
+  };
+}
+
+/** Badge colour of a ChatGPT connection state. */
+function chatgptTone(state) {
+  if (state === "ready") return "done";
+  if (state === "failed") return "bad";
+  if (state === "not_configured") return "todo";
+  return "unknown";
 }
 
 function chatgptGuide() {
@@ -1085,6 +1285,7 @@ function chatgptGuide() {
   });
   append(steps.c.body, [
     h("p", {}, tx("sub.c.explain")),
+    more("sub-c", "sub.c.more"),
     h("ol", { class: "how" }, h("li", {}, tx("sub.c.s1")), h("li", {}, tx("sub.c.s2"))),
     form,
   ]);
@@ -1098,6 +1299,7 @@ function chatgptGuide() {
     asideText(lang, "connector", { tunnelId: data.chatgpt?.tunnelId }),
   );
   append(steps.e.body, [
+    h("p", { class: "muted small" }, tx("sub.e.explain")),
     eThisMac,
     h(
       "ol",
@@ -1109,7 +1311,8 @@ function chatgptGuide() {
     h("p", { class: "muted small" }, tx("conn.labelsDiffer")),
     asideE.root,
   ]);
-  append(steps.f.body, [h("p", {}, tx("sub.f.s1"))]);
+  const copyPassphrase = copyPassphraseBox();
+  append(steps.f.body, [h("p", {}, tx("sub.f.s1")), copyPassphrase.root]);
   const gDyn = h("div", {});
   steps.g.body.appendChild(gDyn);
 
@@ -1117,7 +1320,8 @@ function chatgptGuide() {
   const root = h(
     "div",
     { class: "component" },
-    h("p", { class: "muted" }, tx("conn.tunnelExplain")),
+    h("p", { class: "muted" }, tx("conn.explain")),
+    more("conn", "conn.more"),
     head,
     h(
       "ol",
@@ -1145,11 +1349,17 @@ function chatgptGuide() {
       }
       const toolMissing = chatgpt !== null && chatgpt.tool?.installed !== true && state !== "external";
       for (const id of ["b", "c", "d", "e", "f", "g"]) steps[id].li.hidden = toolMissing;
+      copyPassphrase.update(subs.some((s) => s.id === "f" && s.state === "current"));
 
       renderIf(head, [chatgpt], () => {
         if (!chatgpt) return [h("p", { class: "muted" }, tx("step.why.no_data"))];
         return [
-          h("p", {}, tx("conn.state", { state: lb("chatgptState", state) })),
+          h(
+            "p",
+            { class: "status-row" },
+            h("span", { class: "muted" }, `${tx("conn.stateLabel")}: `),
+            badge(chatgptTone(state), lb("chatgptState", state)),
+          ),
           state === "external" ? h("p", { class: "callout" }, tx("conn.external")) : null,
           detailList("chatgpt-details", [
             [tx("conn.details.tunnel"), chatgpt.tunnelId],
@@ -1169,6 +1379,7 @@ function chatgptGuide() {
           return [h("p", { class: "good" }, tx("sub.a.installed", { version: chatgpt.tool.version ?? "?" }))];
         return [
           h("p", { class: "warn" }, tx("sub.a.missing")),
+          h("p", { class: "muted small" }, tx("sub.a.never")),
           h("p", {}, link(LINKS.installGuide, tx("sub.a.link"))),
           h("p", {}, tx("sub.a.brew")),
           codeLine(COMMANDS.installTunnelClient),
@@ -1184,8 +1395,9 @@ function chatgptGuide() {
         return [
           h(
             "p",
-            { class: state === "ready" ? "good" : state === "failed" ? "warn" : "" },
-            tx("conn.state", { state: lb("chatgptState", state) }),
+            { class: "status-row" },
+            h("span", { class: "muted" }, `${tx("conn.stateLabel")}: `),
+            badge(chatgptTone(state), lb("chatgptState", state)),
           ),
           state === "failed"
             ? h(
@@ -1261,14 +1473,15 @@ function buildShell() {
   ui = {
     passphrase: passphraseForm(),
     runtime: runtimeForm(),
+    captcha: captchaForm(),
     account: accountForm(),
     addSite: addSiteForm(),
     helper: helperBox(),
     guide: chatgptGuide(),
     statusLine: h("div", { class: "status-line", role: "status" }),
     banner: h("div", { class: "banner", hidden: true }),
+    nextBox: h("div", { class: "next", "aria-live": "polite" }),
     steps: {},
-    startIntro: h("div", {}),
     sitesList: h("div", { class: "cards" }),
     jobsList: h("div", { class: "jobs" }),
     logTitle: h("strong", {}, tx("jobs.logNone")),
@@ -1294,15 +1507,16 @@ function buildShell() {
     ui.logBox,
   );
 
-  // Getting started: five steps, each a disclosure with a live state.
+  // Getting started: five steps, each a disclosure with a live state; the first one not done is open.
+  // Each shows a short explanation, the longer background behind "More", then its live part.
   const stepDefs = [
-    ["passphrase", "step1.title", "step1.explain"],
-    ["aside", "step2.title", "step2.explain"],
-    ["chatgpt", "step3.title", "step3.explain"],
-    ["helper", "step4.title", "step4.explain"],
-    ["sites", "step5.title", "step5.explain"],
+    ["passphrase", tx("step1.title"), tx("step1.explain"), more("step1", "step1.more")],
+    ["aside", tx("step2.title"), tx("step2.explain"), null],
+    ["chatgpt", tx("step3.title"), tx("step3.explain"), null],
+    ["helper", tx("step4.title"), tx("step4.explain"), more("step4", "step4.more")],
+    ["sites", tx("step5.title"), tx("step5.explain"), null],
   ];
-  const stepNodes = stepDefs.map(([id, title, explain], index) => {
+  const stepNodes = stepDefs.map(([id, title, explain, background], index) => {
     const state = h("span", { class: "step-state" });
     const dyn = h("div", { class: "stack" });
     const slot = h("div", { class: "slot" });
@@ -1313,10 +1527,10 @@ function buildShell() {
         "summary",
         {},
         h("span", { class: "step-num" }, String(index + 1)),
-        h("span", { class: "step-title" }, tx(title)),
+        h("span", { class: "step-title" }, title),
         state,
       ),
-      h("div", { class: "step-body" }, h("p", {}, tx(explain)), dyn, slot),
+      h("div", { class: "step-body" }, h("p", {}, explain), background, dyn, slot),
     );
     ui.steps[id] = { node, state, dyn, slot };
     return node;
@@ -1350,18 +1564,19 @@ function buildShell() {
   );
 
   const sections = {
+    // The home: what to do next comes first, then the five steps.
     start: h(
       "section",
       { id: "area-start", class: "area" },
-      h("h2", {}, tx("start.title")),
+      ui.nextBox,
       h("p", { class: "muted" }, tx("start.intro")),
-      ui.startIntro,
       h("div", { class: "steps" }, stepNodes),
     ),
     sites: h(
       "section",
       { id: "area-sites", class: "area" },
       h("h2", {}, tx("sites.title")),
+      h("p", { class: "muted" }, tx("sites.explain")),
       ui.slots.sitesAdd,
       h("h3", {}, tx("sites.listTitle")),
       ui.sitesList,
@@ -1376,8 +1591,7 @@ function buildShell() {
       h("h3", {}, tx("apps.title")),
       h("p", { class: "muted small" }, tx("apps.explain")),
       ui.appsList,
-      h("h3", {}, tx("conn.address")),
-      ui.addressBox,
+      disclosure("address", tx("conn.address"), ui.addressBox),
     ),
     settings: h(
       "section",
@@ -1389,11 +1603,14 @@ function buildShell() {
       h("h3", {}, tx("rt.title")),
       ui.runtime.root,
       ui.slots.settingsHelper,
+      h("h3", {}, tx("cap.title")),
+      ui.captcha.root,
       h("h3", {}, tx("lang.title")),
       h(
         "div",
         { class: "component" },
         h("p", { class: "muted" }, tx("lang.explain")),
+        h("label", { for: "lang-settings", class: "visually-hidden" }, tx("lang.title")),
         langSelect("lang-settings"),
       ),
       disclosure(
@@ -1431,6 +1648,7 @@ function buildShell() {
         ),
       ),
       h("p", { class: "muted intro" }, tx("app.intro")),
+      more("app", "app.more"),
       ui.statusLine,
       ui.banner,
       h("div", { id: "notice", class: "notice", hidden: true }),
@@ -1609,6 +1827,93 @@ function stepWhy(step) {
   return step.why ? h("p", { class: "muted" }, tx(`step.why.${step.why}`)) : null;
 }
 
+/** Opens a Getting started step and brings `selector` inside it (or the step) into view. */
+function goToStep(id, selector) {
+  const view = ui.steps[id];
+  if (!view) return;
+  view.node.open = true;
+  const target = (selector && view.node.querySelector(selector)) || view.node;
+  target.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+const reutersSite = () =>
+  Array.isArray(data.sites) ? data.sites.find((s) => s.key === "reuters") : undefined;
+
+/** The one action of the "what to do next" line, as the page's prominent button. */
+function nextAction(next) {
+  switch (next.action) {
+    case "passphrase":
+      return button(
+        tx("next.passphraseAction"),
+        () => {
+          goToStep("passphrase", "form");
+          ui.passphrase.focus();
+        },
+        "primary",
+      );
+    case "checkBrowser":
+      return button(
+        tx("common.checkAgain"),
+        () => {
+          goToStep("aside");
+          return loadBrowser();
+        },
+        "primary",
+      );
+    case "showChatgpt":
+      return button(tx("next.chatgptAction"), () => goToStep("chatgpt", ".substep-current"), "primary");
+    case "checkHelper":
+      return button(
+        tx("next.helperAction"),
+        () => {
+          goToStep("helper");
+          return ui.helper.check();
+        },
+        "primary",
+      );
+    case "checkReuters":
+      return button(
+        tx("next.sitesAction"),
+        () => {
+          const reuters = reutersSite();
+          return reuters ? checkNow(reuters) : undefined;
+        },
+        "primary",
+      );
+    case "openSites":
+      return button(
+        tx("next.openSites"),
+        () => {
+          window.location.hash = "#sites";
+        },
+        "primary",
+      );
+    case "reload":
+      return button(tx("common.checkAgain"), () => loadAll(), "primary");
+    default:
+      return null;
+  }
+}
+
+function renderNext(steps) {
+  const next = nextStep(steps, data);
+  const part = chatgptSubsteps(data.chatgpt).find((s) => s.state === "current")?.id ?? "";
+  renderIf(ui.nextBox, [loadedOnce, next, part], () => {
+    if (!loadedOnce) return [h("p", { class: "muted" }, tx("app.loading"))];
+    if (next.id === null) return [h("p", { class: "next-text good" }, tx("start.allDone"))];
+    return [
+      h(
+        "p",
+        { class: "next-text" },
+        h("strong", { class: "next-label" }, `${tx("next.label")}: `),
+        tx(next.say, { part }),
+      ),
+      nextAction(next),
+    ];
+  });
+  ui.nextBox.classList.toggle("is-done", loadedOnce && next.id === null);
+}
+
 function renderStart() {
   const steps = gettingStarted(data);
   const first = firstOpenStep(steps);
@@ -1616,9 +1921,7 @@ function renderStart() {
     lastFirstOpen = first;
     for (const s of steps) ui.steps[s.id].node.open = s.id === first;
   }
-  renderIf(ui.startIntro, [first === null && loadedOnce], () =>
-    first === null && loadedOnce ? [h("p", { class: "callout good" }, tx("start.allDone"))] : [],
-  );
+  renderNext(steps);
   for (const step of steps) {
     const view = ui.steps[step.id];
     view.state.replaceChildren(badge(step.state, tx(`step.${step.state}`)));
@@ -1667,8 +1970,8 @@ function renderStart() {
   renderIf(ui.steps.helper.dyn, [byId.helper], () => [stepWhy(byId.helper)]);
 
   const sitesStep = byId.sites;
-  const reuters = Array.isArray(data.sites) ? data.sites.find((s) => s.key === "reuters") : null;
-  renderIf(ui.steps.sites.dyn, [sitesStep, reuters], () => {
+  const reuters = reutersSite() ?? null;
+  renderIf(ui.steps.sites.dyn, [sitesStep, reuters, data.jobs], () => {
     if (sitesStep.why && sitesStep.why !== "no_data") return [stepWhy(sitesStep)];
     if (!Array.isArray(data.sites)) return [stepWhy(sitesStep)];
     return [
@@ -1688,13 +1991,20 @@ function renderStart() {
   ui.addSite.update();
 }
 
+/** Badge colour of a site status. */
+function siteTone(status) {
+  if (status === "active") return "done";
+  if (status === "failed") return "bad";
+  if (status === "onboarding") return "unknown";
+  return "todo";
+}
+
 function siteCard(site, compact) {
   const guide = siteGuidance(site);
   const name = site.name || site.key;
   const status = site.checking
     ? `${lb("siteStatus", site.status)} · ${tx("site.checking")}`
     : lb("siteStatus", site.status);
-  const tone = site.status === "active" ? "done" : site.status === "failed" ? "bad" : "todo";
   const say =
     guide.say === "site.do.login"
       ? h("p", { class: "todo-line" }, rich("site.do.login", { url: link(site.loginUrl) }))
@@ -1714,13 +2024,15 @@ function siteCard(site, compact) {
   if (site.job && !compact)
     others.push(button(tx("action.showLog"), () => openLogFromAnywhere(site.job.id), "secondary"));
   const job = site.job;
+  const loginHelp = offersLoginHelp(site) ? loginHelper(`login:${site.key}`, siteLoginTarget(site)) : null;
   return h(
     "article",
     { class: "card" },
-    h("div", { class: "card-head" }, h("strong", {}, name), badge(tone, status)),
+    h("div", { class: "card-head" }, h("strong", {}, name), badge(siteTone(site.status), status)),
     say,
     requested,
     h("div", { class: "row actions" }, primary, others),
+    loginHelp,
     detailList(`site:${site.key}`, [
       [tx("site.d.key"), site.key],
       [tx("site.d.addresses"), (site.hostnames ?? []).join(", ")],
@@ -1738,8 +2050,9 @@ function siteCard(site, compact) {
         tx("site.d.job"),
         job ? `${lb("jobKind", job.kind)} · ${lb("jobState", job.state)} · ${job.id}` : null,
       ],
+      [tx("job.d.blockKind"), job?.state === "awaiting_user" ? lb("blockKind", blockKind(job)) : null],
       [tx("conn.details.message"), job?.lastFailure ?? job?.reason ?? null],
-      [tx("site.d.runtime"), job?.runtime],
+      [tx("site.d.runtime"), job?.runtime ? lb("helperRuntime", job.runtime) : null],
       [tx("site.d.cache"), site.cache ? `${site.cache.entries} · ${formatBytes(site.cache.bytes)}` : null],
     ]),
   );
@@ -1766,7 +2079,7 @@ function renderSites() {
     if (data.sites.length === 0) return [h("p", { class: "muted" }, tx("sites.empty"))];
     return data.sites.map((s) => siteCard(s, false));
   });
-  renderIf(ui.jobsList, [data.jobs], () => {
+  renderIf(ui.jobsList, [data.jobs, data.sites], () => {
     if (!Array.isArray(data.jobs)) return [];
     if (data.jobs.length === 0) return [h("p", { class: "muted" }, tx("jobs.empty"))];
     return data.jobs.map((job) => {
@@ -1802,10 +2115,12 @@ function renderSites() {
             )
           : null,
         h("div", { class: "row actions" }, buttons),
+        jobPausedForLogin(job) ? loginHelper(`login-job:${job.id}`, jobLoginTarget(job)) : null,
         detailList(`job:${job.id}`, [
           [tx("job.d.id"), job.id],
+          [tx("job.d.blockKind"), job.state === "awaiting_user" ? lb("blockKind", blockKind(job)) : null],
           [tx("conn.details.message"), job.lastFailure ?? job.reason],
-          [tx("site.d.runtime"), job.runtime],
+          [tx("site.d.runtime"), job.runtime ? lb("helperRuntime", job.runtime) : null],
           [tx("job.d.attempts"), job.attempts],
           [tx("job.d.commit"), job.commit],
           [tx("job.d.lang"), job.lang],
@@ -1871,6 +2186,7 @@ function renderConnection() {
 
 function renderSettings() {
   ui.runtime.update(data.settings);
+  ui.captcha.update(data.settings);
   ui.account.update(data.settings);
   renderIf(ui.cacheBox, [data.cache, data.status?.mode], () => {
     if (!coreRunning() || !data.cache) return [h("p", { class: "muted" }, tx("cache.off"))];
@@ -1938,13 +2254,10 @@ async function start() {
   showTab(currentTab());
   await loadAll();
   loadedOnce = true;
-  if (!TABS.includes(window.location.hash.replace(/^#/, ""))) {
-    chosenTab = firstOpenStep(gettingStarted(data)) === null ? "sites" : "start";
-    showTab(chosenTab);
-  }
+  // Getting started is the home: without a tab in the address, the page stays there.
   render();
   setInterval(() => {
-    if (!restartWaiter && !signedOut) void refresh();
+    if (!restartWaiter && !signedOut) void poll();
   }, POLL_MS);
   setInterval(() => {
     if (!restartWaiter && !signedOut && coreRunning()) void loadBrowser();
