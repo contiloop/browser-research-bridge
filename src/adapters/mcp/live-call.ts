@@ -2,17 +2,23 @@
  * One live adapter call: load the site's adapter, run the call in the site's shared pool within the
  * remaining tool-call budget, map anything thrown to a failure outcome, and feed the outcome back
  * into the site lifecycle. After a blocked outcome (a block or captcha page), `callWithChallenge`
- * runs one challenge attempt and re-runs the call once (see ./challenge.ts). Each call also reports
- * the page the adapter's browser session last showed (`pageUrl`), where an attempt after a blocked
- * search is aimed.
+ * runs one quick challenge attempt and, unless the check is captcha-limited, re-runs the call once
+ * (see ./challenge.ts). Each call also reports the page the adapter's browser session last showed
+ * (`pageUrl`), where an attempt after a blocked search is aimed.
  */
 import type { Outcome } from "../../core/models.js";
-import { OutcomeError, errorToOutcome, isFailureStatus, withOutcomeDefaults } from "../../core/outcome.js";
+import {
+  OutcomeError,
+  errorToOutcome,
+  isBlockedError,
+  isFailureStatus,
+  withOutcomeDefaults,
+} from "../../core/outcome.js";
 import type { AdapterContext } from "../../ports/adapter.js";
 import type { LoadedSiteAdapter } from "../../ports/registry.js";
 import type { Clock } from "../../ports/clock.js";
 import type { Logger } from "../../ports/logger.js";
-import { canRerun, planChallenge } from "./challenge.js";
+import { canRerun, captchaUnsolvedAction, planChallenge } from "./challenge.js";
 import type { ChallengeGate } from "./challenge.js";
 import type { SiteTaskRunner, ToolRegistry } from "./deps.js";
 import { errorMessage } from "./deps.js";
@@ -28,11 +34,13 @@ export interface LiveCallContext {
 
 /**
  * One adapter call's result. `pageUrl`: the on-site page the adapter's browser session last showed
- * (`BrowserSession.lastUrl()`, read before the session is disposed), null when it loaded none.
+ * (`BrowserSession.lastUrl()`, read before the session is disposed), null when it loaded none. A
+ * failure's `blocked` comes from the thrown error (`isBlockedError`, e.g. a page script that ran into
+ * a bot check) and is read like an adapter's returned `blocked`.
  */
 export type LiveCallResult<T> =
   | { ok: true; value: T; loaded: LoadedSiteAdapter; pageUrl: string | null }
-  | { ok: false; outcome: Outcome; pageUrl: string | null };
+  | { ok: false; outcome: Outcome; blocked: boolean; pageUrl: string | null };
 
 function sessionPage(ctx: AdapterContext): string | null {
   try {
@@ -70,7 +78,7 @@ export async function callSiteAdapter<T>(
     );
     return { ok: true, value, loaded, pageUrl };
   } catch (error) {
-    return { ok: false, outcome: errorToOutcome(error), pageUrl };
+    return { ok: false, outcome: errorToOutcome(error), blocked: isBlockedError(error), pageUrl };
   }
 }
 
@@ -109,6 +117,11 @@ export interface SettledCall<R> {
   blocked: boolean;
   value: R;
   pageUrl: string | null;
+  /**
+   * Set by `callWithChallenge` on a captcha-limited answer, whose message names the page URL: logs
+   * must not carry that message.
+   */
+  captchaLimited?: true | undefined;
 }
 
 export interface ChallengeFlowOptions {
@@ -145,15 +158,32 @@ function withAction<R>(call: SettledCall<R>, action: string): SettledCall<R> {
 }
 
 /**
+ * A captcha-limited answer: the original failure as `access_denied` (never `ok` or `empty`), still
+ * `blocked`, with the captcha-limited sentence as both message and action.
+ */
+function captchaLimited<R>(call: SettledCall<R>, sentence: string): SettledCall<R> {
+  return {
+    ...call,
+    blocked: true,
+    captchaLimited: true,
+    outcome: { status: "access_denied", message: sentence, action: sentence },
+  };
+}
+
+/**
  * Runs the adapter call (`run`) and records its outcome. When it is blocked and attempts are on:
- * with at least `captchaInlineMinRemainingMs` of the call left, one attempt (joining the site's running
- * one) within `min(captchaAttemptBudgetMs, remaining − captchaRerunReserveMs)`, then one re-run while
- * the reserve is left; otherwise the failure at once and an attempt in the background.
+ * with at least `captchaDetectBudgetMs + captchaRerunReserveMs` of the call left, one quick attempt
+ * (joining the site's running one) within `min(captchaAttemptBudgetMs, remaining −
+ * captchaRerunReserveMs)`; otherwise the failure at once with the captcha action and an attempt in the
+ * background.
  *
- * Returns the re-run when it is `ok`/`empty` (the only confirmation of a solved challenge) or another
- * truthful non-blocked verdict; a re-run that is still blocked, or an attempt that could not run,
- * returns the original failure with the captcha action. A challenge met in the re-run is not attempted
- * again. Never throws unless `run` does.
+ * After the attempt: captcha-limited (nothing acted on: `unknown` with no round, detection not done
+ * within the detection budget, no solver) → the failure at once as `access_denied` with the
+ * captcha-limited sentence, no re-run. Otherwise one re-run while the reserve is left; the re-run is
+ * returned when it is `ok`/`empty` (the only confirmation of a solved challenge) or another truthful
+ * non-blocked verdict; a re-run that is still blocked, or an attempt that could not run, returns the
+ * original failure with the captcha action. A challenge met in the re-run is not attempted again.
+ * Nothing is remembered per site between calls. Never throws unless `run` does.
  */
 export async function callWithChallenge<R>(
   deps: LiveCallContext,
@@ -175,7 +205,7 @@ export async function callWithChallenge<R>(
     if (hadAttempt) return first;
     const started = gate.background(key, target);
     deps.logger.info("captcha deferred to the background", { site: key, tool: holder, started });
-    return first;
+    return withAction(first, captchaUnsolvedAction(gate.challengeUrl(key, target)));
   }
   const attemptOptions = { budgetMs: plan.budgetMs, signal: options.signal };
   const pending = hadAttempt
@@ -183,6 +213,16 @@ export async function callWithChallenge<R>(
     : gate.attempt(key, target, attemptOptions);
   if (pending === null) return first;
   const report = await pending;
+  if (report.limited) {
+    // Nothing the solver can do here: answer now, no re-run, no background attempt.
+    deps.logger.info("captcha-limited", {
+      site: key,
+      tool: holder,
+      attempt: report.result,
+      kind: report.kind,
+    });
+    return captchaLimited(first, report.action);
+  }
   const unsolved = withAction(first, report.action);
   if (!report.ran) return unsolved;
   if (!canRerun(gate.settings, options.deadline - deps.clock.now().getTime())) {

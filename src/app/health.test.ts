@@ -1,8 +1,23 @@
-import { mkdir } from "node:fs/promises";
+import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { makeTempDir, silentLogger, writeAdapterFolder } from "../../test/support/site-fixtures.js";
+import {
+  challengeAttempt,
+  fakeBrowser,
+  makeTempDir,
+  silentLogger,
+  writeAdapterFolder,
+} from "../../test/support/site-fixtures.js";
+import type { FakeBrowser } from "../../test/support/site-fixtures.js";
+import { createAdapterHelpers } from "../adapter-kit/helpers.js";
 import { InMemoryScheduler } from "../adapters/aside/scheduler.js";
+import {
+  ChallengeCoordinator,
+  DEFAULT_CHALLENGE_SETTINGS,
+  captchaLimitedAction,
+} from "../adapters/mcp/challenge.js";
+import { lightCheck } from "../adapters/validation/index.js";
+import { SiteValidator } from "../adapters/validation/validator.js";
 import { ModuleAdapterLoader } from "../adapters/registry/loader.js";
 import { SiteRegistryService } from "../adapters/registry/registry.js";
 import { FileCache } from "../adapters/storage/cache-store.js";
@@ -10,10 +25,11 @@ import { FileSiteStateStore } from "../adapters/storage/site-state-store.js";
 import type { Outcome } from "../core/models.js";
 import { OutcomeError } from "../core/outcome.js";
 import { HealthChecker } from "./health.js";
-import type { HealthCheckOutcome } from "./health.js";
+import type { HealthChallenges, HealthCheckOutcome } from "./health.js";
 
 describe("HealthChecker", () => {
   let tmp: { dir: string; cleanup: () => Promise<void> };
+  let sitesDir: string;
   let registry: SiteRegistryService;
   let scheduler: InMemoryScheduler;
   let cache: FileCache;
@@ -38,7 +54,7 @@ describe("HealthChecker", () => {
 
   beforeEach(async () => {
     tmp = await makeTempDir();
-    const sitesDir = join(tmp.dir, "sites");
+    sitesDir = join(tmp.dir, "sites");
     await mkdir(sitesDir, { recursive: true });
     await writeAdapterFolder(join(sitesDir, "alpha"), "alpha");
     await writeAdapterFolder(join(sitesDir, "beta"), "beta");
@@ -173,9 +189,12 @@ describe("HealthChecker", () => {
     const BLOCKED = { status: "access_denied", message: "captcha page", blocked: { url: null } } as const;
     const ACTION =
       "The captcha could not be solved automatically. Open https://alpha.example.com/ in Aside, solve it, then retry";
+    const LIMITED = captchaLimitedAction("alpha", "https://alpha.example.com/");
     let attempts: { key: string; url: string | null }[];
     let checks: HealthCheckOutcome[];
     let ran: boolean;
+    let limited: boolean;
+    let result: string | undefined;
     let solverMessage: string | undefined;
     let order: string[];
 
@@ -199,9 +218,10 @@ describe("HealthChecker", () => {
             attempts.push({ key, url });
             return {
               ran,
-              result: ran ? "unsolved" : "unavailable",
+              limited,
+              result: result ?? "unsolved",
               url: url ?? "https://alpha.example.com/",
-              action: ACTION,
+              action: limited ? LIMITED : ACTION,
               ...(solverMessage !== undefined ? { message: solverMessage } : {}),
             };
           },
@@ -212,6 +232,8 @@ describe("HealthChecker", () => {
       attempts = [];
       checks = [];
       ran = true;
+      limited = false;
+      result = undefined;
       solverMessage = undefined;
       order = [];
     });
@@ -244,20 +266,97 @@ describe("HealthChecker", () => {
       expect(registry.get("alpha")).toMatchObject({ status: "degraded", lastFailure: message });
 
       ran = false;
-      solverMessage = "captcha solving is not available in this Aside version";
+      result = "unsolved";
+      solverMessage = "the captcha attempt ran out of time";
       checks = [{ ...BLOCKED }];
       const r2 = await withChallenges().runNow("alpha");
-      expect(r2.outcome?.message).toBe(
-        "captcha page (captcha attempt: captcha solving is not available in this Aside version)",
-      );
+      expect(r2.outcome?.message).toBe("captcha page (captcha attempt: the captcha attempt ran out of time)");
     });
 
-    it("an attempt that could not run (no capability) keeps the first result, with the captcha action", async () => {
+    it("an attempt that could not run (refused, browser unavailable) keeps the first result, with the captcha action", async () => {
       ran = false;
       checks = [{ ...BLOCKED }];
       const r = await withChallenges().runNow("alpha");
       expect(order).toEqual(["check", "attempt"]);
       expect(r.outcome).toEqual({ status: "access_denied", message: "captcha page", action: ACTION });
+    });
+
+    it("captcha-limited (nothing to act on, or no capability): the second check is skipped; the first result stands with the captcha-limited message", async () => {
+      ran = false;
+      limited = true;
+      solverMessage = "the page shows a challenge the solver cannot handle (datadome-challenge)";
+      checks = [{ ...BLOCKED }, { status: "ok" }];
+      const r = await withChallenges().runNow("alpha");
+      expect(order).toEqual(["check", "attempt"]);
+      expect(r.outcome).toEqual({ status: "access_denied", message: LIMITED, action: LIMITED });
+      expect(registry.get("alpha")).toMatchObject({ status: "degraded", lastFailure: LIMITED });
+      expect(scheduler.cooldownUntil("alpha")).toBeNull();
+
+      // The same for an unavailable solver.
+      order = [];
+      result = "unavailable";
+      solverMessage = "captcha solving is not available in this Aside version";
+      checks = [{ ...BLOCKED, message: "first" }, { status: "ok" }];
+      const r2 = await withChallenges().runNow("alpha");
+      expect(order).toEqual(["check", "attempt"]);
+      expect(r2.outcome).toEqual({ status: "access_denied", message: LIMITED, action: LIMITED });
+    });
+
+    it("a limited report never re-checks, even if it also says ran", async () => {
+      ran = true;
+      limited = true;
+      checks = [{ ...BLOCKED }, { status: "ok" }];
+      const r = await withChallenges().runNow("alpha");
+      expect(order).toEqual(["check", "attempt"]);
+      expect(r.outcome).toEqual({ status: "access_denied", message: LIMITED, action: LIMITED });
+    });
+
+    it("with the real coordinator: light check → quick attempt → light check again only when the attempt acted or found none", async () => {
+      const run = async (attempt: ReturnType<typeof challengeAttempt>) => {
+        const browser = fakeBrowser({ solveChallenge: async () => attempt });
+        const coordinator = new ChallengeCoordinator({
+          settings: DEFAULT_CHALLENGE_SETTINGS,
+          browser,
+          scheduler,
+          registry,
+          logger: silentLogger,
+        });
+        order = [];
+        checks = [{ ...BLOCKED }, { status: "ok" }];
+        const h = new HealthChecker({
+          registry,
+          scheduler,
+          intervalMs: 86_400_000,
+          clock: { now: () => new Date(nowMs) },
+          logger: silentLogger,
+          check: async () => {
+            order.push("check");
+            return checks.shift() ?? { status: "ok" };
+          },
+          challenges: coordinator,
+        });
+        const r = await h.runNow("alpha");
+        await coordinator.settled();
+        return { r, browser };
+      };
+      // Captcha-limited: no second check; the first result stands with the sentence.
+      const limitedRun = await run(challengeAttempt({ solved: false, kind: "unknown", rounds: 0 }));
+      expect(order).toEqual(["check"]);
+      expect(limitedRun.browser.challenges).toHaveLength(1);
+      expect(limitedRun.browser.challenges[0]?.detectBudgetMs).toBe(
+        DEFAULT_CHALLENGE_SETTINGS.detectBudgetMs,
+      );
+      expect(limitedRun.r.outcome).toEqual({ status: "access_denied", message: LIMITED, action: LIMITED });
+      // The reload alone cleared it (none), or the solver acted: the light check runs again.
+      for (const attempt of [
+        challengeAttempt({ solved: false, kind: "none", rounds: 0 }),
+        challengeAttempt(),
+        challengeAttempt({ solved: false, kind: "unknown", rounds: 1 }),
+      ]) {
+        const again = await run(attempt);
+        expect(order).toEqual(["check", "check"]);
+        expect(again.r).toMatchObject({ outcome: { status: "ok" }, status: "active" });
+      }
     });
 
     it("scheduled checks never attempt", async () => {
@@ -281,6 +380,110 @@ describe("HealthChecker", () => {
       checks = [{ status: "auth_required", message: "login wall" }];
       await withChallenges().runNow("alpha");
       expect(order).toEqual(["check"]);
+    });
+
+    it("a check that throws a blocked failure counts as a block page with no known URL", async () => {
+      const h = new HealthChecker({
+        registry,
+        scheduler,
+        intervalMs: 86_400_000,
+        logger: silentLogger,
+        check: async () => {
+          throw new OutcomeError("access_denied", "bot check", undefined, { blocked: true });
+        },
+        challenges: {
+          enabled: true,
+          attempt: async (key, url) => {
+            attempts.push({ key, url });
+            return { ran: false, action: ACTION };
+          },
+        },
+      });
+      const r = await h.runNow("alpha");
+      expect(attempts).toEqual([{ key: "alpha", url: null }]);
+      expect(r.outcome).toEqual({ status: "access_denied", message: "bot check", action: ACTION });
+    });
+  });
+
+  describe("a bot check met by a page script (light check through the validator)", () => {
+    const BOT = "alpha answered with a bot check (geo.captcha-delivery.com)";
+    const SEARCH_PAGE = "https://alpha.example.com/search?q=sample";
+    const ACTION = `The captcha could not be solved automatically. Open ${SEARCH_PAGE} in Aside, solve it, then retry`;
+    let browser: FakeBrowser;
+    let attempts: { key: string; url: string | null }[];
+
+    /** alpha's search runs a page script and lets the port's failure through, as a real adapter does. */
+    const scriptingAdapter = `export default {
+  async search(_req: unknown, ctx: { browser: { runScript(s: string): Promise<unknown> } }) {
+    await ctx.browser.runScript("return 1;");
+    return { results: [{ title: "Story 1", url: "https://alpha.example.com/s/1", publishedAt: null, datePrecision: null, excerpt: null, author: null }], nextCursor: null, status: "ok" };
+  },
+  async read(ref: { url?: string }) {
+    return { status: "ok", document: { title: "Story", url: ref.url ?? "", publishedAt: null, datePrecision: null, author: null, text: "A full paragraph of article text. ".repeat(20), accessLevel: "public", metadata: {} } };
+  },
+  async smokeTest() { return { status: "ok" }; },
+};
+`;
+
+    /** "Check now" attempts: recorded; `clears` makes the attempt remove the bot check. */
+    const attempting = (clears: boolean): HealthChallenges => ({
+      enabled: true,
+      attempt: async (key, url) => {
+        attempts.push({ key, url });
+        if (clears) browser.scriptErrors.delete("alpha");
+        return { ran: true, result: clears ? "solved" : "unsolved", action: ACTION };
+      },
+    });
+
+    const botChecker = (challenges: HealthChallenges) =>
+      new HealthChecker({
+        registry,
+        scheduler,
+        intervalMs: 86_400_000,
+        clock: { now: () => new Date(nowMs) },
+        logger: silentLogger,
+        check: lightCheck(
+          new SiteValidator({
+            sitesDir,
+            repoRoot: process.cwd(),
+            loader: new ModuleAdapterLoader({ repoRoot: process.cwd(), preferCompiled: false }),
+            runtime: { browser, scheduler, helpers: createAdapterHelpers(), logger: silentLogger },
+            logger: silentLogger,
+          }),
+        ),
+        challenges,
+      });
+
+    beforeEach(async () => {
+      await writeFile(join(sitesDir, "alpha", "adapter.ts"), scriptingAdapter);
+      browser = fakeBrowser();
+      browser.scriptErrors.set("alpha", new OutcomeError("access_denied", BOT, undefined, { blocked: true }));
+      browser.lastUrls.set("alpha", SEARCH_PAGE);
+      attempts = [];
+    });
+
+    it("Check now: the bot check gets one attempt on the page last shown, then the check once more", async () => {
+      const r = await botChecker(attempting(true)).runNow("alpha");
+      expect(attempts).toEqual([{ key: "alpha", url: SEARCH_PAGE }]);
+      expect(r).toEqual({ site: "alpha", ran: true, outcome: { status: "ok" }, status: "active" });
+    });
+
+    it("Check now still blocked: the bot-check failure with the captcha action; no cool-down", async () => {
+      const r = await botChecker(attempting(false)).runNow("alpha");
+      expect(attempts).toEqual([{ key: "alpha", url: SEARCH_PAGE }]);
+      expect(r.outcome).toEqual({ status: "access_denied", message: `search: ${BOT}`, action: ACTION });
+      expect(registry.get("alpha")).toMatchObject({ status: "degraded", lastFailure: `search: ${BOT}` });
+      expect(scheduler.cooldownUntil("alpha")).toBeNull();
+    });
+
+    it("scheduled check: reports the bot-check message like any blocked page, with no attempt", async () => {
+      const pass = await botChecker(attempting(true)).runDue();
+      expect(attempts).toEqual([]);
+      expect(pass.find((x) => x.site === "alpha")?.outcome).toEqual({
+        status: "access_denied",
+        message: `search: ${BOT}`,
+      });
+      expect(registry.get("alpha")).toMatchObject({ status: "degraded", lastFailure: `search: ${BOT}` });
     });
   });
 });

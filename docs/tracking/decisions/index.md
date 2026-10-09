@@ -15,5 +15,6 @@
 | 0011 | [Setup-only mode and in-process core restart instead of refusing to start](0011-setup-only-mode-and-in-process-restart.md)    | accepted                                         |
 | 0012 | [Site-add helper on Claude or Codex, on the user's subscription](0012-helper-on-claude-or-codex-subscriptions.md)             | accepted                                         |
 | 0013 | [Reuters as the reference adapter; Hacker News removed; the Naver adapter kept private](0013-reuters-as-reference-adapter.md) | accepted                                         |
-| 0014 | [Automatic captcha attempts with a fixed vendor-host list](0014-captcha-attempts-and-vendor-hosts.md)                         | accepted                                         |
+| 0014 | [Automatic captcha attempts with a fixed vendor-host list](0014-captcha-attempts-and-vendor-hosts.md)                         | accepted; superseded in part by 0016 (budget)    |
 | 0015 | [A per-site browser pool, and no cool-down after a block page](0015-per-site-pool-and-no-block-cooldown.md)                   | accepted; supersedes 0010 in part                |
+| 0016 | [One quick captcha attempt per blocked call; "captcha-limited"](0016-quick-captcha-attempt-and-captcha-limited.md)            | accepted; supersedes 0014 in part                |

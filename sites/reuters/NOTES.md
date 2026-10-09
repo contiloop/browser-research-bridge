@@ -111,3 +111,7 @@ login in Aside (account u0) for paid articles.
 ## 2026-10-09 — video embeds
 
 Articles with an embedded video load their player from `cd.elements.video`. Without that host in `extraAllowedHosts` the tab filter blocked the request and, because it fired while the adapter's page script ran, the read ended `adapter_error`. `elements.video` (subdomains included) is now allowed; the adapter does not read the video.
+
+## 2026-10-09 — a bot check is not a lapsed login
+
+While the DataDome check holds the page (or its scripts are blocked), the search page and article pages render without the site header, so the signed-in account control is missing too. The adapter used to report that as `auth_required`, which turned the site `needs_login` although the login was fine (acceptance run 4). Now: no `SiteHeader` → `access_denied` with `blocked: true` ("answered with a bot check (the page did not render)"); `auth_required` only when the header rendered without the account control. Reuters is sensitive to parallel loads: the owner's install runs with `maxConcurrentPerSite: 2` and `concurrentStaggerMs: 1500`.

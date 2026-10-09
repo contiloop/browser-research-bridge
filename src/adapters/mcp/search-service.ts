@@ -393,7 +393,8 @@ export class SearchService {
         const outcome = finishOutcome(call.outcome, key, loginUrl);
         return {
           outcome,
-          blocked: false,
+          // A thrown failure may be a block page too (a page script that ran into a bot check).
+          blocked: call.blocked,
           value: { site: key, state, status: outcome.status, results: [], nextCursor: null },
           pageUrl: call.pageUrl,
         };
@@ -436,7 +437,9 @@ export class SearchService {
         site: key,
         status: outcome.status,
         blocked,
-        message: outcome.message?.slice(0, 200) ?? null,
+        // A captcha-limited message names the page URL (with its query): never logged.
+        message:
+          settled.captchaLimited === true ? "captcha-limited" : (outcome.message?.slice(0, 200) ?? null),
       });
     }
 

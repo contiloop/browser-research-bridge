@@ -17,6 +17,7 @@ import type { FakeBrowser } from "../../../test/support/site-fixtures.js";
 import { InMemoryScheduler } from "../aside/scheduler.js";
 import { ModuleAdapterLoader } from "../registry/loader.js";
 import type { AdapterHelpers } from "../../ports/adapter.js";
+import { OutcomeError } from "../../core/outcome.js";
 import { createAdapterHelpers } from "../../adapter-kit/helpers.js";
 import { readValidationReport } from "./report.js";
 import { lightCheck } from "./index.js";
@@ -57,6 +58,28 @@ function blockedAdapter(where: "read" | "search"): string {
     ${where === "search" ? `return { results: [], nextCursor: null, ...${blocked} };` : 'return { results: [{ title: "Story 1", url: "https://demo.example.com/s/1", publishedAt: null, datePrecision: null, excerpt: null, author: null }], nextCursor: null, status: "ok" };'}
   },
   async read() { return ${blocked}; },
+  async smokeTest() { return { status: "ok" }; },
+};
+`;
+}
+
+/**
+ * An adapter whose read (or search) runs a page script and lets its failure through, as the port
+ * throws it (the fake port throws what `scriptErrors` holds for the site).
+ */
+function scriptingAdapter(where: "read" | "search"): string {
+  const item =
+    '{ title: "Story 1", url: "https://demo.example.com/s/1", publishedAt: null, datePrecision: null, excerpt: null, author: null }';
+  const text = '"A full paragraph of article text. ".repeat(20)';
+  return `export default {
+  async search(_req: unknown, ctx: { browser: { runScript(s: string): Promise<unknown> } }) {
+    ${where === "search" ? 'await ctx.browser.runScript("return 1;");' : ""}
+    return { results: [${item}], nextCursor: null, status: "ok" };
+  },
+  async read(ref: { url?: string }, ctx: { browser: { runScript(s: string): Promise<unknown> } }) {
+    ${where === "read" ? 'await ctx.browser.runScript("return 1;");' : ""}
+    return { status: "ok", document: { title: "Story", url: ref.url ?? "", publishedAt: null, datePrecision: null, author: null, text: ${text}, accessLevel: "public", metadata: {} } };
+  },
   async smokeTest() { return { status: "ok" }; },
 };
 `;
@@ -235,6 +258,74 @@ describe("SiteValidator", () => {
     expect(await lightCheck(validator())("other", {})).toMatchObject({
       status: "access_denied",
       blocked: { url: null },
+    });
+  });
+
+  describe("a bot check thrown by a page-script step", () => {
+    const BOT = "demo answered with a bot check (geo.captcha-delivery.com)";
+    const botCheck = () => new OutcomeError("access_denied", BOT, undefined, { blocked: true });
+
+    it("light form reports the block of a thrown search failure on the page last shown", async () => {
+      await writeAdapterFolder(join(sitesDir, "demo"), "demo", {
+        manifest: manifestFor("demo", { hostnames: ["demo.example.com"] }),
+        adapter: scriptingAdapter("search"),
+      });
+      browser.scriptErrors.set("demo", botCheck());
+      browser.lastUrls.set("demo", "https://demo.example.com/search?q=sample");
+      const seen: { url: string | null }[] = [];
+      const report = await validator().light("demo", { onBlocked: (b) => seen.push(b) });
+      expect(report.failure).toMatchObject({
+        step: "search",
+        status: "access_denied",
+        message: `search: ${BOT}`,
+      });
+      expect(seen).toEqual([{ url: "https://demo.example.com/search?q=sample" }]);
+      expect(await lightCheck(validator())("demo", {})).toEqual({
+        status: "access_denied",
+        message: expect.stringContaining(BOT) as string,
+        blocked: { url: "https://demo.example.com/search?q=sample" },
+      });
+    });
+
+    it("light form reports the block of a thrown read failure on the read's URL", async () => {
+      await writeAdapterFolder(join(sitesDir, "demo"), "demo", {
+        manifest: manifestFor("demo", { hostnames: ["demo.example.com"] }),
+        adapter: scriptingAdapter("read"),
+      });
+      browser.scriptErrors.set("demo", botCheck());
+      expect(await lightCheck(validator())("demo", { ignoreCooldown: true })).toMatchObject({
+        status: "access_denied",
+        blocked: { url: "https://demo.example.com/s/1" },
+      });
+    });
+
+    it("a thrown failure that is not blocked reports no block", async () => {
+      await writeAdapterFolder(join(sitesDir, "demo"), "demo", {
+        manifest: manifestFor("demo", { hostnames: ["demo.example.com"] }),
+        adapter: scriptingAdapter("read"),
+      });
+      browser.scriptErrors.set("demo", new OutcomeError("adapter_error", "page script failed: boom"));
+      const outcome = await lightCheck(validator())("demo", {});
+      expect(outcome).toMatchObject({ status: "adapter_error" });
+      expect(outcome.blocked).toBeUndefined();
+    });
+
+    it("full validation reports the bot check as access_denied and attempts nothing", async () => {
+      browser = fakeBrowser({ solveChallenge: async () => challengeAttempt() });
+      browser.scriptErrors.set("demo", botCheck());
+      const staging = join(sitesDir, "demo", ".staging");
+      await writeAdapterFolder(staging, "demo", {
+        manifest: manifestFor("demo", { hostnames: ["demo.example.com"] }),
+        adapter: scriptingAdapter("read"),
+        validated: false,
+      });
+      const report = await validator().full("demo", { staging: true });
+      expect(report.failure).toMatchObject({
+        step: "read",
+        status: "access_denied",
+        message: `read: ${BOT}`,
+      });
+      expect(browser.challenges).toEqual([]);
     });
   });
 

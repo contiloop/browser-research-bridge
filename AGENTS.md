@@ -46,7 +46,8 @@ browser-research-bridge/
 │           ├── 0012-helper-on-claude-or-codex-subscriptions.md
 │           ├── 0013-reuters-as-reference-adapter.md
 │           ├── 0014-captcha-attempts-and-vendor-hosts.md
-│           └── 0015-per-site-pool-and-no-block-cooldown.md
+│           ├── 0015-per-site-pool-and-no-block-cooldown.md
+│           └── 0016-quick-captcha-attempt-and-captcha-limited.md
 ├── src/
 │   ├── core/
 │   │   └── AGENTS.md                ← pure domain logic: query, ids, cursor, merge, outcomes, lifecycle

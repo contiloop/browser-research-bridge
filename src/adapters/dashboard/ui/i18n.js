@@ -179,8 +179,11 @@ const en = {
   "site.do.awaiting": "The helper needs you to do something first:",
   "site.do.awaitingThen": "When you have done it, press Retry.",
   "site.do.jobFailed": "The helper could not finish. Press Retry to try again; the reason is under Details.",
-  "site.do.login": "Log in at {url} in the Aside browser, then press Check now.",
-  "site.do.loginNoUrl": "Log in to this site in the Aside browser, then press Check now.",
+  "site.do.login":
+    "Log in at {url} in the Aside browser window of account {account} (its first profile), then press Check now.",
+  "site.do.loginNoUrl":
+    "Log in to this site in the Aside browser window of account {account} (its first profile), then press Check now.",
+  "site.do.loginCheckNote": "The status updates only after Check now.",
   "site.do.degraded": "The site works only partly. Press Repair so the helper fixes it.",
   "site.do.failed":
     "This site does not work. Press Repair so the helper fixes it; the reason is under Details.",
@@ -209,6 +212,7 @@ const en = {
   "action.retry": "Retry",
   "action.repair": "Repair",
   "action.check": "Check now",
+  "action.checkLoggedIn": "Logged in? Check now",
   "action.cancel": "Cancel job",
   "action.remove": "Remove",
   "action.showLog": "Show progress",
@@ -584,8 +588,11 @@ const ko = {
   "site.do.awaitingThen": "요청한 일을 마친 뒤 다시 시도를 누르세요.",
   "site.do.jobFailed":
     "도우미가 작업을 마치지 못했습니다. 다시 시도를 누르세요(이유는 자세히 보기에 있습니다).",
-  "site.do.login": "Aside 브라우저에서 {url} 에 로그인한 뒤 지금 확인을 누르세요.",
-  "site.do.loginNoUrl": "Aside 브라우저에서 이 사이트에 로그인한 뒤 지금 확인을 누르세요.",
+  "site.do.login":
+    "Aside 브라우저의 {account} 계정 창(첫 번째 프로필)에서 {url} 에 로그인한 뒤 지금 확인을 누르세요.",
+  "site.do.loginNoUrl":
+    "Aside 브라우저의 {account} 계정 창(첫 번째 프로필)에서 이 사이트에 로그인한 뒤 지금 확인을 누르세요.",
+  "site.do.loginCheckNote": "지금 확인을 눌러야 상태가 바뀝니다.",
   "site.do.degraded": "이 사이트는 일부만 작동합니다. 고치기를 누르면 도우미가 고칩니다.",
   "site.do.failed":
     "이 사이트는 작동하지 않습니다. 고치기를 누르면 도우미가 고칩니다(이유는 자세히 보기에 있습니다).",
@@ -614,6 +621,7 @@ const ko = {
   "action.retry": "다시 시도",
   "action.repair": "고치기",
   "action.check": "지금 확인",
+  "action.checkLoggedIn": "로그인했으면 지금 확인",
   "action.cancel": "작업 취소",
   "action.remove": "삭제",
   "action.showLog": "진행 상황 보기",

@@ -215,7 +215,7 @@ export function createApp(options: CreateAppOptions): BridgeApp {
     settings: {
       auto: config.captcha.auto,
       attemptBudgetMs: tunables.captchaAttemptBudgetMs,
-      inlineMinRemainingMs: tunables.captchaInlineMinRemainingMs,
+      detectBudgetMs: tunables.captchaDetectBudgetMs,
       rerunReserveMs: tunables.captchaRerunReserveMs,
     },
     browser,

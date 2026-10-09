@@ -69,7 +69,10 @@ const request = { text: "inflation", limit: 10, cursor: null, after: null, befor
 
 describe("reuters search", () => {
   it("returns results when the search page shows the signed-in account control", async () => {
-    const res = await adapter.search(request, await ctxWith({ status: 200, text: API_BODY, signedIn: true }));
+    const res = await adapter.search(
+      request,
+      await ctxWith({ status: 200, text: API_BODY, signedIn: true, header: true }),
+    );
     expect(res.status).toBe("ok");
     expect(res.status === "ok" ? res.results.length : 0).toBe(1);
     // The search page script passes the port's static page-script check.
@@ -79,12 +82,24 @@ describe("reuters search", () => {
   it("reports auth_required with the login action when the signed-in marker is absent", async () => {
     const res = await adapter.search(
       request,
-      await ctxWith({ status: 200, text: API_BODY, signedIn: false }),
+      await ctxWith({ status: 200, text: API_BODY, signedIn: false, header: true }),
     );
     expect(res).toMatchObject({
       status: "auth_required",
       message: "Reuters is not signed in in Aside",
       action: "Log in to reuters.com in Aside (account u0), then retry",
+    });
+  });
+
+  it("reports a blocked bot check, not a lapsed login, when the page never rendered (no site header)", async () => {
+    const res = await adapter.search(
+      request,
+      await ctxWith({ status: 200, text: API_BODY, signedIn: false, header: false }),
+    );
+    expect(res).toMatchObject({
+      status: "access_denied",
+      blocked: true,
+      message: "Reuters answered with a bot check (the page did not render)",
     });
   });
 });

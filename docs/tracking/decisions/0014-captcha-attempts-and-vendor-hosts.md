@@ -1,5 +1,7 @@
 # 0014 — Automatic captcha attempts with a fixed vendor-host list
 
+> **Superseded in part by [0016](0016-quick-captcha-attempt-and-captcha-limited.md) (2026-10-09):** the budget rule for live calls changed. An attempt is inline only with `captchaDetectBudgetMs + captchaRerunReserveMs` of the call left (`captchaInlineMinRemainingMs` is retired), a detection budget bounds every attempt of a live call or Check now until its first detection, and an attempt that could not act on the check (`unknown` with no round, or no solver) answers at once as captcha-limited without a re-run. A bot check met during a page script is now a blocked page. The vendor-host list, the widening and restore, `solved` never being proof, and where attempts happen still stand. The text below is the original decision.
+
 ## Context
 
 Reuters sits behind DataDome, and other login sites show reCAPTCHA, hCaptcha, Turnstile, or GeeTest checks. Until now a captcha paused the helper with "Open <url> in Aside, solve the captcha, then click Retry" and made a live search or read fail with `access_denied`, plus a 10-minute cool-down of the site. The owner asked for automatic captcha handling (status list item 1, 2026-10-07). Aside exposes a `captcha` global in its REPL realm (`click`, `drag`, `readText`; `readText` sends a cropped screenshot to the "visual" model configured in Aside). It detects nothing. A bridge tab blocks every host outside the site's scope, so a vendor's widget frame cannot even load in it.

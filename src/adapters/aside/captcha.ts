@@ -28,6 +28,7 @@ import { DEFAULT_CAPTCHA_ATTEMPT_BUDGET_MS } from "../../core/defaults.js";
 import { OutcomeError } from "../../core/outcome.js";
 import type { ChallengeAttempt, ChallengeKind } from "../../ports/browser.js";
 import type { ExtraHost } from "./hosts.js";
+import { hostInScope } from "./hosts.js";
 
 /** One attempt's default time budget (`captchaAttemptBudgetMs`; defined in src/core/defaults.ts). */
 export const DEFAULT_CAPTCHA_BUDGET_MS = DEFAULT_CAPTCHA_ATTEMPT_BUDGET_MS;
@@ -55,6 +56,17 @@ export const CAPTCHA_VENDOR_HOSTS: readonly ExtraHost[] = deepFreeze([
   { host: "challenges.cloudflare.com" },
   { host: "geetest.com" },
 ]);
+
+const CAPTCHA_VENDOR_HOSTNAMES: readonly string[] = Object.freeze(CAPTCHA_VENDOR_HOSTS.map((e) => e.host));
+
+/**
+ * Whether `host` is one of the captcha vendor hosts or a subdomain of one. Path limits are ignored,
+ * because a shim violation record carries only the host: any `*.google.com`/`*.gstatic.com` host counts.
+ * Used only to name a blocked request as a bot check; it never allows anything.
+ */
+export function isCaptchaVendorHost(host: string): boolean {
+  return hostInScope(host, CAPTCHA_VENDOR_HOSTNAMES);
+}
 
 export interface CaptchaFrameRule {
   vendor: string;
@@ -580,6 +592,8 @@ export const CAPTCHA_MESSAGES = Object.freeze({
   none: "no captcha or block page is shown after reloading the page; re-run the request",
   pending: "the page's automatic check did not finish and no captcha widget appeared",
   time: "the captcha attempt ran out of time",
+  /** The detection budget (or the attempt's budget) ended before the first detection finished. */
+  detectLate: "detection did not finish in time",
 });
 
 function unknownMessage(d: CaptchaDetection): string {
@@ -629,12 +643,17 @@ export function parseActResult(value: unknown): CaptchaActResult {
   return out;
 }
 
-/** The browser work of one attempt, implemented by the Aside port (or a fake in tests). */
+/**
+ * The browser work of one attempt, implemented by the Aside port (or a fake in tests). `probe`,
+ * `prepare`, and `detect` run under the detection budget and throw `OutcomeError("timeout")` when it
+ * ends first (including an automatic check still running when its wait was cut short by it).
+ */
 export interface ChallengeDriver {
   /** Whether the REPL offers the `captcha` capability (click, drag, readText). */
   probe(): Promise<boolean>;
   /** Picks the tab, widens its filter and guard to the vendor hosts, and (re)loads the challenge URL. */
   prepare(): Promise<void>;
+  /** The first detection; it ends the detection budget's phase. */
   detect(): Promise<CaptchaDetection>;
   /** Re-detects, performs the action for `kind` if it is still shown, waits, and detects again. */
   act(kind: ActionKind): Promise<CaptchaActResult>;
@@ -646,8 +665,9 @@ export interface ChallengeDriver {
 /**
  * One attempt: probe, prepare, detect, then at most `MAX_CAPTCHA_ROUNDS` action rounds while the budget
  * allows; restore always. `solved` only when an action was performed and the page then showed nothing
- * recognized. A spent budget is an unsolved result; other failures (browser unavailable, a guard
- * violation) are thrown after the restore.
+ * recognized. A spent budget is an unsolved result: before the first detection finished it is `unknown`
+ * with no round and "detection did not finish in time"; later "the captcha attempt ran out of time".
+ * Other failures (browser unavailable, a guard violation) are thrown after the restore.
  */
 export async function runChallengeAttempt(
   driver: ChallengeDriver,
@@ -711,6 +731,8 @@ export async function runChallengeAttempt(
     return result(false, publicKind(current), `the page kept changing during the attempt`);
   } catch (err) {
     if (err instanceof OutcomeError && err.status === "timeout") {
+      // No action happens before the first detection, so `rounds` is 0 there.
+      if (current === null) return result(false, "unknown", CAPTCHA_MESSAGES.detectLate);
       return result(false, publicKind(current), CAPTCHA_MESSAGES.time);
     }
     throw err;

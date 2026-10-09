@@ -245,7 +245,8 @@ export class ReadService {
       if (!call.ok)
         return {
           outcome: finishOutcome(call.outcome, key, loginUrl),
-          blocked: false,
+          // A thrown failure may be a block page too (a page script that ran into a bot check).
+          blocked: call.blocked,
           value: null,
           pageUrl: call.pageUrl,
         };

@@ -16,6 +16,14 @@
  *   runs, since the registry has no removal hook) or when the core stops (`dispose`); the port then
  *   ends the attempt and restores or closes its tab.
  *
+ * Every attempt is a quick one: the port gets a detection budget (`captchaDetectBudgetMs`, clipped to
+ * the port's own budget) that starts once the scheduler slot is held and covers the politeness wait,
+ * the widened reload, the interstitial wait, and detection. Only when it detected something it can act
+ * on do action rounds use the rest of the attempt budget. An attempt that did not act on the page —
+ * `kind: "unknown"` with `rounds: 0` (nothing recognized, or detection not finished in time), or no
+ * solver at all (`unavailable`) — is captcha-limited (`limited: true`): the caller answers at once,
+ * without a re-run. Nothing about a site is remembered between attempts.
+ *
  * The solver never declares success: a report with `ran: true` only tells the caller to re-run its own
  * adapter call once, and only that re-run (`ok`/`empty`) confirms the challenge is gone. The report
  * carries the solver's fixed message (never page content), and the action for an unsolved attempt
@@ -25,7 +33,7 @@
  */
 import {
   DEFAULT_CAPTCHA_ATTEMPT_BUDGET_MS,
-  DEFAULT_CAPTCHA_INLINE_MIN_REMAINING_MS,
+  DEFAULT_CAPTCHA_DETECT_BUDGET_MS,
   DEFAULT_CAPTCHA_RERUN_RESERVE_MS,
 } from "../../core/defaults.js";
 import type { FailureStatus } from "../../core/models.js";
@@ -56,8 +64,12 @@ export interface ChallengeSettings {
   auto: boolean;
   /** Time one attempt may take (`captchaAttemptBudgetMs`). */
   attemptBudgetMs: number;
-  /** Tool-call budget that must remain to attempt inside the call (`captchaInlineMinRemainingMs`). */
-  inlineMinRemainingMs: number;
+  /**
+   * Detection budget of an attempt (`captchaDetectBudgetMs`), from the moment the port's attempt starts
+   * (after the scheduler slot) through the reload, the interstitial wait, and detection; clipped to the
+   * attempt's budget. An inline attempt also needs this plus `rerunReserveMs` of the tool call left.
+   */
+  detectBudgetMs: number;
   /** Tool-call budget kept back for the re-run after an attempt (`captchaRerunReserveMs`). */
   rerunReserveMs: number;
 }
@@ -65,7 +77,7 @@ export interface ChallengeSettings {
 export const DEFAULT_CHALLENGE_SETTINGS: Readonly<ChallengeSettings> = Object.freeze({
   auto: DEFAULT_CAPTCHA_AUTO,
   attemptBudgetMs: DEFAULT_CAPTCHA_ATTEMPT_BUDGET_MS,
-  inlineMinRemainingMs: DEFAULT_CAPTCHA_INLINE_MIN_REMAINING_MS,
+  detectBudgetMs: DEFAULT_CAPTCHA_DETECT_BUDGET_MS,
   rerunReserveMs: DEFAULT_CAPTCHA_RERUN_RESERVE_MS,
 });
 
@@ -74,10 +86,17 @@ export type ChallengeResult = "solved" | "unsolved" | "unavailable";
 
 export interface ChallengeReport {
   /**
-   * The solver ran on the page (detection, maybe actions): the caller re-runs its adapter call once.
-   * False when nothing was done (setting off, no capability, refused or failed before the page).
+   * The solver acted on the page, found the check gone (`kind: "none"`), or met a kind it can act on:
+   * the caller re-runs its adapter call once. False when it is captcha-limited (`limited`) or nothing
+   * was done (setting off, refused or failed before or during the page work).
    */
   ran: boolean;
+  /**
+   * Captcha-limited: the attempt could not act on this check — `kind: "unknown"` with `rounds: 0`
+   * (nothing recognized, or detection not finished in time) or no solver (`unavailable`). The caller
+   * answers at once with `access_denied` and `action` (the captcha-limited sentence), no re-run.
+   */
+  limited: boolean;
   result: ChallengeResult;
   kind: ChallengeKind;
   rounds: number;
@@ -85,7 +104,8 @@ export interface ChallengeReport {
   url: string;
   /**
    * The action for a failure that is still blocked: open `url` in Aside and solve it by hand (naming
-   * the solver's message when the attempt did not report `solved`).
+   * the solver's message when the attempt did not report `solved`); for a captcha-limited report the
+   * captcha-limited sentence, which is also the failure's message.
    */
   action: string;
   /**
@@ -125,11 +145,12 @@ export interface ChallengeGate {
 export type ChallengePlan = { mode: "inline"; budgetMs: number } | { mode: "background" };
 
 /**
- * Inline only with at least `inlineMinRemainingMs` left, for `min(attemptBudgetMs, remaining −
- * rerunReserveMs)`; otherwise (or when that leaves no time) in the background.
+ * Inline only with at least `detectBudgetMs + rerunReserveMs` left, for `min(attemptBudgetMs,
+ * remaining − rerunReserveMs)` (the slot wait included); otherwise (or when that leaves no time) the
+ * failure is answered at once and the attempt runs in the background.
  */
 export function planChallenge(settings: ChallengeSettings, remainingMs: number): ChallengePlan {
-  if (remainingMs < settings.inlineMinRemainingMs) return { mode: "background" };
+  if (remainingMs < settings.detectBudgetMs + settings.rerunReserveMs) return { mode: "background" };
   const budgetMs = Math.min(settings.attemptBudgetMs, remainingMs - settings.rerunReserveMs);
   return budgetMs > 0 ? { mode: "inline", budgetMs } : { mode: "background" };
 }
@@ -148,9 +169,34 @@ export function captchaUnsolvedAction(url: string, detail?: string): string {
   return `The captcha could not be solved automatically${why}. Open ${url} in Aside, solve it, then retry`;
 }
 
+/**
+ * The answer for a check the solver cannot act on (captcha-limited); it is both the failure's message
+ * and its action.
+ */
+export function captchaLimitedAction(site: string, url: string): string {
+  return `${site} is captcha-limited: its bot check cannot be solved automatically. Open ${url} in Aside, solve it, then retry`;
+}
+
 /** The solver message worth showing with a failure: none after a reported `solved` (only the re-run judges). */
 function unsolvedDetail(report: Pick<ChallengeReport, "result" | "message">): string | undefined {
   return report.result === "solved" ? undefined : report.message;
+}
+
+/** The action of a report for the page `url`. */
+function actionFor(
+  key: string,
+  url: string,
+  report: Pick<ChallengeReport, "limited" | "result" | "message">,
+): string {
+  return report.limited ? captchaLimitedAction(key, url) : captchaUnsolvedAction(url, unsolvedDetail(report));
+}
+
+/**
+ * Captcha-limited: the attempt did not act on the check. `kind: "unknown"` with `rounds: 0` covers
+ * "nothing recognized" and "detection did not finish in time".
+ */
+function isLimited(attempt: Pick<ChallengeAttempt, "available" | "kind" | "rounds">): boolean {
+  return !attempt.available || (attempt.kind === "unknown" && attempt.rounds === 0);
 }
 
 /** The site's homepage: `https://<first hostname>/`. */
@@ -230,14 +276,20 @@ export class ChallengeCoordinator implements ChallengeGate {
     options: ChallengeAttemptOptions = {},
   ): Promise<ChallengeReport> {
     const target = this.challengeUrl(key, url);
-    if (!this.enabled) return this.report(target, { ran: false, result: "unsolved" });
+    if (!this.enabled) return this.report(key, target, { ran: false, result: "unsolved" });
     const budgetMs = Math.max(0, options.budgetMs ?? this.settings.attemptBudgetMs);
     const running = this.flights.get(key);
     if (running !== undefined) {
       this.options.logger.debug("joining the running captcha attempt", { site: key });
-      return this.wait(running.promise, target, budgetMs, options.signal);
+      return this.wait(key, running.promise, target, budgetMs, options.signal);
     }
-    return this.wait(this.start(key, target, budgetMs, "inline").promise, target, Infinity, options.signal);
+    return this.wait(
+      key,
+      this.start(key, target, budgetMs, "inline").promise,
+      target,
+      Infinity,
+      options.signal,
+    );
   }
 
   join(
@@ -250,7 +302,7 @@ export class ChallengeCoordinator implements ChallengeGate {
     if (running === undefined) return null;
     this.options.logger.debug("joining the running captcha attempt", { site: key });
     const budgetMs = Math.max(0, options.budgetMs ?? this.settings.attemptBudgetMs);
-    return this.wait(running.promise, this.challengeUrl(key, url), budgetMs, options.signal);
+    return this.wait(key, running.promise, this.challengeUrl(key, url), budgetMs, options.signal);
   }
 
   background(key: string, url: string | null): boolean {
@@ -331,12 +383,17 @@ export class ChallengeCoordinator implements ChallengeGate {
       const loaded = registry.get(key) === undefined ? undefined : await registry.load(key);
       if (loaded === undefined || controller.signal.aborted) {
         log({ result: "unsolved", error: "unsupported" });
-        return this.report(url, { ran: false, result: "unsolved", error: "unsupported" });
+        return this.report(key, url, { ran: false, result: "unsolved", error: "unsupported" });
       }
       const solve = browser.solveChallenge;
       if (typeof solve !== "function") {
         log({ result: "unavailable", message: NO_SOLVER_MESSAGE });
-        return this.report(url, { ran: false, result: "unavailable", message: NO_SOLVER_MESSAGE });
+        return this.report(key, url, {
+          ran: false,
+          limited: true,
+          result: "unavailable",
+          message: NO_SOLVER_MESSAGE,
+        });
       }
       const { manifest } = loaded;
       const attempt: ChallengeAttempt = await scheduler.runForSite(
@@ -350,13 +407,16 @@ export class ChallengeCoordinator implements ChallengeGate {
         },
         (lease) => {
           portCalled = true;
+          // The slot is held: what the wait left is the port's budget; the detection budget starts now,
+          // whole, and is clipped to that budget.
           const left = budgetMs - (this.clock.now().getTime() - started);
           // Leave the port time to restore the tab inside the task's budget when there is room for it.
-          const solveBudgetMs = left > 2 * RESTORE_MARGIN_MS ? left - RESTORE_MARGIN_MS : left;
+          const solveBudgetMs = Math.max(0, left > 2 * RESTORE_MARGIN_MS ? left - RESTORE_MARGIN_MS : left);
           const task = solve.call(browser, {
             scope: { siteKey: key, hostnames: scopeHostnames(manifest), signal: lease.signal, lease },
             url,
-            budgetMs: Math.max(0, solveBudgetMs),
+            budgetMs: solveBudgetMs,
+            detectBudgetMs: Math.max(0, Math.min(this.settings.detectBudgetMs, solveBudgetMs)),
           });
           work.settled = false;
           // Tracks only when the port is done; its failure reaches the caller through `task`.
@@ -372,14 +432,17 @@ export class ChallengeCoordinator implements ChallengeGate {
         },
       );
       if (!attempt.available)
-        return this.report(url, {
+        return this.report(key, url, {
           ran: false,
+          limited: true,
           result: "unavailable",
           kind: attempt.kind,
           message: attempt.message,
         });
-      return this.report(url, {
-        ran: true,
+      const limited = isLimited(attempt);
+      return this.report(key, url, {
+        ran: !limited,
+        limited,
         result: attempt.solved ? "solved" : "unsolved",
         kind: attempt.kind,
         rounds: attempt.rounds,
@@ -389,21 +452,25 @@ export class ChallengeCoordinator implements ChallengeGate {
       const status = errorToOutcome(error).status;
       // The port logs its own line for an attempt it ran; a refusal before the port is logged here.
       if (!portCalled) log({ result: "unsolved", error: status });
-      return this.report(url, { ran: false, result: "unsolved", error: status });
+      return this.report(key, url, { ran: false, result: "unsolved", error: status });
     } finally {
       clearInterval(poll);
     }
   }
 
-  /** The flight's report, or a timeout report once `budgetMs` passes or the caller's signal aborts. */
+  /**
+   * The flight's report for this caller's page, or a timeout report once `budgetMs` passes or the
+   * caller's signal aborts.
+   */
   private wait(
+    key: string,
     promise: Promise<ChallengeReport>,
     url: string,
     budgetMs: number,
     signal: AbortSignal | undefined,
   ): Promise<ChallengeReport> {
     const timedOut = (): ChallengeReport =>
-      this.report(url, { ran: false, result: "unsolved", error: "timeout" });
+      this.report(key, url, { ran: false, result: "unsolved", error: "timeout" });
     if (signal?.aborted) return Promise.resolve(timedOut());
     return new Promise<ChallengeReport>((resolve) => {
       let timer: ReturnType<typeof setTimeout> | undefined;
@@ -415,23 +482,25 @@ export class ChallengeCoordinator implements ChallengeGate {
       const onAbort = (): void => finish(timedOut());
       signal?.addEventListener("abort", onAbort, { once: true });
       if (Number.isFinite(budgetMs)) timer = setTimeout(() => finish(timedOut()), budgetMs);
-      void promise.then((report) =>
-        finish({ ...report, url, action: captchaUnsolvedAction(url, unsolvedDetail(report)) }),
-      );
+      void promise.then((report) => finish({ ...report, url, action: actionFor(key, url, report) }));
     });
   }
 
   private report(
+    key: string,
     url: string,
-    fields: Pick<ChallengeReport, "ran" | "result"> & Partial<Omit<ChallengeReport, "url" | "action">>,
+    fields: Pick<ChallengeReport, "ran" | "result"> &
+      Partial<Omit<ChallengeReport, "url" | "action" | "ran" | "result">>,
   ): ChallengeReport {
+    const limited = fields.limited ?? false;
     const out: ChallengeReport = {
       ran: fields.ran,
+      limited,
       result: fields.result,
       kind: fields.kind ?? "unknown",
       rounds: fields.rounds ?? 0,
       url,
-      action: captchaUnsolvedAction(url, unsolvedDetail(fields)),
+      action: actionFor(key, url, { limited, result: fields.result, message: fields.message }),
     };
     if (fields.message !== undefined) out.message = fields.message;
     if (fields.error !== undefined) out.error = fields.error;

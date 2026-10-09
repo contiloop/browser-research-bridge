@@ -7,7 +7,7 @@
  * attempts a captcha; the light form only tells its caller where it met a block page (`onBlocked`).
  */
 import { join } from "node:path";
-import { isFailureStatus } from "../../core/outcome.js";
+import { isBlockedError, isFailureStatus } from "../../core/outcome.js";
 import { isValidSiteKey } from "../../core/site-key.js";
 import type { AdapterContext, SiteAdapter } from "../../ports/adapter.js";
 import type { Clock } from "../../ports/clock.js";
@@ -71,9 +71,10 @@ export interface LightValidationOptions {
   ignoreCooldown?: boolean | undefined;
   /**
    * Told when a step fails on a block or captcha page (the adapter's `blocked: true` with a failure
-   * status): `url` is the read's page, else the page the adapter's browser session last showed (the
-   * search page), null when it showed none. "Check now" uses it to run one challenge attempt; the
-   * report itself is unchanged.
+   * status, or a thrown failure flagged `blocked`, such as a page script that ran into a bot check):
+   * `url` is the read's page, else the page the adapter's browser session last showed (the search
+   * page), null when it showed none. "Check now" uses it to run one challenge attempt; the report
+   * itself is unchanged.
    */
   onBlocked?: ((block: LightBlock) => void) | undefined;
 }
@@ -98,19 +99,42 @@ function sessionPage(ctx: AdapterContext): string | null {
   }
 }
 
+/**
+ * Runs one adapter call and tells `onBlocked` (with `url()`) when it failed on a block page: a returned
+ * verdict with `blocked: true`, or a thrown blocked failure (a page script that ran into a bot check),
+ * which is rethrown unchanged.
+ */
+async function watchBlocks<R>(
+  call: () => Promise<R>,
+  url: () => string | null,
+  onBlocked: (block: LightBlock) => void,
+): Promise<R> {
+  let response: R;
+  try {
+    response = await call();
+  } catch (error) {
+    if (isBlockedError(error)) onBlocked({ url: url() });
+    throw error;
+  }
+  if (isBlockedFailure(response)) onBlocked({ url: url() });
+  return response;
+}
+
 /** The adapter with its search and read watched for block pages (methods otherwise unchanged). */
 function observeBlocks(adapter: SiteAdapter, onBlocked: (block: LightBlock) => void): SiteAdapter {
   const observed: SiteAdapter = {
-    search: async (request, ctx) => {
-      const response = await adapter.search(request, ctx);
-      if (isBlockedFailure(response)) onBlocked({ url: sessionPage(ctx) });
-      return response;
-    },
-    read: async (ref, ctx) => {
-      const response = await adapter.read(ref, ctx);
-      if (isBlockedFailure(response)) onBlocked({ url: ref.url ?? sessionPage(ctx) });
-      return response;
-    },
+    search: (request, ctx) =>
+      watchBlocks(
+        () => adapter.search(request, ctx),
+        () => sessionPage(ctx),
+        onBlocked,
+      ),
+    read: (ref, ctx) =>
+      watchBlocks(
+        () => adapter.read(ref, ctx),
+        () => ref.url ?? sessionPage(ctx),
+        onBlocked,
+      ),
     smokeTest: (ctx) => adapter.smokeTest(ctx),
   };
   if (adapter.canonicalize) observed.canonicalize = (url) => adapter.canonicalize!(url);

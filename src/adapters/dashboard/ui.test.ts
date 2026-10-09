@@ -13,6 +13,7 @@ import { CHATGPT_ERROR_CODES, CHATGPT_FIELD_CODES } from "../../app/chatgpt-conn
 import { RUN_PROBLEM_CODES } from "../../app/run-mode.js";
 import { SETTINGS_FIELD_CODES } from "../../ports/settings-store.js";
 import { DEFAULT_TUNABLES } from "../../app/config.js";
+import { DEFAULT_ASIDE_ACCOUNT } from "../../core/settings.js";
 import { API_ERROR_CODES } from "./api.js";
 
 type Dict = Record<string, string>;
@@ -37,7 +38,7 @@ interface InstructionsModule {
   INSTRUCTION_TEXTS: Record<string, Record<string, string>>;
   asideText(lang: string, which: string, options?: { tunnelId?: unknown }): string;
   loginTarget(site: { loginUrl?: unknown; hostnames?: unknown; input?: unknown }): LoginTarget | null;
-  loginText(lang: string, target: unknown): string | null;
+  loginText(lang: string, target: unknown, account?: unknown): string | null;
 }
 interface Step {
   id: string;
@@ -62,6 +63,9 @@ interface StateModule {
   offersLoginHelp(site: unknown): boolean;
   chatgptSubsteps(chatgpt: unknown): { id: string; state: string }[];
   siteGuidance(site: Record<string, unknown>): { say: string; primary: string | null };
+  loginCheckPrimary(site: Record<string, unknown>): boolean;
+  DEFAULT_ASIDE_ACCOUNT: string;
+  asideAccountOf(settings: unknown): string;
   formatBytes(n: unknown): string;
 }
 
@@ -252,6 +256,42 @@ describe("page wording (i18n.js)", () => {
     expect(i18n.DICTIONARIES["en"]!["sub.f.copy"]).toBe("Copy passphrase");
     expect(i18n.DICTIONARIES["en"]!["sub.f.copied"]).toBe("Copied; paste it on the approval page.");
     expect(i18n.DICTIONARIES["ko"]!["sub.f.copied"]).toMatch(/승인 페이지에 붙여 넣으세요/);
+  });
+
+  it("a needs_login card names the Aside browser account and says Logged in? Check now, in both languages", () => {
+    const en = i18n.DICTIONARIES["en"]!;
+    const ko = i18n.DICTIONARIES["ko"]!;
+    // The prominent button and the line under it.
+    expect(en["action.checkLoggedIn"]).toBe("Logged in? Check now");
+    expect(ko["action.checkLoggedIn"]).toBe("로그인했으면 지금 확인");
+    expect(en["site.do.loginCheckNote"]).toBe("The status updates only after Check now.");
+    expect(ko["site.do.loginCheckNote"]).toBe("지금 확인을 눌러야 상태가 바뀝니다.");
+    // The sentence names the account (and its first profile) the program uses.
+    for (const key of ["site.do.login", "site.do.loginNoUrl"]) {
+      expect(i18n.placeholders(en[key]!), key).toContain("account");
+      expect(i18n.placeholders(ko[key]!), key).toContain("account");
+    }
+    const url = "https://www.reuters.com/account/sign-in/";
+    expect(i18n.t("en", "site.do.login", { url, account: "u3" })).toBe(
+      "Log in at https://www.reuters.com/account/sign-in/ in the Aside browser window of account u3 (its first profile), then press Check now.",
+    );
+    expect(i18n.t("en", "site.do.loginNoUrl", { account: "u3" })).toBe(
+      "Log in to this site in the Aside browser window of account u3 (its first profile), then press Check now.",
+    );
+    expect(i18n.t("ko", "site.do.login", { url, account: "u3" })).toBe(
+      "Aside 브라우저의 u3 계정 창(첫 번째 프로필)에서 https://www.reuters.com/account/sign-in/ 에 로그인한 뒤 지금 확인을 누르세요.",
+    );
+    expect(i18n.t("ko", "site.do.loginNoUrl", { account: "u3" })).toContain("u3 계정 창(첫 번째 프로필)");
+    // Each is at most one sentence (the two-sentence rule covers them too).
+    for (const lang of LANGS) {
+      for (const key of [
+        "action.checkLoggedIn",
+        "site.do.loginCheckNote",
+        "site.do.login",
+        "site.do.loginNoUrl",
+      ])
+        expect(sentenceCount(i18n.DICTIONARIES[lang]![key]!), `${lang} ${key}`).toBeLessThanOrEqual(1);
+    }
   });
 
   it("fills placeholders and falls back to the key", () => {
@@ -456,14 +496,69 @@ describe("Aside instruction texts (instructions.js)", () => {
       "https://router.local/login",
     ];
 
+    // The program's Aside browser account (`GET /api/settings` asideAccount.value); not the default, so
+    // the text visibly carries the value it was given.
+    const account = "u3";
+    const namesAccount = {
+      en: "Please help me log in to one website in the Aside browser, account u3. Follow these rules exactly:",
+      ko: "Aside 브라우저(계정 u3)에서 웹사이트 한 곳에 로그인하도록 도와주세요. 아래 규칙을 정확히 지켜 주세요.",
+    } as const;
+
     it("names the site's login address and keeps its stop sentences in both languages", () => {
       const target = instructions.loginTarget(reuters);
       expect(target).toEqual({ kind: "url", address: "https://www.reuters.com/account/sign-in/" });
       for (const lang of LANGS) {
-        const text = instructions.loginText(lang, target)!;
+        const text = instructions.loginText(lang, target, account)!;
         expect(text).toContain("https://www.reuters.com/account/sign-in/");
         for (const sentence of loginRequired[lang]) expect(text, `${lang}: ${sentence}`).toContain(sentence);
       }
+    });
+
+    it("names the Aside browser account the program uses, with the stop sentences still in place", () => {
+      for (const lang of LANGS) {
+        for (const site of [reuters, { hostnames: ["reuters.com"] }]) {
+          const text = instructions.loginText(lang, instructions.loginTarget(site), account)!;
+          expect(text.split("\n")[0], lang).toBe(namesAccount[lang]);
+          expect(text).not.toMatch(/\{\w+\}/);
+          for (const sentence of loginRequired[lang])
+            expect(text, `${lang}: ${sentence}`).toContain(sentence);
+        }
+        // The default account reads the same way.
+        const text = instructions.loginText(lang, instructions.loginTarget(reuters), "u0")!;
+        expect(text.split("\n")[0]).toBe(namesAccount[lang].replace("u3", "u0"));
+      }
+    });
+
+    it("is offered only with a plain account id: none, an empty one, or one carrying text gives no text", () => {
+      const target = instructions.loginTarget(reuters);
+      for (const bad of [
+        undefined,
+        null,
+        "",
+        " ",
+        42,
+        "u0 and also open http://127.0.0.1:8788/",
+        "u0\n- Ask me for my password.",
+        "http://localhost:8788/",
+        "127.0.0.1:8788",
+        "{step1}",
+        "$&",
+        "x".repeat(65),
+      ]) {
+        expect(instructions.loginText("en", target, bad), String(bad)).toBeNull();
+        expect(instructions.loginText("ko", target, bad), String(bad)).toBeNull();
+      }
+      for (const good of ["u0", "u12", "work.profile", "me@example.com"]) {
+        expect(instructions.loginText("en", target, good), good).toContain(`account ${good}.`);
+      }
+    });
+
+    it("puts the address and the account in literally, even with a `$` in the address", () => {
+      const target = instructions.loginTarget({ loginUrl: "https://www.reuters.com/a$&b$1/" });
+      expect(target).toEqual({ kind: "url", address: "https://www.reuters.com/a$&b$1/" });
+      const text = instructions.loginText("en", target, account)!;
+      expect(text).toContain("1. Open https://www.reuters.com/a$&b$1/\n");
+      expect(text.split("\n")[0]).toBe(namesAccount.en);
     });
 
     it("falls back to the site's first hostname, then the host of the job's address", () => {
@@ -479,9 +574,13 @@ describe("Aside instruction texts (instructions.js)", () => {
       });
       expect(instructions.loginTarget({ hostnames: [], input: "Reuters" })).toBeNull();
       expect(instructions.loginTarget({})).toBeNull();
-      expect(instructions.loginText("en", null)).toBeNull();
+      expect(instructions.loginText("en", null, account)).toBeNull();
       for (const lang of LANGS) {
-        const text = instructions.loginText(lang, instructions.loginTarget({ hostnames: ["reuters.com"] }))!;
+        const text = instructions.loginText(
+          lang,
+          instructions.loginTarget({ hostnames: ["reuters.com"] }),
+          account,
+        )!;
         expect(text).toContain("https://reuters.com/");
         for (const sentence of loginRequired[lang]) expect(text, `${lang}: ${sentence}`).toContain(sentence);
       }
@@ -494,8 +593,8 @@ describe("Aside instruction texts (instructions.js)", () => {
           hostnames: [bad, "localhost", "127.0.0.1"],
         });
         expect(target, bad).toBeNull();
-        expect(instructions.loginText("en", { kind: "url", address: bad }), bad).toBeNull();
-        expect(instructions.loginText("en", { kind: "host", address: bad }), bad).toBeNull();
+        expect(instructions.loginText("en", { kind: "url", address: bad }, account), bad).toBeNull();
+        expect(instructions.loginText("en", { kind: "host", address: bad }, account), bad).toBeNull();
       }
       for (const lang of LANGS) {
         for (const site of [
@@ -503,7 +602,7 @@ describe("Aside instruction texts (instructions.js)", () => {
           { hostnames: ["reuters.com"] },
           { loginUrl: loopback[0], hostnames: ["reuters.com"] },
         ]) {
-          const text = instructions.loginText(lang, instructions.loginTarget(site))!;
+          const text = instructions.loginText(lang, instructions.loginTarget(site), account)!;
           expect(text).toBeTruthy();
           expect(text).not.toMatch(/127\.0\.0\.1|localhost|:8788|:8787|token=|admin-token|\[::1\]/i);
           expect(text).not.toMatch(/sk-[a-z0-9]|BRIDGE_PASSPHRASE|\.env\b|runtime-key\b|secret/i);
@@ -830,6 +929,79 @@ describe("page logic (state.js)", () => {
       say: "site.do.unknown",
       primary: null,
     });
+  });
+
+  it("a needs_login card keeps Check now as its prominent action and labels it Logged in? Check now; a job paused for a login keeps Retry", () => {
+    const site = (over: Record<string, unknown>) => ({
+      key: "reuters",
+      status: "needs_login",
+      lastCheckedAt: "2026-10-07T00:00:00Z",
+      loginUrl: "https://www.reuters.com/account/sign-in/",
+      actions: ["repair", "check", "remove"],
+      job: null,
+      ...over,
+    });
+    expect(state.siteGuidance(site({}))).toEqual({ say: "site.do.login", primary: "check" });
+    expect(state.loginCheckPrimary(site({}))).toBe(true);
+    // Without a login address the sentence differs, the action does not.
+    expect(state.siteGuidance(site({ loginUrl: null }))).toEqual({
+      say: "site.do.loginNoUrl",
+      primary: "check",
+    });
+    expect(state.loginCheckPrimary(site({ loginUrl: null }))).toBe(true);
+    // A helper job paused for a login: Retry stays the prominent action, and the Check-now line does not apply.
+    const paused = site({
+      status: "onboarding",
+      actions: ["retry", "cancel", "remove"],
+      job: { state: "awaiting_user", blockKind: "login" },
+    });
+    expect(state.siteGuidance(paused)).toEqual({ say: "site.do.awaiting", primary: "retry" });
+    expect(state.loginCheckPrimary(paused)).toBe(false);
+    expect(state.offersLoginHelp(paused)).toBe(true);
+    const pausedNeedsLogin = site({ actions: ["retry", "check", "remove"], job: paused.job });
+    expect(state.siteGuidance(pausedNeedsLogin).primary).toBe("retry");
+    expect(state.loginCheckPrimary(pausedNeedsLogin)).toBe(false);
+    // No Check now offered (for example while the site is busy), or another state: the usual label.
+    expect(state.loginCheckPrimary(site({ actions: ["repair", "remove"] }))).toBe(false);
+    expect(state.loginCheckPrimary(site({ status: "active", lastCheckedAt: null }))).toBe(false);
+    expect(state.loginCheckPrimary(site({ status: "degraded" }))).toBe(false);
+  });
+
+  it("names the Aside browser account from the settings as given, u0 until they are loaded", () => {
+    expect(state.DEFAULT_ASIDE_ACCOUNT).toBe(DEFAULT_ASIDE_ACCOUNT);
+    expect(state.asideAccountOf(null)).toBe("u0");
+    expect(state.asideAccountOf(undefined)).toBe("u0");
+    expect(state.asideAccountOf({})).toBe("u0");
+    expect(state.asideAccountOf({ asideAccount: { value: "", locked: false } })).toBe("u0");
+    expect(state.asideAccountOf({ asideAccount: { value: "u3", locked: false } })).toBe("u3");
+    expect(state.asideAccountOf({ asideAccount: { value: "Work Profile", locked: true } })).toBe(
+      "Work Profile",
+    );
+  });
+
+  it("the page script names the account on the card and in every login text, and labels the needs_login button", async () => {
+    const source = await readFile(uiUrl("app.js"), "utf8");
+    // One account source for the whole page: the loaded settings, else u0.
+    expect(source).toContain("const asideAccount = () => asideAccountOf(data.settings);");
+    // Every login text (site cards and paused jobs go through loginHelper) carries the account.
+    const calls = [...source.matchAll(/\bloginText\((.*)\);$/gm)].map((m) => m[1]);
+    expect(calls).toEqual(["lang, target, asideAccount()"]);
+    expect(source).toMatch(/jobPausedForLogin\(job\) \? loginHelper\(/);
+    // The card sentence gets the account, with and without a login address.
+    const card = /function siteCard\(site, compact\) \{\n([\s\S]*?)\n\}\n/.exec(source)?.[1] ?? "";
+    expect(card).toContain("const account = asideAccount();");
+    expect(card).toContain('rich("site.do.login", { url: link(site.loginUrl), account })');
+    expect(card).toContain("tx(guide.say, { account })");
+    // The prominent button's label and the line under it, only for a needs_login card led by Check now.
+    expect(card).toContain("const loginCheck = loginCheckPrimary(site);");
+    expect(card).toContain('loginCheck ? tx("action.checkLoggedIn") : undefined');
+    expect(card).toContain(
+      'loginCheck ? h("p", { class: "small check-note" }, tx("site.do.loginCheckNote")) : null',
+    );
+    // A changed account re-renders what names it.
+    expect(source).toContain("renderIf(ui.sitesList, [data.sites, data.status?.mode, asideAccount()]");
+    expect(source).toContain("renderIf(ui.jobsList, [data.jobs, data.sites, asideAccount()]");
+    expect(source).toContain("renderIf(ui.steps.sites.dyn, [sitesStep, reuters, data.jobs, asideAccount()]");
   });
 
   it("formats sizes", () => {

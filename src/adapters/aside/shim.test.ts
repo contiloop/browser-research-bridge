@@ -280,6 +280,31 @@ describe("REPL runtime (shim) in a fake Aside REPL", () => {
     expect(repl.pageRequests).toEqual(["https://example.com/api"]);
   });
 
+  it("blocks and reports a page-script request to a captcha vendor host like any other host (never widened)", async () => {
+    const repl = new FakeAsideRepl();
+    const id = await openTab(repl);
+    const r = await runRaw(
+      repl,
+      `return await page.evaluate(async () => {
+         try { await fetch("https://geo.captcha-delivery.com/captcha/?c=1"); } catch (e) {}
+         try { await fetch("https://www.google.com/recaptcha/api.js"); } catch (e) {}
+         return 1;
+       });`,
+      id,
+    );
+    expect(r.envelope).toMatchObject({
+      ok: false,
+      kind: "violation",
+      violations: [
+        { kind: "request", host: "geo.captcha-delivery.com" },
+        { kind: "request", host: "www.google.com" },
+      ],
+    });
+    expect(repl.pageRequests).toEqual([]);
+    const allowed = repl.pages.get(id)!.blockPatterns.filter((p) => !p.block);
+    expect(allowed.some((p) => /captcha|google/.test(p.urlPattern))).toBe(false);
+  });
+
   it("fails the step on an in-page cross-host navigation, WebSocket, or window.open", async () => {
     const repl = new FakeAsideRepl();
     const id = await openTab(repl);

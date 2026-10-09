@@ -14,7 +14,7 @@ Not in scope: I/O of any kind, clocks, logging, caching, scheduling, HTTP, MCP, 
 ## Invariants
 
 - `OUTCOME_STATUSES` has exactly nine values and `LIFECYCLE_STATUSES` exactly five; every `switch` over them is exhaustive.
-- `errorToOutcome` and `OutcomeError` never yield `ok` or `empty`; `coerceAdapterStatus` turns unknown statuses into `adapter_error`, `ok` with zero results into `empty`, `empty` with results into `ok`, and passes failures through.
+- `errorToOutcome` and `OutcomeError` never yield `ok` or `empty`; `OutcomeError` may carry `blocked` (a block or captcha page, read with `isBlockedError`), which never becomes an outcome field; `coerceAdapterStatus` turns unknown statuses into `adapter_error`, `ok` with zero results into `empty`, `empty` with results into `ok`, and passes failures through.
 - `withOutcomeDefaults` gives every non-`ok` outcome a message and every `auth_required`/`access_denied` an action.
 - `makeResultId` uses the adapter's canonicalizer, never `normalizeUrl`; a native local id never starts with `u_`; `parseRef(makeResultId(...))` round-trips.
 - `normalizeUrl` strips `www.`, fragment, `utm_*`, `fbclid`, `gclid`, `ref`, `src`, sorts parameters, and drops a non-root trailing slash; `hashUrlKey` is the first 12 base64url characters of its sha256.

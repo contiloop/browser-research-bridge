@@ -9,12 +9,14 @@ import type { ReplClient } from "./repl-client.js";
 import { InMemoryScheduler } from "./scheduler.js";
 import type { CaptchaTimings } from "./captcha.js";
 import {
+  CAPTCHA_MESSAGES,
   CAPTCHA_PAGE_SOURCE,
   CAPTCHA_STEP_SOURCE,
   CAPTCHA_VENDOR_HOSTS,
   CAPTCHA_WIDGETS,
   DEFAULT_CAPTCHA_BUDGET_MS,
   MAX_CAPTCHA_ROUNDS,
+  isCaptchaVendorHost,
 } from "./captcha.js";
 import { parseCaptchaCheckArgs } from "./captcha-check.js";
 import { blockedUrlPatterns } from "./hosts.js";
@@ -270,6 +272,34 @@ describe("captcha vendor hosts", () => {
     ]);
     expect(Object.isFrozen(CAPTCHA_VENDOR_HOSTS)).toBe(true);
     expect(CAPTCHA_VENDOR_HOSTS.every((h) => Object.isFrozen(h))).toBe(true);
+  });
+
+  it("isCaptchaVendorHost: exact or subdomain match on the entries' hosts, path limits ignored", () => {
+    for (const host of [
+      "captcha-delivery.com",
+      "geo.captcha-delivery.com",
+      "GEO.Captcha-Delivery.com.",
+      "www.google.com",
+      "accounts.google.com",
+      "www.gstatic.com",
+      "js.hcaptcha.com",
+      "challenges.cloudflare.com",
+      "static.geetest.com",
+    ]) {
+      expect(isCaptchaVendorHost(host), host).toBe(true);
+    }
+    for (const host of [
+      "example.com",
+      "cloudflare.com",
+      "www.cloudflare.com",
+      "notcaptcha-delivery.com",
+      "captcha-delivery.com.evil.test",
+      "google.co.uk",
+      "",
+      "an off-site URL",
+    ]) {
+      expect(isCaptchaVendorHost(host), host).toBe(false);
+    }
   });
 
   it("widen the request filter only for those hosts and paths, keeping the block rules last", () => {
@@ -734,8 +764,13 @@ describe("AsideBrowserPort.solveChallenge", () => {
   it("returns unsolved without touching the browser when the budget is already spent", async () => {
     const { repl, port } = setup();
     const r = await port.solveChallenge({ scope, url: URL1, budgetMs: 0 });
-    expect(r).toMatchObject({ solved: false, rounds: 0 });
-    expect(r.message).toMatch(/time/);
+    expect(r).toEqual({
+      solved: false,
+      kind: "unknown",
+      rounds: 0,
+      available: true,
+      message: "detection did not finish in time",
+    });
     expect(repl.pages.size).toBe(0);
   });
 
@@ -841,6 +876,115 @@ describe("AsideBrowserPort.solveChallenge", () => {
     expect(loads[1]! - loads[0]!).toBeGreaterThanOrEqual(interval - 20);
     expect(loads[1]! - loads[0]!).toBeLessThan(2 * interval - 50);
     expect(clicks[0]! - loads[1]!).toBeGreaterThanOrEqual(interval - 20);
+  });
+});
+
+describe("the detection budget of a quick attempt", () => {
+  const DETECT_LATE = "detection did not finish in time";
+
+  /** Runs one attempt as a pool task of the site with the given politeness interval. */
+  async function inPool(
+    port: AsideBrowserPort,
+    minIntervalMs: number,
+    options: { budgetMs: number; detectBudgetMs?: number; tab?: boolean },
+  ) {
+    const scheduler = new InMemoryScheduler();
+    return scheduler.runForSite(
+      { site: "example", holder: "captcha", acquireTimeoutMs: 5000, minIntervalMs },
+      async (lease) => {
+        const started = Date.now();
+        const r = await port.solveChallenge({
+          scope: { ...scope, lease },
+          url: URL1,
+          budgetMs: options.budgetMs,
+          ...(options.detectBudgetMs !== undefined ? { detectBudgetMs: options.detectBudgetMs } : {}),
+        });
+        return { r, ms: Date.now() - started };
+      },
+    );
+  }
+
+  it("has a fixed message for a detection that did not finish in time", () => {
+    expect(CAPTCHA_MESSAGES.detectLate).toBe(DETECT_LATE);
+  });
+
+  it("covers the politeness wait before the widened reload: unknown, no action, the tab restored", async () => {
+    const { repl, port, info } = setup();
+    repl.documents.set(URL1, recaptchaPage());
+    // The fresh tab loads at once; its widened reload would wait 5 s for the site's interval.
+    const { r, ms } = await inPool(port, 5000, { budgetMs: 10_000, detectBudgetMs: 300 });
+    expect(r).toEqual({ solved: false, kind: "unknown", rounds: 0, available: true, message: DETECT_LATE });
+    expect(ms).toBeLessThan(2000);
+    expect(repl.captchaCalls).toEqual([]);
+    expect(repl.loads).toHaveLength(1); // the reload never went out
+    expectNoWidenedTab(repl);
+    expect(info).toHaveBeenCalledWith(
+      "captcha attempt",
+      expect.objectContaining({ kind: "unknown", rounds: 0, result: "unsolved", message: DETECT_LATE }),
+    );
+    await port.shutdown();
+  });
+
+  it("is clipped to the attempt's own budget", async () => {
+    const { repl, port } = setup();
+    repl.documents.set(URL1, recaptchaPage());
+    const { r, ms } = await inPool(port, 5000, { budgetMs: 300, detectBudgetMs: 20_000 });
+    expect(r).toMatchObject({ solved: false, kind: "unknown", rounds: 0, message: DETECT_LATE });
+    expect(ms).toBeLessThan(2000);
+    expectNoWidenedTab(repl);
+    await port.shutdown();
+  });
+
+  it("covers the interstitial wait: an automatic check still running when it ends is unknown, no action", async () => {
+    const { repl, port } = setup({ timings: { pendingWaitMs: 3000, pollMs: 20 } });
+    repl.documents.set(URL1, DATADOME_INTERSTITIAL);
+    const started = Date.now();
+    const r = await port.solveChallenge({ scope, url: URL1, budgetMs: 10_000, detectBudgetMs: 1500 });
+    expect(r).toEqual({ solved: false, kind: "unknown", rounds: 0, available: true, message: DETECT_LATE });
+    expect(Date.now() - started).toBeLessThan(2500);
+    expect(repl.captchaCalls).toEqual([]);
+    expectNoWidenedTab(repl);
+    // Without a separate detection budget the attempt waits the whole pending window first.
+    const slow = setup({ timings: { pendingWaitMs: 600, pollMs: 20 } });
+    slow.repl.documents.set(URL1, DATADOME_INTERSTITIAL);
+    const r2 = await slow.port.solveChallenge({ scope, url: URL1, budgetMs: 10_000 });
+    expect(r2).toMatchObject({ kind: "unknown", rounds: 0, message: CAPTCHA_MESSAGES.pending });
+  });
+
+  it("action rounds after the detection use the rest of the attempt budget", async () => {
+    const { repl, port } = setup();
+    repl.documents.set(URL1, recaptchaPage());
+    repl.captchaHandlers.click = (page) =>
+      new Promise<void>((resolve) =>
+        setTimeout(() => {
+          page.show(ARTICLE);
+          resolve();
+        }, 1200),
+      );
+    const r = await port.solveChallenge({ scope, url: URL1, budgetMs: 10_000, detectBudgetMs: 800 });
+    expect(r).toMatchObject({ solved: true, kind: "checkbox", rounds: 1 });
+    expect(repl.captchaCalls).toHaveLength(1);
+    expectNoWidenedTab(repl);
+  });
+
+  it("a detection that finishes in time is acted on as before (kind none, unknown, checkbox)", async () => {
+    const { repl, port } = setup();
+    repl.documents.set(URL1, ACCESS_DENIED);
+    expect(
+      await port.solveChallenge({ scope, url: URL1, budgetMs: 10_000, detectBudgetMs: 5000 }),
+    ).toMatchObject({
+      solved: false,
+      kind: "unknown",
+      rounds: 0,
+      message: expect.stringContaining("cannot handle") as string,
+    });
+    repl.documents.set(URL1, ARTICLE);
+    expect(
+      await port.solveChallenge({ scope, url: URL1, budgetMs: 10_000, detectBudgetMs: 5000 }),
+    ).toMatchObject({
+      kind: "none",
+      rounds: 0,
+    });
   });
 });
 
@@ -991,12 +1135,14 @@ describe("adapter scripts stay restricted", () => {
     const tab = await session.openTab(URL1);
     const probe = async () => {
       await expect(session.runScript("return typeof captcha;", { tab })).resolves.toBe("undefined");
+      // The tab blocks it; the step fails as a bot check (blocked access_denied), never reaching the host.
       await expect(
         session.runScript(
           `return await page.evaluate(async () => { try { await fetch("https://www.google.com/recaptcha/api.js"); } catch (e) {} return 1; });`,
           { tab },
         ),
-      ).rejects.toMatchObject({ status: "adapter_error" });
+      ).rejects.toMatchObject({ status: "access_denied", blocked: true });
+      expect(repl.pageRequests.some((u) => u.includes("google.com"))).toBe(false);
       await expect(
         session.runScript(
           `try { await fetch("https://geo.captcha-delivery.com/captcha/"); } catch (e) {} return 1;`,

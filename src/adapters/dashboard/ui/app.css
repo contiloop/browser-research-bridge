@@ -527,6 +527,11 @@ button:disabled {
   margin: 4px 0 8px;
 }
 
+/* Under a `needs_login` card's "Logged in? Check now": the status changes only after that button. */
+.check-note {
+  margin: 6px 0 8px;
+}
+
 .requested {
   margin: 6px 0 8px;
   padding: 10px 14px;

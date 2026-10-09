@@ -37,7 +37,7 @@
     "coolDownSeconds": 600,
     "warmTabTtlSeconds": 300,
     "captchaAttemptBudgetMs": 45000,
-    "captchaInlineMinRemainingMs": 40000,
+    "captchaDetectBudgetMs": 20000,
     "captchaRerunReserveMs": 15000,
     "consecutiveAdapterErrorsToDegrade": 3,
     "healthCheckIntervalSeconds": 86400,

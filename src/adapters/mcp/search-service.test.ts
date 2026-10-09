@@ -11,8 +11,9 @@ import {
 import type { FakeSiteSpec, McpWorld, WorldOptions } from "../../../test/support/mcp-fixtures.js";
 import { challengeAttempt } from "../../../test/support/site-fixtures.js";
 import { DATE_POST_FILTER_NOTE } from "../../core/merge.js";
+import { OutcomeError } from "../../core/outcome.js";
 import type { AdapterSearchRequest } from "../../ports/adapter.js";
-import { captchaUnsolvedAction } from "./challenge.js";
+import { captchaLimitedAction, captchaUnsolvedAction } from "./challenge.js";
 import { SearchService } from "./search-service.js";
 
 let world: McpWorld | null = null;
@@ -460,7 +461,7 @@ describe("SearchService: captcha attempts", () => {
   });
 
   it("unsolved: the original failure with the captcha action naming the solver's message; other sites are unaffected; nothing raises", async () => {
-    const why = "the page shows a challenge the solver cannot handle (block-title)";
+    const why = "the checkbox captcha is still shown after 2 rounds";
     const w = await make(
       [
         { key: "alpha", search: async () => blockedSearch },
@@ -468,7 +469,7 @@ describe("SearchService: captcha attempts", () => {
       ],
       {
         challenge: {
-          solve: async () => challengeAttempt({ solved: false, kind: "unknown", rounds: 0, message: why }),
+          solve: async () => challengeAttempt({ solved: false, kind: "checkbox", rounds: 2, message: why }),
         },
       },
     );
@@ -486,6 +487,45 @@ describe("SearchService: captcha attempts", () => {
     expect(w.count("alpha").search).toBe(2);
     expect(w.browser.challenges).toHaveLength(1);
     expect(w.scheduler.cooldownUntil("alpha")).toBeNull();
+  });
+
+  it("captcha-limited: the site's entry is access_denied with the captcha-limited sentence at once; no re-run, no background; other sites unaffected", async () => {
+    const w = await make(
+      [
+        { key: "alpha", search: async () => blockedSearch },
+        { key: "beta", search: async () => ok([item("beta", 1, "2026-10-04")]) },
+      ],
+      {
+        challenge: {
+          solve: async () =>
+            challengeAttempt({ solved: false, kind: "unknown", rounds: 0, message: "block-title" }),
+        },
+      },
+    );
+    const out = await w.search.search({ query: "election", mode: "search" });
+    const sentence = captchaLimitedAction("alpha", HOME);
+    expect(out.results.map((r) => r.id)).toEqual(["beta:1"]);
+    expect(out.siteStatuses).toEqual([
+      { site: "alpha", status: "access_denied", message: sentence, action: sentence },
+      { site: "beta", status: "ok" },
+    ]);
+    expect(w.count("alpha").search).toBe(1);
+    expect(w.browser.challenges).toHaveLength(1);
+    expect(w.challenges?.inFlight("alpha")).toBe(false);
+    expect(w.scheduler.cooldownUntil("alpha")).toBeNull();
+    expect(w.registry.get("alpha")?.status).toBe("active");
+  });
+
+  it("an unavailable solver is captcha-limited too", async () => {
+    const w = await make([{ key: "alpha", search: async () => blockedSearch }], {
+      challenge: { solve: null },
+    });
+    const out = await w.search.search({ query: "election", mode: "search_sites" });
+    const sentence = captchaLimitedAction("alpha", HOME);
+    expect(out.siteStatuses).toEqual([
+      { site: "alpha", status: "access_denied", message: sentence, action: sentence },
+    ]);
+    expect(w.count("alpha").search).toBe(1);
   });
 
   it("a solver that throws does not make search raise; the failure carries the captcha action", async () => {
@@ -598,5 +638,146 @@ describe("SearchService: captcha attempts", () => {
       expect.objectContaining({ site: "alpha", status: "access_denied", message: "captcha page" }),
     ]);
     expect(out.siteStatuses[0]?.action).not.toBe(captchaUnsolvedAction(HOME));
+  });
+});
+
+describe("SearchService: a bot check thrown by a page-script step", () => {
+  const HOME = "https://alpha.example.com/";
+  const BOT = "alpha answered with a bot check (geo.captcha-delivery.com)";
+  const botCheck = () => new OutcomeError("access_denied", BOT, undefined, { blocked: true });
+
+  /**
+   * alpha's search runs a page script and lets its failure through. While the fake port has a failure
+   * scripted for alpha's page scripts (as the real port throws on a bot check), the script throws.
+   */
+  const scriptedSite: FakeSiteSpec = {
+    key: "alpha",
+    search: async (_req, ctx) => {
+      await ctx.browser.runScript("return 1;");
+      return ok([item("alpha", 1, "2026-10-05")]);
+    },
+  };
+
+  it("solved: the thrown blocked failure gets the attempt; the re-run's results are returned", async () => {
+    const w: McpWorld = await make(
+      [scriptedSite, { key: "beta", search: async () => ok([item("beta", 1, "2026-10-04")]) }],
+      {
+        challenge: {
+          solve: async () => {
+            w.browser.scriptErrors.delete("alpha");
+            return challengeAttempt();
+          },
+        },
+      },
+    );
+    w.browser.scriptErrors.set("alpha", botCheck());
+    const out = await w.search.search({ query: "election", mode: "search" });
+    expect(out.results.map((r) => r.id)).toEqual(["alpha:1", "beta:1"]);
+    expect(out.siteStatuses).toEqual([
+      { site: "alpha", status: "ok" },
+      { site: "beta", status: "ok" },
+    ]);
+    expect(w.browser.challenges.map((c) => c.url)).toEqual([HOME]);
+    expect(w.count("alpha").search).toBe(2);
+    expect(w.scheduler.cooldownUntil("alpha")).toBeNull();
+  });
+
+  it("unsolved: the bot-check failure carries the captcha action (aimed at the page last shown); no cool-down", async () => {
+    const SEARCH_PAGE = "https://alpha.example.com/search?q=election";
+    const why =
+      "after the checkbox action the page shows a challenge the solver cannot handle (for example an image grid)";
+    const w: McpWorld = await make([scriptedSite], {
+      challenge: {
+        solve: async () => challengeAttempt({ solved: false, kind: "unknown", rounds: 1, message: why }),
+      },
+    });
+    w.browser.scriptErrors.set("alpha", botCheck());
+    w.browser.lastUrls.set("alpha", SEARCH_PAGE);
+    const out = await w.search.search({ query: "election", mode: "search_sites" });
+    expect(out.siteStatuses).toEqual([
+      {
+        site: "alpha",
+        status: "access_denied",
+        message: BOT,
+        action: captchaUnsolvedAction(SEARCH_PAGE, why),
+      },
+    ]);
+    expect(w.browser.challenges.map((c) => c.url)).toEqual([SEARCH_PAGE]);
+    expect(w.count("alpha").search).toBe(2);
+    expect(w.scheduler.cooldownUntil("alpha")).toBeNull();
+    expect(w.registry.get("alpha")?.status).toBe("active");
+    expect(
+      w.logger.lines.some((l) => l.includes("site search outcome") && l.includes('"blocked":true')),
+    ).toBe(true);
+  });
+
+  it("captcha-limited: a bot check the solver cannot act on is answered at once, aimed at the page last shown", async () => {
+    const SEARCH_PAGE = "https://alpha.example.com/search?q=election";
+    const w: McpWorld = await make([scriptedSite], {
+      challenge: { solve: async () => challengeAttempt({ solved: false, kind: "unknown", rounds: 0 }) },
+    });
+    w.browser.scriptErrors.set("alpha", botCheck());
+    w.browser.lastUrls.set("alpha", SEARCH_PAGE);
+    const out = await w.search.search({ query: "election", mode: "search_sites" });
+    const sentence = captchaLimitedAction("alpha", SEARCH_PAGE);
+    expect(out.siteStatuses).toEqual([
+      { site: "alpha", status: "access_denied", message: sentence, action: sentence },
+    ]);
+    expect(w.count("alpha").search).toBe(1);
+    // The search query in the page URL reaches the answer, never the logs.
+    expect(w.logger.lines.some((l) => l.includes("q=election"))).toBe(false);
+  });
+
+  it("setting off: the bot check is a plain access_denied with the default action, no attempt", async () => {
+    const w: McpWorld = await make([scriptedSite], { challenge: { settings: { auto: false } } });
+    w.browser.scriptErrors.set("alpha", botCheck());
+    const out = await w.search.search({ query: "election", mode: "search" });
+    expect(out.siteStatuses).toEqual([
+      {
+        site: "alpha",
+        status: "access_denied",
+        message: BOT,
+        action: "Open alpha in Aside and check the subscription, captcha, or block page, then retry",
+      },
+    ]);
+    expect(w.browser.challenges).toEqual([]);
+    expect(w.count("alpha").search).toBe(1);
+  });
+
+  it("a thrown failure that is not blocked (a violation on another host) gets no attempt", async () => {
+    const w: McpWorld = await make([scriptedSite], { challenge: {} });
+    const message = "page script blocked by the bridge: request to evil.test is outside the site's hostnames";
+    w.browser.scriptErrors.set("alpha", new OutcomeError("adapter_error", message));
+    const out = await w.search.search({ query: "election", mode: "search" });
+    expect(out.siteStatuses).toEqual([{ site: "alpha", status: "adapter_error", message }]);
+    expect(w.browser.challenges).toEqual([]);
+    expect(w.count("alpha").search).toBe(1);
+  });
+
+  it("the adapter's own verdict stands when it catches the bot check and returns one", async () => {
+    const w = await make(
+      [
+        {
+          key: "alpha",
+          search: async (_req, ctx) => {
+            try {
+              await ctx.browser.runScript("return 1;");
+            } catch {
+              return { results: [], nextCursor: null, status: "auth_required", message: "login wall" };
+            }
+            return ok([]);
+          },
+        },
+      ],
+      { challenge: {} },
+    );
+    w.browser.scriptErrors.set("alpha", botCheck());
+    const out = await w.search.search({ query: "election", mode: "search" });
+    expect(out.siteStatuses[0]).toMatchObject({
+      site: "alpha",
+      status: "auth_required",
+      message: "login wall",
+    });
+    expect(w.browser.challenges).toEqual([]);
   });
 });

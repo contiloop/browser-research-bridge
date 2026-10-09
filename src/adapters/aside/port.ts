@@ -37,8 +37,10 @@ import type {
   ChallengeDriver,
 } from "./captcha.js";
 import {
+  CAPTCHA_MESSAGES,
   CAPTCHA_VENDOR_HOSTS,
   DEFAULT_CAPTCHA_TIMINGS,
+  isCaptchaVendorHost,
   parseActResult,
   parseDetection,
   runChallengeAttempt,
@@ -103,6 +105,12 @@ const silentLogger: Logger = { debug() {}, info() {}, warn() {}, error() {} };
 
 /** Slack on top of the in-REPL deadline so the envelope still comes back. */
 const CLIENT_GRACE_MS = 10_000;
+
+/**
+ * Violation kinds that only the script's own scoped calls produce (repl-runtime.ts refuses the URL it
+ * was given). A vendor host there is the adapter's doing, not the site's bot check.
+ */
+const SCRIPT_OWN_CALLS: ReadonlySet<string> = new Set(["fetch", "openTab"]);
 
 function describeShimViolations(violations: readonly ShimViolationRecord[]): string {
   const parts = violations.map((v) => `${v.kind} to ${v.host}`);
@@ -350,7 +358,7 @@ export class AsideBrowserPort implements BrowserPort {
         });
         continue;
       }
-      throw this.envelopeError(envelope, options.site, deadlineMs);
+      throw this.envelopeError(envelope, op.kind, options.site, deadlineMs);
     }
     throw new OutcomeError(
       "browser_unavailable",
@@ -459,19 +467,40 @@ export class AsideBrowserPort implements BrowserPort {
     );
   }
 
+  /**
+   * A failed envelope as an `OutcomeError`. A violation fails the step with `adapter_error`, except in
+   * a page-script step whose tab was blocked from a captcha vendor host (the site started a bot check
+   * while the script ran): that step fails as a blocked `access_denied`, so the challenge path runs.
+   * The script's own refused `fetch`/`openTab` calls are not the site's answer and keep
+   * `adapter_error`. The request stayed blocked and every violation is logged either way.
+   */
   private envelopeError(
     envelope: Exclude<ShimEnvelope, { ok: true }>,
+    opKind: ShimOp["kind"],
     site: string,
     deadlineMs: number,
   ): OutcomeError {
     switch (envelope.kind) {
-      case "violation":
+      case "violation": {
         for (const v of envelope.violations)
           this.logger.warn("browser shim violation", { site, kind: v.kind, detail: v.host });
+        const vendor =
+          opKind === "script"
+            ? envelope.violations.find((v) => !SCRIPT_OWN_CALLS.has(v.kind) && isCaptchaVendorHost(v.host))
+            : undefined;
+        if (vendor !== undefined) {
+          return new OutcomeError(
+            "access_denied",
+            `${site} answered with a bot check (${vendor.host})`,
+            undefined,
+            { blocked: true },
+          );
+        }
         return new OutcomeError(
           "adapter_error",
           `page script blocked by the bridge: ${describeShimViolations(envelope.violations)} is outside the site's hostnames`,
         );
+      }
       case "script":
         return new OutcomeError("adapter_error", `page script failed: ${envelope.message}`);
       case "timeout":
@@ -778,17 +807,31 @@ interface ChallengeTarget {
 
 /**
  * The browser work of one challenge attempt (`ChallengeDriver` of captcha.ts). Every REPL call runs
- * under the attempt's budget and the scope's signal. A tab may reach `CAPTCHA_VENDOR_HOSTS` only while
- * it is the attempt's target: it becomes the target before the widening call goes out, so `restore`
- * owns every tab that may carry the widened filter and guard. `restore` puts back the normal ones, or
- * closes the tab when it cannot be sure: the widening call did not come back (it may still be running
- * in the REPL), the restore failed, or the attempt was abandoned (the scope's signal aborted: site
- * removed, core stopped). A closed tab is forgotten by its session and never kept warm.
+ * under the attempt's budget and the scope's signal. Until the first detection has finished, the
+ * detection budget (`detectBudgetMs`, clipped to the attempt's budget, counted from the attempt's
+ * start) bounds the steps too: probe, open, widen, the politeness waits through the lease, the widened
+ * reload, and the detection with its interstitial wait; a step it cuts short ends the attempt
+ * `unknown` with no round. Action rounds use the rest of the attempt's budget.
+ *
+ * A tab may reach `CAPTCHA_VENDOR_HOSTS` only while it is the attempt's target: it becomes the target
+ * before the widening call goes out, so `restore` owns every tab that may carry the widened filter and
+ * guard. `restore` puts back the normal ones, or closes the tab when it cannot be sure: the widening
+ * call did not come back (it may still be running in the REPL), the restore failed, or the attempt was
+ * abandoned (the scope's signal aborted: site removed, core stopped). A closed tab is forgotten by its
+ * session and never kept warm.
  */
 class ChallengeRun implements ChallengeDriver {
   private readonly deadline: number;
   private readonly budget = new AbortController();
   private readonly timer: ReturnType<typeof setTimeout>;
+  /** End of the detection phase (epoch ms), never after `deadline`. */
+  private readonly detectDeadline: number;
+  private readonly detectBudget = new AbortController();
+  private readonly detectTimer: ReturnType<typeof setTimeout>;
+  /** Aborts when the attempt's budget or the detection budget ends: the signal of the detection phase. */
+  private readonly detectSignal: AbortSignal;
+  /** True until the first detection has finished. */
+  private detecting = true;
   private readonly unlink: () => void;
   /** The scope's own signal (the caller's or the lease's); its abort abandons the attempt. */
   private readonly outer: AbortSignal | undefined;
@@ -806,7 +849,13 @@ class ChallengeRun implements ChallengeDriver {
     private readonly timings: CaptchaTimings,
   ) {
     const budgetMs = Number.isFinite(options.budgetMs) ? Math.max(0, options.budgetMs) : 0;
-    this.deadline = Date.now() + budgetMs;
+    const detectMs =
+      options.detectBudgetMs !== undefined && Number.isFinite(options.detectBudgetMs)
+        ? Math.min(budgetMs, Math.max(0, options.detectBudgetMs))
+        : budgetMs;
+    const startedAt = Date.now();
+    this.deadline = startedAt + budgetMs;
+    this.detectDeadline = startedAt + detectMs;
     const outer = scope.signal ?? scope.lease?.signal;
     this.outer = outer;
     const abort = () => this.budget.abort();
@@ -815,15 +864,67 @@ class ChallengeRun implements ChallengeDriver {
     this.unlink = () => outer?.removeEventListener("abort", abort);
     this.timer = setTimeout(abort, budgetMs);
     this.timer.unref?.();
+    this.detectTimer = setTimeout(() => this.detectBudget.abort(), detectMs);
+    this.detectTimer.unref?.();
+    this.detectSignal = AbortSignal.any([this.budget.signal, this.detectBudget.signal]);
   }
 
   close(): void {
     clearTimeout(this.timer);
+    clearTimeout(this.detectTimer);
     this.unlink();
   }
 
+  /** What is left of the attempt's budget (action rounds start only with enough of it). */
   remainingMs(): number {
     return this.budget.signal.aborted ? 0 : this.deadline - Date.now();
+  }
+
+  /** What is left for the current step: during detection also bounded by the detection budget. */
+  private phaseRemainingMs(): number {
+    const remaining = this.remainingMs();
+    if (!this.detecting) return remaining;
+    return this.detectBudget.signal.aborted ? 0 : Math.min(remaining, this.detectDeadline - Date.now());
+  }
+
+  private phaseSignal(): AbortSignal {
+    return this.detecting ? this.detectSignal : this.budget.signal;
+  }
+
+  private spent(): OutcomeError {
+    return new OutcomeError(
+      "timeout",
+      this.detecting ? CAPTCHA_MESSAGES.detectLate : "the captcha attempt's time budget is spent",
+    );
+  }
+
+  /** The first detection is done: the detection budget no longer applies. */
+  private endDetection(): void {
+    this.detecting = false;
+    clearTimeout(this.detectTimer);
+  }
+
+  /**
+   * The site's politeness wait before a page load (`lease.beforePageLoad()`), cut short by the current
+   * phase's budget: during detection, a wait longer than the detection budget ends the attempt.
+   */
+  private async pageLoadSlot(): Promise<void> {
+    const lease = this.scope.lease;
+    if (!lease) return;
+    const signal = this.phaseSignal();
+    if (signal.aborted || this.phaseRemainingMs() <= 0) throw this.spent();
+    let onAbort: (() => void) | undefined;
+    try {
+      await Promise.race([
+        lease.beforePageLoad(),
+        new Promise<never>((_, reject) => {
+          onAbort = () => reject(this.spent());
+          signal.addEventListener("abort", onAbort, { once: true });
+        }),
+      ]);
+    } finally {
+      if (onAbort) signal.removeEventListener("abort", onAbort);
+    }
   }
 
   private get site(): string {
@@ -839,15 +940,15 @@ class ChallengeRun implements ChallengeDriver {
     title: string,
     options: { widened?: boolean; generation?: number | undefined; load?: boolean } = {},
   ): RunOptions {
-    const remaining = this.remainingMs();
-    if (remaining <= 0) throw new OutcomeError("timeout", "the captcha attempt's time budget is spent");
+    const remaining = this.phaseRemainingMs();
+    if (remaining <= 0) throw this.spent();
     const lease = this.scope.lease;
     return {
       site: this.site,
       hostnames: this.hostnames,
       title: `Bridge ${this.site}: captcha ${title}`,
       timeoutMs: Math.min(remaining, this.port.stepTimeoutMs),
-      signal: this.budget.signal,
+      signal: this.phaseSignal(),
       generation: options.generation,
       notBefore: options.load === true ? 0 : (lease?.nextPageLoadAt?.() ?? 0),
       minIntervalMs: lease?.minIntervalMs ?? 0,
@@ -855,9 +956,9 @@ class ChallengeRun implements ChallengeDriver {
     };
   }
 
-  /** A wait inside one REPL call, kept a second short of the remaining budget. */
+  /** A wait inside one REPL call, kept a second short of what is left for the step. */
   private waitMs(ms: number): number {
-    return Math.max(0, Math.min(ms, this.remainingMs() - 1000));
+    return Math.max(0, Math.min(ms, this.phaseRemainingMs() - 1000));
   }
 
   private requireTarget(): ChallengeTarget {
@@ -886,9 +987,8 @@ class ChallengeRun implements ChallengeDriver {
     // attempt owns it before anything is widened; then widened and reloaded like the adapter's tab.
     const session = this.port.challengeSession(this.scope, this.hostnames);
     this.ownSession = session;
-    const options = this.step("open", { load: true });
-    await this.scope.lease?.beforePageLoad();
-    const r = await this.port.run({ kind: "open", url: this.url }, options);
+    await this.pageLoadSlot();
+    const r = await this.port.run({ kind: "open", url: this.url }, this.step("open", { load: true }));
     const handle = session.adopt(r.value, r.generation);
     const fresh: ChallengeTarget = { id: handle.id, generation: r.generation, owner: session };
     if (!(await this.widen(fresh))) {
@@ -924,24 +1024,34 @@ class ChallengeRun implements ChallengeDriver {
 
   /** Loads the challenge URL in the widened tab (one politeness wait, through the lease). */
   private async reload(t: ChallengeTarget): Promise<void> {
-    const options = this.step("reload", { widened: true, generation: t.generation, load: true });
-    await this.scope.lease?.beforePageLoad();
-    await this.port.run({ kind: "open", url: this.url, reuseTargetId: t.id }, options);
+    await this.pageLoadSlot();
+    await this.port.run(
+      { kind: "open", url: this.url, reuseTargetId: t.id },
+      this.step("reload", { widened: true, generation: t.generation, load: true }),
+    );
   }
 
+  /**
+   * The first detection, with the interstitial wait, inside the detection budget. An automatic check
+   * still running after a wait the budget cut short means detection did not finish in time.
+   */
   async detect(): Promise<CaptchaDetection> {
     const t = this.requireTarget();
+    const pendingWaitMs = this.waitMs(this.timings.pendingWaitMs);
     const step = {
       action: "detect" as const,
       noneWaitMs: this.waitMs(this.timings.noneWaitMs),
-      pendingWaitMs: this.waitMs(this.timings.pendingWaitMs),
+      pendingWaitMs,
       pollMs: this.timings.pollMs,
     };
     const r = await this.port.run(
       { kind: "captcha", targetId: t.id, step },
       this.step("detect", { generation: t.generation }),
     );
-    return parseDetection((r.value as { detection?: unknown } | null)?.detection);
+    const detection = parseDetection((r.value as { detection?: unknown } | null)?.detection);
+    if (detection.kind === "pending" && pendingWaitMs < this.timings.pendingWaitMs) throw this.spent();
+    this.endDetection();
+    return detection;
   }
 
   async act(kind: ActionKind): Promise<CaptchaActResult> {

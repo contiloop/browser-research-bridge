@@ -141,6 +141,14 @@ export interface SolveChallengeOptions {
   url: string;
   /** Time budget for detection plus at most two action rounds. */
   budgetMs: number;
+  /**
+   * Detection budget, clipped to `budgetMs`; absent → `budgetMs`. It starts when the attempt starts
+   * and covers the politeness wait, the widened reload, the interstitial wait, and the first
+   * detection. When it expires before that detection finished, the attempt ends with `kind:
+   * "unknown"`, `rounds: 0`, message "detection did not finish in time". Action rounds after a
+   * detection use the rest of `budgetMs`.
+   */
+  detectBudgetMs?: number | undefined;
 }
 
 export interface BrowserPort {

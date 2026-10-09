@@ -2,7 +2,7 @@
  * The challenge coordinator with the real scheduler, a fake browser port (scripted solver, no page),
  * and a minimal site lookup. No site behavior is real.
  */
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { MemoryLogger } from "../../../test/support/oauth-harness.js";
 import { challengeAttempt, fakeBrowser, manifestFor } from "../../../test/support/site-fixtures.js";
 import type { FakeBrowser, FakeSolver } from "../../../test/support/site-fixtures.js";
@@ -17,7 +17,9 @@ import {
   ChallengeCoordinator,
   DEFAULT_CHALLENGE_SETTINGS,
   NO_SOLVER_MESSAGE,
+  RESTORE_MARGIN_MS,
   canRerun,
+  captchaLimitedAction,
   captchaUnsolvedAction,
   planChallenge,
 } from "./challenge.js";
@@ -81,12 +83,13 @@ function setup(
     settings?: Partial<ChallengeSettings>;
     manifests?: SiteManifest[];
     removalPollMs?: number;
+    scheduler?: InMemoryScheduler;
   } = {},
 ): Setup {
   const browser = fakeBrowser(
     options.solve === null ? {} : { solveChallenge: options.solve ?? (async () => challengeAttempt()) },
   );
-  const scheduler = new InMemoryScheduler();
+  const scheduler = options.scheduler ?? new InMemoryScheduler();
   const tasks: SiteTaskOptions[] = [];
   const run = scheduler.runForSite.bind(scheduler);
   scheduler.runForSite = (taskOptions, task) => {
@@ -156,11 +159,17 @@ describe("ChallengeCoordinator.attempt", () => {
     });
   });
 
-  it("a port without solveChallenge is unavailable: nothing runs, one metadata-only log line", async () => {
+  it("a port without solveChallenge is unavailable (captcha-limited): nothing runs, one metadata-only log line", async () => {
     const s = setup({ solve: null });
     const report = await s.coordinator.attempt("alpha", URL1);
-    expect(report).toMatchObject({ ran: false, result: "unavailable", url: URL1 });
-    expect(report.action).toBe(captchaUnsolvedAction(URL1, NO_SOLVER_MESSAGE));
+    expect(report).toMatchObject({
+      ran: false,
+      limited: true,
+      result: "unavailable",
+      url: URL1,
+      message: NO_SOLVER_MESSAGE,
+    });
+    expect(report.action).toBe(captchaLimitedAction("alpha", URL1));
     expect(s.tasks).toEqual([]);
     const lines = s.logger.lines.filter((l) => l.includes("captcha attempt"));
     expect(lines).toHaveLength(1);
@@ -170,11 +179,16 @@ describe("ChallengeCoordinator.attempt", () => {
     expect(lines[0]).toContain('"durationMs"');
   });
 
-  it("an older browser (available: false) is unavailable and not re-run", async () => {
+  it("an older browser (available: false) is unavailable, captcha-limited, and not re-run", async () => {
     const s = setup({
       solve: async () => challengeAttempt({ solved: false, kind: "unknown", rounds: 0, available: false }),
     });
-    expect(await s.coordinator.attempt("alpha", URL1)).toMatchObject({ ran: false, result: "unavailable" });
+    expect(await s.coordinator.attempt("alpha", URL1)).toMatchObject({
+      ran: false,
+      limited: true,
+      result: "unavailable",
+      action: captchaLimitedAction("alpha", URL1),
+    });
   });
 
   it("carries the solver's fixed message and names it in the action unless the solver said solved", async () => {
@@ -200,8 +214,9 @@ describe("ChallengeCoordinator.attempt", () => {
     });
     expect(await unavailable.coordinator.attempt("alpha", URL1)).toMatchObject({
       result: "unavailable",
+      limited: true,
       message: "captcha solving is not available in this Aside version",
-      action: captchaUnsolvedAction(URL1, "captcha solving is not available in this Aside version"),
+      action: captchaLimitedAction("alpha", URL1),
     });
     // A reported `solved` that the re-run did not confirm: the plain action (only the re-run judges).
     const solved = setup({
@@ -236,11 +251,17 @@ describe("ChallengeCoordinator.attempt", () => {
     });
     expect(await s.coordinator.attempt("alpha", URL1)).toMatchObject({
       ran: false,
+      limited: false,
       result: "unsolved",
       error: "browser_unavailable",
+      action: captchaUnsolvedAction(URL1),
     });
     s.scheduler.setCooldown("alpha", Date.now() + 60_000);
-    expect(await s.coordinator.attempt("alpha", URL1)).toMatchObject({ ran: false, error: "rate_limited" });
+    expect(await s.coordinator.attempt("alpha", URL1)).toMatchObject({
+      ran: false,
+      limited: false,
+      error: "rate_limited",
+    });
     expect(s.browser.challenges).toHaveLength(1);
     const refused = s.logger.lines.filter((l) => l.includes("captcha attempt") && l.includes("rate_limited"));
     expect(refused).toHaveLength(1);
@@ -282,7 +303,13 @@ describe("ChallengeCoordinator.attempt", () => {
     const started = Date.now();
     const joined = await s.coordinator.attempt("alpha", URL1, { budgetMs: 40 });
     expect(Date.now() - started).toBeLessThan(1000);
-    expect(joined).toMatchObject({ ran: false, result: "unsolved", error: "timeout" });
+    expect(joined).toMatchObject({
+      ran: false,
+      limited: false,
+      result: "unsolved",
+      error: "timeout",
+      action: captchaUnsolvedAction(URL1),
+    });
     gate.resolve(challengeAttempt());
     expect((await first).ran).toBe(true);
   });
@@ -293,6 +320,146 @@ describe("ChallengeCoordinator.attempt", () => {
     expect(await s.coordinator.attempt("alpha", URL1)).toMatchObject({ ran: false });
     expect(s.coordinator.background("alpha", URL1)).toBe(false);
     expect(s.browser.challenges).toEqual([]);
+  });
+});
+
+describe("ChallengeCoordinator: the quick attempt (detection budget, captcha-limited)", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("passes the detection budget (captchaDetectBudgetMs) to the port, clipped to the port's own budget", async () => {
+    const s = setup();
+    await s.coordinator.attempt("alpha", URL1, { budgetMs: 45_000 });
+    expect(s.browser.challenges[0]?.detectBudgetMs).toBe(DEFAULT_CHALLENGE_SETTINGS.detectBudgetMs);
+    expect(DEFAULT_CHALLENGE_SETTINGS.detectBudgetMs).toBe(20_000);
+    // A port budget below the detection budget clips it.
+    await s.coordinator.attempt("alpha", URL1, { budgetMs: 10_000 });
+    const clipped = s.browser.challenges[1]!;
+    expect(clipped.budgetMs).toBeLessThanOrEqual(10_000);
+    expect(clipped.detectBudgetMs).toBe(clipped.budgetMs);
+    // The tunable decides it.
+    const tuned = setup({ settings: { detectBudgetMs: 5_000 } });
+    await tuned.coordinator.attempt("alpha", URL1, { budgetMs: 45_000 });
+    expect(tuned.browser.challenges[0]?.detectBudgetMs).toBe(5_000);
+  });
+
+  it("the detection budget starts after the scheduler slot was acquired; only the slot wait shortens the port's budget", async () => {
+    vi.useFakeTimers({ now: Date.parse("2026-10-09T10:00:00Z") });
+    const scheduler = new InMemoryScheduler({ maxConcurrentPerSite: 1 });
+    const s = setup({ scheduler });
+    const solvedAt: number[] = [];
+    s.browser.solveChallenge = async (o) => {
+      s.browser.challenges.push(o);
+      solvedAt.push(Date.now());
+      return challengeAttempt({ solved: false, kind: "unknown", rounds: 0 });
+    };
+    // Another task of the site holds the only slot for 12 s.
+    const hold = scheduler.runForSite(
+      { site: "alpha", holder: "fetch", acquireTimeoutMs: 1000, minIntervalMs: 0 },
+      () => new Promise<void>((r) => setTimeout(r, 12_000)),
+    );
+    const startedAt = Date.now();
+    const pending = s.coordinator.attempt("alpha", URL1, { budgetMs: 45_000 });
+    await vi.advanceTimersByTimeAsync(11_999);
+    expect(s.browser.challenges).toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(1);
+    await hold;
+    const report = await pending;
+    expect(solvedAt[0]! - startedAt).toBe(12_000);
+    const call = s.browser.challenges[0]!;
+    // The detection budget is whole: it starts when the port's attempt starts.
+    expect(call.detectBudgetMs).toBe(20_000);
+    // The port's own budget is what the slot wait left (less the restore margin).
+    expect(call.budgetMs).toBe(45_000 - 12_000 - RESTORE_MARGIN_MS);
+    expect(report).toMatchObject({ ran: false, limited: true });
+
+    // A short attempt budget after the same wait: the detection budget is clipped to the port's.
+    const hold2 = scheduler.runForSite(
+      { site: "alpha", holder: "fetch", acquireTimeoutMs: 1000, minIntervalMs: 0 },
+      () => new Promise<void>((r) => setTimeout(r, 12_000)),
+    );
+    const pending2 = s.coordinator.attempt("alpha", URL1, { budgetMs: 25_000 });
+    await vi.advanceTimersByTimeAsync(12_000);
+    await hold2;
+    await pending2;
+    const call2 = s.browser.challenges[1]!;
+    expect(call2.budgetMs).toBe(25_000 - 12_000 - RESTORE_MARGIN_MS);
+    expect(call2.detectBudgetMs).toBe(call2.budgetMs);
+  });
+
+  it("kind unknown with rounds 0 is captcha-limited: no re-run, the captcha-limited action", async () => {
+    const why = "the page shows a challenge the solver cannot handle (datadome-challenge)";
+    const s = setup({
+      solve: async () => challengeAttempt({ solved: false, kind: "unknown", rounds: 0, message: why }),
+    });
+    const report = await s.coordinator.attempt("alpha", URL1);
+    expect(report).toEqual({
+      ran: false,
+      limited: true,
+      result: "unsolved",
+      kind: "unknown",
+      rounds: 0,
+      url: URL1,
+      message: why,
+      action: captchaLimitedAction("alpha", URL1),
+    });
+    expect(report.action).toBe(
+      `alpha is captcha-limited: its bot check cannot be solved automatically. Open ${URL1} in Aside, solve it, then retry`,
+    );
+    // Detection that did not finish in time is the same verdict.
+    const late = setup({
+      solve: async () =>
+        challengeAttempt({
+          solved: false,
+          kind: "unknown",
+          rounds: 0,
+          message: "detection did not finish in time",
+        }),
+    });
+    expect(await late.coordinator.attempt("alpha", URL1)).toMatchObject({ ran: false, limited: true });
+  });
+
+  it("an attempt that acted and then found something it cannot handle is not limited: re-run", async () => {
+    const s = setup({
+      solve: async () =>
+        challengeAttempt({ solved: false, kind: "unknown", rounds: 1, message: "image grid" }),
+    });
+    expect(await s.coordinator.attempt("alpha", URL1)).toMatchObject({
+      ran: true,
+      limited: false,
+      kind: "unknown",
+      rounds: 1,
+      action: captchaUnsolvedAction(URL1, "image grid"),
+    });
+  });
+
+  it("kind none and solvable kinds re-run, even without an action (e.g. a text captcha and no vision model)", async () => {
+    for (const attempt of [
+      challengeAttempt({ solved: false, kind: "none", rounds: 0 }),
+      challengeAttempt({ solved: false, kind: "text", rounds: 0, message: "no vision model" }),
+      challengeAttempt({ solved: false, kind: "slider", rounds: 2 }),
+      challengeAttempt(),
+    ]) {
+      const s = setup({ solve: async () => attempt });
+      expect(await s.coordinator.attempt("alpha", URL1)).toMatchObject({ ran: true, limited: false });
+    }
+  });
+
+  it("a caller that joins a captcha-limited attempt gets the captcha-limited action for its own page", async () => {
+    const gate = deferred<ChallengeAttempt>();
+    const s = setup({ solve: () => gate.promise });
+    const first = s.coordinator.attempt("alpha", URL1, { budgetMs: 30_000 });
+    const other = "https://alpha.example.com/articles/6";
+    const joined = s.coordinator.join("alpha", other, { budgetMs: 30_000 });
+    gate.resolve(challengeAttempt({ solved: false, kind: "unknown", rounds: 0 }));
+    expect(await first).toMatchObject({ limited: true, action: captchaLimitedAction("alpha", URL1) });
+    expect(await joined).toMatchObject({
+      ran: false,
+      limited: true,
+      url: other,
+      action: captchaLimitedAction("alpha", other),
+    });
   });
 });
 
@@ -362,13 +529,25 @@ describe("ChallengeCoordinator.background", () => {
 describe("budget arithmetic", () => {
   const s = DEFAULT_CHALLENGE_SETTINGS;
 
-  it("attempts inline only with at least captchaInlineMinRemainingMs left, within min(budget, remaining − reserve)", () => {
+  it("attempts inline only with at least detection budget + re-run reserve left, within min(budget, remaining − reserve)", () => {
+    expect(s.detectBudgetMs + s.rerunReserveMs).toBe(35_000);
     expect(planChallenge(s, 90_000)).toEqual({ mode: "inline", budgetMs: 45_000 });
     expect(planChallenge(s, 50_000)).toEqual({ mode: "inline", budgetMs: 35_000 });
-    expect(planChallenge(s, 40_000)).toEqual({ mode: "inline", budgetMs: 25_000 });
-    expect(planChallenge(s, 39_999)).toEqual({ mode: "background" });
-    // A configuration whose reserve leaves nothing for the attempt runs it in the background.
-    expect(planChallenge({ ...s, inlineMinRemainingMs: 10_000 }, 12_000)).toEqual({ mode: "background" });
+    expect(planChallenge(s, 35_000)).toEqual({ mode: "inline", budgetMs: 20_000 });
+    expect(planChallenge(s, 34_999)).toEqual({ mode: "background" });
+    // The detection budget is tunable and moves the threshold with it.
+    expect(planChallenge({ ...s, detectBudgetMs: 5_000 }, 20_000)).toEqual({
+      mode: "inline",
+      budgetMs: 5_000,
+    });
+    expect(planChallenge({ ...s, detectBudgetMs: 5_000 }, 19_999)).toEqual({ mode: "background" });
+    // A short attempt budget caps the inline attempt (the port clips the detection budget to it).
+    expect(planChallenge({ ...s, attemptBudgetMs: 10_000 }, 90_000)).toEqual({
+      mode: "inline",
+      budgetMs: 10_000,
+    });
+    // A configuration that leaves nothing for the attempt runs it in the background.
+    expect(planChallenge({ ...s, detectBudgetMs: 0 }, 15_000)).toEqual({ mode: "background" });
   });
 
   it("re-runs only when the reserve is still there", () => {
@@ -380,5 +559,17 @@ describe("budget arithmetic", () => {
     expect(captchaUnsolvedAction("https://alpha.example.com/")).toBe(
       "The captcha could not be solved automatically. Open https://alpha.example.com/ in Aside, solve it, then retry",
     );
+    expect(captchaLimitedAction("alpha", "https://alpha.example.com/a/1")).toBe(
+      "alpha is captcha-limited: its bot check cannot be solved automatically. Open https://alpha.example.com/a/1 in Aside, solve it, then retry",
+    );
+  });
+
+  it("the old inline minimum is retired from the settings", () => {
+    expect(Object.keys(DEFAULT_CHALLENGE_SETTINGS).sort()).toEqual([
+      "attemptBudgetMs",
+      "auto",
+      "detectBudgetMs",
+      "rerunReserveMs",
+    ]);
   });
 });

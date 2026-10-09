@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   coerceAdapterStatus,
   errorToOutcome,
+  isBlockedError,
   isOutcomeStatus,
   OutcomeError,
   withOutcomeDefaults,
@@ -46,6 +47,12 @@ describe("errorToOutcome", () => {
     expect(errorToOutcome(undefined).message).toBeTruthy();
   });
 
+  it("keeps the outcome's shape for a blocked error (blocked travels on the error, not the outcome)", () => {
+    const message = "alpha answered with a bot check (geo.captcha-delivery.com)";
+    const err = new OutcomeError("access_denied", message, undefined, { blocked: true });
+    expect(errorToOutcome(err)).toEqual({ status: "access_denied", message });
+  });
+
   it("never yields ok or empty, even if misused at runtime", () => {
     const bogus = new OutcomeError("empty" as never, "x");
     expect(errorToOutcome(bogus).status).toBe("adapter_error");
@@ -53,6 +60,30 @@ describe("errorToOutcome", () => {
       if (s === "ok" || s === "empty") continue;
       expect(errorToOutcome(new OutcomeError(s, "m")).status).toBe(s);
     }
+  });
+});
+
+describe("blocked failures thrown as errors", () => {
+  it("OutcomeError carries blocked (false unless given) next to its cause", () => {
+    const cause = new Error("inner");
+    const blocked = new OutcomeError("access_denied", "bot check", "solve it", { blocked: true, cause });
+    expect(blocked).toMatchObject({ status: "access_denied", message: "bot check", action: "solve it" });
+    expect(blocked.blocked).toBe(true);
+    expect(blocked.cause).toBe(cause);
+    expect(new OutcomeError("adapter_error", "m").blocked).toBe(false);
+    expect(new OutcomeError("adapter_error", "m", undefined, { cause }).blocked).toBe(false);
+  });
+
+  it("isBlockedError: only a failure status flagged blocked counts", () => {
+    expect(isBlockedError(new OutcomeError("access_denied", "m", undefined, { blocked: true }))).toBe(true);
+    expect(isBlockedError(new OutcomeError("access_denied", "m"))).toBe(false);
+    expect(isBlockedError({ status: "access_denied", message: "m", blocked: true })).toBe(true);
+    expect(isBlockedError({ status: "ok", blocked: true })).toBe(false);
+    expect(isBlockedError({ status: "empty", blocked: true })).toBe(false);
+    expect(isBlockedError({ status: "access_denied", blocked: "yes" })).toBe(false);
+    expect(isBlockedError(Object.assign(new Error("m"), { blocked: true }))).toBe(false);
+    expect(isBlockedError(null)).toBe(false);
+    expect(isBlockedError("blocked")).toBe(false);
   });
 });
 

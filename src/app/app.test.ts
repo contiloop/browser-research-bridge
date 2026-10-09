@@ -125,9 +125,20 @@ describe("createApp", () => {
     expect(challenges.settings).toEqual({
       auto: true,
       attemptBudgetMs: config.tunables.captchaAttemptBudgetMs,
-      inlineMinRemainingMs: config.tunables.captchaInlineMinRemainingMs,
+      detectBudgetMs: config.tunables.captchaDetectBudgetMs,
       rerunReserveMs: config.tunables.captchaRerunReserveMs,
     });
+    expect(challenges.settings.detectBudgetMs).toBe(20_000);
+    expect(Object.keys(challenges.settings)).not.toContain("inlineMinRemainingMs");
+  });
+
+  it("passes a configured captchaDetectBudgetMs to the coordinator; the retired inline minimum is ignored", async () => {
+    const { bridge } = await makeBridge({
+      bridgeJson: { tunables: { captchaDetectBudgetMs: 8_000, captchaInlineMinRemainingMs: 40_000 } },
+    });
+    const { challenges, config } = bridge.services;
+    expect(challenges.settings.detectBudgetMs).toBe(8_000);
+    expect(config.warnings).toContain('unknown tunable "captchaInlineMinRemainingMs" ignored');
   });
 
   it("captcha.auto false turns the attempts off", async () => {

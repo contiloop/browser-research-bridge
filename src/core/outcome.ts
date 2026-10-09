@@ -12,6 +12,16 @@ export function isFailureStatus(value: unknown): value is FailureStatus {
   return isOutcomeStatus(value) && value !== "ok" && value !== "empty";
 }
 
+export interface OutcomeErrorOptions {
+  cause?: unknown;
+  /**
+   * The failure is a block or captcha page met while the step ran (for example a page script that ran
+   * into a bot check), like an adapter's returned `blocked: true`. Callers that run challenge attempts
+   * read it with {@link isBlockedError}; it never becomes part of the outcome.
+   */
+  blocked?: boolean | undefined;
+}
+
 /**
  * Typed failure thrown by ports and adapters. A non-failure status passed at runtime is coerced to
  * `adapter_error`, so an error can never surface as `ok` or `empty`.
@@ -19,13 +29,27 @@ export function isFailureStatus(value: unknown): value is FailureStatus {
 export class OutcomeError extends Error {
   readonly status: FailureStatus;
   readonly action: string | undefined;
+  /** A block or captcha page (see `OutcomeErrorOptions.blocked`); false unless given. */
+  readonly blocked: boolean;
 
-  constructor(status: FailureStatus, message: string, action?: string, options?: { cause?: unknown }) {
-    super(message, options);
+  constructor(status: FailureStatus, message: string, action?: string, options?: OutcomeErrorOptions) {
+    super(message, options !== undefined && "cause" in options ? { cause: options.cause } : undefined);
     this.name = "OutcomeError";
     this.status = isFailureStatus(status) ? status : "adapter_error";
     this.action = action;
+    this.blocked = options?.blocked === true;
   }
+}
+
+/**
+ * Whether something thrown is a failure flagged `blocked` (a block or captcha page): an object with a
+ * failure status and `blocked: true`, as an `OutcomeError` carries it. Read where a returned adapter
+ * verdict's `blocked` would be read.
+ */
+export function isBlockedError(err: unknown): boolean {
+  if (typeof err !== "object" || err === null) return false;
+  const e = err as { status?: unknown; blocked?: unknown };
+  return e.blocked === true && isFailureStatus(e.status);
 }
 
 export const DEFAULT_STATUS_MESSAGES: Readonly<Record<Exclude<OutcomeStatus, "ok">, string>> = {

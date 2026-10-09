@@ -12,7 +12,8 @@ import type { FakeSiteSpec, McpWorld, WorldOptions } from "../../../test/support
 import { challengeAttempt } from "../../../test/support/site-fixtures.js";
 import { encodeUrlLocalId } from "../../core/ids.js";
 import type { DocumentRef } from "../../core/models.js";
-import { NO_SOLVER_MESSAGE, captchaUnsolvedAction } from "./challenge.js";
+import { OutcomeError } from "../../core/outcome.js";
+import { captchaLimitedAction, captchaUnsolvedAction } from "./challenge.js";
 import { perItemBudget } from "./read-service.js";
 
 let world: McpWorld | null = null;
@@ -345,7 +346,7 @@ describe("captcha attempts in live reads", () => {
     expect(w.browser.challenges.map((c) => c.url)).toEqual([ARTICLE]);
   });
 
-  it("an Aside without the captcha capability: the action names the solver's message", async () => {
+  it("an Aside without the captcha capability (unavailable): captcha-limited at once, no re-run", async () => {
     const w = await make([{ key: "alpha", read: async () => blockedRead }], {
       challenge: {
         solve: async () =>
@@ -359,10 +360,8 @@ describe("captcha attempts in live reads", () => {
       },
     });
     const out = await w.read.fetch(ARTICLE);
-    expect(out.error?.action).toBe(
-      captchaUnsolvedAction(ARTICLE, "captcha solving is not available in this Aside version"),
-    );
-    expect(out.error?.action).toContain("(captcha solving is not available in this Aside version)");
+    const limited = captchaLimitedAction("alpha", ARTICLE);
+    expect(out.error).toEqual({ code: "access_denied", message: limited, site: "alpha", action: limited });
     expect(w.count("alpha").read).toBe(1);
   });
 
@@ -453,12 +452,14 @@ describe("captcha attempts in live reads", () => {
     expect(w.scheduler.cooldownUntil("alpha")).toBeNull();
   });
 
-  it("a browser without solveChallenge: no re-run, the failure carries the captcha action, logged unavailable", async () => {
+  it("a browser without solveChallenge: captcha-limited, no re-run, no background attempt, logged unavailable", async () => {
     const w = await make([{ key: "alpha", read: async () => blockedRead }], { challenge: { solve: null } });
     const out = await w.read.fetch(ARTICLE);
     expect(out.status).toBe("access_denied");
-    expect(out.error?.action).toBe(captchaUnsolvedAction(ARTICLE, NO_SOLVER_MESSAGE));
+    expect(out.error?.message).toBe(captchaLimitedAction("alpha", ARTICLE));
+    expect(out.error?.action).toBe(captchaLimitedAction("alpha", ARTICLE));
     expect(w.count("alpha").read).toBe(1);
+    expect(w.challenges?.inFlight("alpha")).toBe(false);
     expect(
       w.logger.lines.some((l) => l.includes("captcha attempt") && l.includes('"result":"unavailable"')),
     ).toBe(true);
@@ -469,9 +470,9 @@ describe("captcha attempts in live reads", () => {
     let release!: () => void;
     const gate = new Promise<void>((r) => (release = r));
     const w = await make([captchaSite(state)], {
-      // Every call has less than the inline minimum left.
+      // Every call has less than detection budget + re-run reserve left.
       challenge: {
-        settings: { inlineMinRemainingMs: 200_000 },
+        settings: { detectBudgetMs: 200_000 },
         solve: async () => {
           await gate;
           state.cleared = true;
@@ -481,6 +482,12 @@ describe("captcha attempts in live reads", () => {
     });
     const first = await w.read.fetch(ARTICLE);
     expect(first.status).toBe("access_denied");
+    expect(first.error).toEqual({
+      code: "access_denied",
+      message: "captcha page",
+      site: "alpha",
+      action: captchaUnsolvedAction(ARTICLE),
+    });
     expect(w.count("alpha").read).toBe(1);
     expect(w.challenges?.inFlight("alpha")).toBe(true);
     release();
@@ -530,7 +537,8 @@ describe("captcha attempts in live reads", () => {
         challenge: {
           solve: async () => {
             attempts += 1;
-            return challengeAttempt({ solved: false, kind: "unknown", rounds: 0, message: "x" });
+            // Acted, then met something it cannot handle: the call re-runs once.
+            return challengeAttempt({ solved: false, kind: "unknown", rounds: 1, message: "x" });
           },
         },
       },
@@ -561,5 +569,220 @@ describe("captcha attempts in live reads", () => {
     expect(out.items.map((i) => i.status)).toEqual(["ok", "ok"]);
     expect(w.browser.challenges).toHaveLength(1);
     expect(w.count("alpha").read).toBe(4);
+  });
+
+  it("captcha-limited (kind unknown, rounds 0): the failure at once as access_denied with the captcha-limited sentence; no re-run, no background attempt", async () => {
+    const why = "the page shows a challenge the solver cannot handle (datadome-challenge)";
+    const w = await make([{ key: "alpha", read: async () => blockedRead }], {
+      challenge: {
+        solve: async () => challengeAttempt({ solved: false, kind: "unknown", rounds: 0, message: why }),
+      },
+    });
+    const out = await w.read.fetch(ARTICLE);
+    const sentence = captchaLimitedAction("alpha", ARTICLE);
+    expect(sentence).toBe(
+      `alpha is captcha-limited: its bot check cannot be solved automatically. Open ${ARTICLE} in Aside, solve it, then retry`,
+    );
+    expect(out).toEqual({
+      ref: ARTICLE,
+      status: "access_denied",
+      error: { code: "access_denied", message: sentence, site: "alpha", action: sentence },
+    });
+    expect(w.count("alpha").read).toBe(1);
+    expect(w.browser.challenges).toHaveLength(1);
+    expect(w.challenges?.inFlight("alpha")).toBe(false);
+    await w.challenges?.settled();
+    expect(w.browser.challenges).toHaveLength(1);
+    // Lifecycle unchanged, no cool-down; nothing is remembered: the next call attempts again.
+    expect(w.registry.get("alpha")?.status).toBe("active");
+    expect(w.scheduler.cooldownUntil("alpha")).toBeNull();
+    await w.read.fetch(ARTICLE);
+    expect(w.browser.challenges).toHaveLength(2);
+    // Metadata-only logs.
+    expect(w.logger.lines.some((l) => l.includes("captcha-limited") && l.includes('"site":"alpha"'))).toBe(
+      true,
+    );
+    expect(w.logger.lines.some((l) => l.includes("https://"))).toBe(false);
+  });
+
+  it("captcha-limited replaces any blocked failure status with access_denied (never empty, never ok)", async () => {
+    const w = await make(
+      [{ key: "alpha", read: async () => ({ status: "auth_required", message: "wall", blocked: true }) }],
+      {
+        challenge: { solve: async () => challengeAttempt({ solved: false, kind: "unknown", rounds: 0 }) },
+      },
+    );
+    const out = await w.read.fetch(ARTICLE);
+    expect(out.status).toBe("access_denied");
+    expect(out.error?.code).toBe("access_denied");
+    expect(out.error?.action).toBe(captchaLimitedAction("alpha", ARTICLE));
+    expect(w.count("alpha").read).toBe(1);
+  });
+
+  it("an attempt that acted and still ended unknown re-runs once; still blocked → the could-not-be-solved action", async () => {
+    const why =
+      "after the checkbox action the page shows a challenge the solver cannot handle (for example an image grid)";
+    const w = await make([{ key: "alpha", read: async () => blockedRead }], {
+      challenge: {
+        solve: async () => challengeAttempt({ solved: false, kind: "unknown", rounds: 1, message: why }),
+      },
+    });
+    const out = await w.read.fetch(ARTICLE);
+    expect(out.error).toEqual({
+      code: "access_denied",
+      message: "captcha page",
+      site: "alpha",
+      action: captchaUnsolvedAction(ARTICLE, why),
+    });
+    expect(w.count("alpha").read).toBe(2);
+  });
+
+  it("other attempt failures keep today's behavior: the original failure with the could-not-be-solved action", async () => {
+    const w = await make([{ key: "alpha", read: async () => blockedRead }], {
+      challenge: {
+        solve: async () => {
+          throw new OutcomeError("browser_unavailable", "Aside is not running");
+        },
+      },
+    });
+    const out = await w.read.fetch(ARTICLE);
+    expect(out.error).toEqual({
+      code: "access_denied",
+      message: "captcha page",
+      site: "alpha",
+      action: captchaUnsolvedAction(ARTICLE),
+    });
+    expect(w.count("alpha").read).toBe(1);
+  });
+
+  it("an inline attempt starts only with detection budget + re-run reserve left; below that, at once and in the background", async () => {
+    // 90 s call budget; the read itself takes 55 s (or 56 s) on the clock before it reports the captcha.
+    for (const [spentMs, inline] of [
+      [55_000, true],
+      [55_001, false],
+    ] as const) {
+      let nowMs = Date.parse("2026-10-08T10:00:00Z");
+      let reads = 0;
+      const w = await make(
+        [
+          {
+            key: "alpha",
+            read: async () => {
+              if (++reads === 1) nowMs += spentMs;
+              return blockedRead;
+            },
+          },
+        ],
+        {
+          clock: { now: () => new Date(nowMs) },
+          challenge: { solve: async () => challengeAttempt({ solved: false, kind: "unknown", rounds: 0 }) },
+        },
+      );
+      const out = await w.read.fetch(ARTICLE);
+      await w.challenges?.settled();
+      expect(w.browser.challenges, `spent ${spentMs}`).toHaveLength(1);
+      if (inline) {
+        expect(w.browser.challenges[0]!.budgetMs).toBeLessThanOrEqual(20_000);
+        expect(out.error?.action).toBe(captchaLimitedAction("alpha", ARTICLE));
+      } else {
+        // The background attempt has the whole attempt budget; the caller gets today's action.
+        expect(out.error?.action).toBe(captchaUnsolvedAction(ARTICLE));
+        expect(out.error?.message).toBe("captcha page");
+        expect(w.logger.lines.some((l) => l.includes("captcha deferred to the background"))).toBe(true);
+      }
+      expect(w.count("alpha").read).toBe(1);
+      await w.cleanup();
+      world = null;
+    }
+  });
+});
+
+describe("a bot check thrown by a page-script step of a read", () => {
+  const ARTICLE = "https://alpha.example.com/articles/5";
+  const BOT = "alpha answered with a bot check (geo.captcha-delivery.com)";
+  const botCheck = () => new OutcomeError("access_denied", BOT, undefined, { blocked: true });
+
+  /** alpha's read runs a page script, which throws while the fake port has a failure scripted. */
+  const read = reader("alpha")!;
+  const scriptedSite: FakeSiteSpec = {
+    key: "alpha",
+    read: async (ref, ctx) => {
+      await ctx.browser.runScript("return 1;");
+      return read(ref, ctx);
+    },
+  };
+
+  it("solved: the attempt runs on the read's URL and the re-run returns the document", async () => {
+    const w: McpWorld = await make([scriptedSite], {
+      challenge: {
+        solve: async () => {
+          w.browser.scriptErrors.delete("alpha");
+          return challengeAttempt();
+        },
+      },
+    });
+    w.browser.scriptErrors.set("alpha", botCheck());
+    const out = await w.read.fetch(ARTICLE);
+    expect(out.status).toBe("ok");
+    expect(out.document?.url).toBe(ARTICLE);
+    expect(w.browser.challenges.map((c) => c.url)).toEqual([ARTICLE]);
+    expect(w.count("alpha").read).toBe(2);
+    expect(w.scheduler.cooldownUntil("alpha")).toBeNull();
+  });
+
+  it("unsolved: the bot-check failure with the captcha action, no cool-down", async () => {
+    const why = "the slider captcha is still shown after 2 rounds";
+    const w: McpWorld = await make([scriptedSite], {
+      challenge: {
+        solve: async () => challengeAttempt({ solved: false, kind: "slider", rounds: 2, message: why }),
+      },
+    });
+    w.browser.scriptErrors.set("alpha", botCheck());
+    const out = await w.read.fetch(ARTICLE);
+    expect(out).toEqual({
+      ref: ARTICLE,
+      status: "access_denied",
+      error: {
+        code: "access_denied",
+        message: BOT,
+        site: "alpha",
+        action: captchaUnsolvedAction(ARTICLE, why),
+      },
+    });
+    expect(w.count("alpha").read).toBe(2);
+    expect(w.scheduler.cooldownUntil("alpha")).toBeNull();
+    expect(w.registry.get("alpha")?.status).toBe("active");
+    expect(w.logger.lines.some((l) => l.includes("site read outcome") && l.includes('"blocked":true'))).toBe(
+      true,
+    );
+  });
+
+  it("captcha-limited: a bot check the solver cannot act on is answered at once, without a re-run", async () => {
+    const why = "the page shows a challenge the solver cannot handle (datadome-challenge)";
+    const w: McpWorld = await make([scriptedSite], {
+      challenge: {
+        solve: async () => challengeAttempt({ solved: false, kind: "unknown", rounds: 0, message: why }),
+      },
+    });
+    w.browser.scriptErrors.set("alpha", botCheck());
+    const out = await w.read.fetch(ARTICLE);
+    const sentence = captchaLimitedAction("alpha", ARTICLE);
+    expect(out).toEqual({
+      ref: ARTICLE,
+      status: "access_denied",
+      error: { code: "access_denied", message: sentence, site: "alpha", action: sentence },
+    });
+    expect(w.count("alpha").read).toBe(1);
+    expect(w.scheduler.cooldownUntil("alpha")).toBeNull();
+    expect(w.registry.get("alpha")?.status).toBe("active");
+  });
+
+  it("a thrown failure that is not blocked gets no attempt", async () => {
+    const w: McpWorld = await make([scriptedSite], { challenge: {} });
+    w.browser.scriptErrors.set("alpha", new OutcomeError("adapter_error", "page script failed: boom"));
+    const out = await w.read.fetch(ARTICLE);
+    expect(out.status).toBe("adapter_error");
+    expect(w.browser.challenges).toEqual([]);
+    expect(w.count("alpha").read).toBe(1);
   });
 });

@@ -1,7 +1,8 @@
 /* Pure page logic of the settings page: the Getting started checklist and its "what to do next"
- * line, the helper's readiness, ChatGPT sub-step states, the "what to do now" choice per site, when a
- * site or a paused job offers the Aside AI login text, the passphrase generator, and the language
- * choice. No DOM and no network, so the unit tests import it directly. */
+ * line, the helper's readiness, ChatGPT sub-step states, the "what to do now" choice per site (and when
+ * its button reads "Logged in? Check now"), when a site or a paused job offers the Aside AI login text,
+ * the Aside browser account the page names, the passphrase generator, and the language choice. No DOM
+ * and no network, so the unit tests import it directly. */
 
 /** Characters of a generated passphrase: letters and digits without look-alikes (0/O, 1/l/I). */
 export const PASSPHRASE_ALPHABET = "abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789";
@@ -239,6 +240,28 @@ export function siteGuidance(site) {
     default:
       return { say: "site.do.unknown", primary: null };
   }
+}
+
+/**
+ * A site card whose one thing to do is logging in, with Check now as its prominent action (a
+ * `needs_login` site without a helper job in the way). Its button then reads "Logged in? Check now" and
+ * the card says that the status changes only after Check now. A job paused for a login keeps Retry.
+ */
+export function loginCheckPrimary(site) {
+  const guide = siteGuidance(site);
+  return (guide.say === "site.do.login" || guide.say === "site.do.loginNoUrl") && guide.primary === "check";
+}
+
+/** The program's Aside browser account when none is known yet (the settings not loaded): `u0`. */
+export const DEFAULT_ASIDE_ACCOUNT = "u0";
+
+/**
+ * The Aside browser account the program uses, from `GET /api/settings` (`asideAccount.value`), as
+ * given; {@link DEFAULT_ASIDE_ACCOUNT} while the settings are not loaded.
+ */
+export function asideAccountOf(settings) {
+  const value = settings?.asideAccount?.value;
+  return typeof value === "string" && value.trim() !== "" ? value : DEFAULT_ASIDE_ACCOUNT;
 }
 
 /** `1.5 KB` style sizes. */

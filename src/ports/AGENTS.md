@@ -15,7 +15,7 @@ Not in scope: implementations, defaults beyond schema defaults, I/O.
 
 - `parseSiteManifest` enforces: `key` valid, `hostnames` non-empty and unique, `extraAllowedHosts` unique, `timezone` a valid IANA zone, `sampleQuery` non-empty when `capabilities.search` is true, defaults `minReadChars` 200 and `minIntervalMs` 1500 (overridable through schema options from the tunables).
 - `hostnames` means ownership (URL → site, duplicate check); `extraAllowedHosts` widens only the browser scope. Keep the two fields separate in every new contract.
-- Browser port errors are `OutcomeError`s: `browser_unavailable`, `timeout`, or `adapter_error` for a shim violation.
+- Browser port errors are `OutcomeError`s: `browser_unavailable`, `timeout`, or `adapter_error` for a shim violation; a page-script step blocked on a captcha vendor host is `access_denied` with `blocked: true` (a bot check, read with `isBlockedError`). `SolveChallengeOptions.detectBudgetMs` is optional: absent, it equals `budgetMs`.
 - `ConnectionTool` failure messages are the implementation's own wording, never raw tool output, and never contain the runtime key.
 - `TokenStore` only ever sees hashes of tokens, codes, and client secrets.
 - `BrowserSession` never attaches to user tabs; `dispose()` closes the session's tabs except a warm tab the port may keep.

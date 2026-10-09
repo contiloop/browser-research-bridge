@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { FakeAsideRepl } from "../../../test/support/fake-aside-repl.js";
+import { OutcomeError } from "../../core/outcome.js";
 import type { Logger } from "../../ports/logger.js";
 import type { SiteLease } from "../../ports/scheduler.js";
 import { AsideBrowserPort } from "./port.js";
@@ -132,6 +133,145 @@ describe("AsideBrowserPort", () => {
       detail: "evil.test",
     });
     expect(repl.pageRequests).toEqual([]);
+  });
+
+  describe("a page script that runs into a bot check", () => {
+    const evaluateFetch = (url: string) =>
+      `return await page.evaluate(async () => { try { await fetch(${JSON.stringify(url)}); } catch (e) {} return 1; });`;
+
+    it("a blocked request to a captcha vendor host fails as a blocked access_denied, still blocked and logged", async () => {
+      const { port, repl, warn } = setup();
+      const session = await port.openSession(scope);
+      const tab = await session.openTab("https://example.com/");
+      const failure = session.runScript(
+        evaluateFetch("https://geo.captcha-delivery.com/captcha/?initialCid=secret"),
+        { tab },
+      );
+      await expect(failure).rejects.toBeInstanceOf(OutcomeError);
+      await expect(failure).rejects.toMatchObject({
+        status: "access_denied",
+        blocked: true,
+        message: "example answered with a bot check (geo.captcha-delivery.com)",
+      });
+      // The request stayed blocked and the violation is logged as before (host only).
+      expect(repl.pageRequests).toEqual([]);
+      expect(warn).toHaveBeenCalledWith("browser shim violation", {
+        site: "example",
+        kind: "request",
+        detail: "geo.captcha-delivery.com",
+      });
+      expect(JSON.stringify(warn.mock.calls)).not.toContain("secret");
+      // Nothing was widened: the tab's filter allows no vendor host.
+      const patterns = repl.pages.get(tab.id)!.blockPatterns;
+      expect(patterns.filter((p) => !p.block).every((p) => p.urlPattern.includes("example.com"))).toBe(true);
+    });
+
+    it("path-limited vendor entries (google.com, gstatic.com) match on the host alone", async () => {
+      const { port } = setup();
+      const session = await port.openSession(scope);
+      const tab = await session.openTab("https://example.com/");
+      for (const [url, host] of [
+        ["https://www.google.com/recaptcha/api2/anchor?k=1", "www.google.com"],
+        ["https://www.google.com/maps", "www.google.com"],
+        ["https://www.gstatic.com/fonts/x.woff", "www.gstatic.com"],
+        ["https://challenges.cloudflare.com/turnstile/v0/api.js", "challenges.cloudflare.com"],
+        ["https://js.hcaptcha.com/1/api.js", "js.hcaptcha.com"],
+        ["https://static.geetest.com/v4/gt4.js", "static.geetest.com"],
+      ] as const) {
+        await expect(session.runScript(evaluateFetch(url), { tab })).rejects.toMatchObject({
+          status: "access_denied",
+          blocked: true,
+          message: `example answered with a bot check (${host})`,
+        });
+      }
+    });
+
+    it("any other blocked host keeps the adapter_error rule (look-alike vendor names included)", async () => {
+      const { port } = setup();
+      const session = await port.openSession(scope);
+      const tab = await session.openTab("https://example.com/");
+      for (const host of [
+        "evil.test",
+        "notcaptcha-delivery.com",
+        "captcha-delivery.com.evil.test",
+        "cloudflare.com",
+      ]) {
+        const failure = session.runScript(evaluateFetch(`https://${host}/x`), { tab });
+        await expect(failure).rejects.toMatchObject({
+          status: "adapter_error",
+          blocked: false,
+          message: `page script blocked by the bridge: request to ${host} is outside the site's hostnames`,
+        });
+      }
+    });
+
+    it("a vendor host and another host in one step: the bot check wins; both are logged", async () => {
+      const { port, repl, warn } = setup();
+      const session = await port.openSession(scope);
+      const tab = await session.openTab("https://example.com/");
+      const store = repl.pages.get(tab.id)!.guardStore;
+      store.push({ kind: "request", host: "evil.test", attributed: true });
+      store.push({ kind: "request", host: "js.hcaptcha.com", attributed: true });
+      await expect(session.runScript("return 1;", { tab })).rejects.toMatchObject({
+        status: "access_denied",
+        blocked: true,
+        message: "example answered with a bot check (js.hcaptcha.com)",
+      });
+      expect(warn).toHaveBeenCalledWith("browser shim violation", {
+        site: "example",
+        kind: "request",
+        detail: "evil.test",
+      });
+      expect(warn).toHaveBeenCalledWith("browser shim violation", {
+        site: "example",
+        kind: "request",
+        detail: "js.hcaptcha.com",
+      });
+    });
+
+    it("a same-site request the site redirects to a vendor host is a bot check too", async () => {
+      const { port, repl } = setup();
+      repl.responses.set("https://example.com/api", {
+        status: 302,
+        headers: { location: "https://geo.captcha-delivery.com/captcha/?c=1" },
+        body: "",
+      });
+      const session = await port.openSession(scope);
+      await expect(
+        session.runScript(`await fetch("https://example.com/api"); return 1;`),
+      ).rejects.toMatchObject({
+        status: "access_denied",
+        blocked: true,
+        message: "example answered with a bot check (geo.captcha-delivery.com)",
+      });
+      expect(repl.fetchLog.map((f) => f.url)).toEqual(["https://example.com/api"]);
+    });
+
+    it("the script's own fetch or openTab of a vendor URL is the adapter's doing: adapter_error", async () => {
+      const { port, repl } = setup();
+      const session = await port.openSession(scope);
+      for (const call of [
+        `try { await fetch("https://geo.captcha-delivery.com/captcha/"); } catch (e) {} return 1;`,
+        `try { await openTab("https://www.google.com/recaptcha/api2/anchor"); } catch (e) {} return 1;`,
+      ]) {
+        await expect(session.runScript(call)).rejects.toMatchObject({
+          status: "adapter_error",
+          blocked: false,
+        });
+      }
+      expect(repl.fetchLog).toEqual([]);
+    });
+
+    it("only page-script steps are mapped: a tab open that lands on a vendor host stays adapter_error", async () => {
+      const { port, repl } = setup();
+      repl.redirects.set("https://example.com/gate", "https://geo.captcha-delivery.com/interstitial/");
+      const session = await port.openSession(scope);
+      await expect(session.openTab("https://example.com/gate")).rejects.toMatchObject({
+        status: "adapter_error",
+        blocked: false,
+        message: expect.stringContaining("navigation to geo.captcha-delivery.com") as string,
+      });
+    });
   });
 
   it("does not fail a step for requests the site's own scripts made; logs them at debug", async () => {

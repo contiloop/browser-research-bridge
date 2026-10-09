@@ -10,7 +10,7 @@ import { readFileSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
 import {
   DEFAULT_CAPTCHA_ATTEMPT_BUDGET_MS,
-  DEFAULT_CAPTCHA_INLINE_MIN_REMAINING_MS,
+  DEFAULT_CAPTCHA_DETECT_BUDGET_MS,
   DEFAULT_CAPTCHA_RERUN_RESERVE_MS,
 } from "../core/defaults.js";
 import {
@@ -56,8 +56,12 @@ export interface Tunables {
   warmTabTtlSeconds: number;
   /** Time one automatic captcha attempt may take. */
   captchaAttemptBudgetMs: number;
-  /** Tool-call budget that must remain for a captcha to be attempted inside the call. */
-  captchaInlineMinRemainingMs: number;
+  /**
+   * Detection budget of one captcha attempt: from the start of the attempt (after the scheduler slot)
+   * through the reload, the interstitial wait, and detection. A tool call attempts inline only with
+   * this plus `captchaRerunReserveMs` left.
+   */
+  captchaDetectBudgetMs: number;
   /** Tool-call budget kept back for re-running the call after a solved captcha. */
   captchaRerunReserveMs: number;
   consecutiveAdapterErrorsToDegrade: number;
@@ -156,7 +160,7 @@ export const DEFAULT_TUNABLES: Readonly<Tunables> = Object.freeze({
   coolDownSeconds: 600,
   warmTabTtlSeconds: 300,
   captchaAttemptBudgetMs: DEFAULT_CAPTCHA_ATTEMPT_BUDGET_MS,
-  captchaInlineMinRemainingMs: DEFAULT_CAPTCHA_INLINE_MIN_REMAINING_MS,
+  captchaDetectBudgetMs: DEFAULT_CAPTCHA_DETECT_BUDGET_MS,
   captchaRerunReserveMs: DEFAULT_CAPTCHA_RERUN_RESERVE_MS,
   consecutiveAdapterErrorsToDegrade: 3,
   healthCheckIntervalSeconds: 86_400,

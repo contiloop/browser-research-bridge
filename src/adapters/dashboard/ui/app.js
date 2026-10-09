@@ -13,6 +13,7 @@ import { DICTIONARIES, t } from "./i18n.js";
 import { label } from "./labels.js";
 import { COMMANDS, LINKS, asideText, loginTarget, loginText } from "./instructions.js";
 import {
+  asideAccountOf,
   blockKind,
   chatgptSubsteps,
   firstOpenStep,
@@ -22,6 +23,7 @@ import {
   helperNeedsPoll,
   helperReady,
   jobPausedForLogin,
+  loginCheckPrimary,
   nextStep,
   offersLoginHelp,
   pickLanguage,
@@ -499,7 +501,8 @@ async function checkNow(site) {
   await refresh();
 }
 
-function siteAction(site, action, primary) {
+/** A site's button for `action`; `text` replaces its usual label (the "Logged in? Check now" button). */
+function siteAction(site, action, primary, text) {
   const key = encodeURIComponent(site.key);
   const name = site.name || site.key;
   const cls = primary ? "primary" : "secondary";
@@ -517,7 +520,7 @@ function siteAction(site, action, primary) {
         cls,
       );
     case "check":
-      return button(tx("action.check"), () => checkNow(site), cls);
+      return button(text ?? tx("action.check"), () => checkNow(site), cls);
     case "cancel":
       return site.job
         ? button(
@@ -1087,9 +1090,15 @@ function asideHelper(id, getText) {
   };
 }
 
-/** The Aside AI login text for one site (a `needs_login` card or a job paused for a login), or null. */
+/** The Aside browser account the program uses, as the settings give it (`u0` until they are loaded). */
+const asideAccount = () => asideAccountOf(data.settings);
+
+/**
+ * The Aside AI login text for one site (a `needs_login` card or a job paused for a login), naming the
+ * program's Aside browser account, or null.
+ */
 function loginHelper(id, target) {
-  const text = loginText(lang, target);
+  const text = loginText(lang, target, asideAccount());
   if (text === null) return null;
   const box = disclosure(
     id,
@@ -1971,7 +1980,7 @@ function renderStart() {
 
   const sitesStep = byId.sites;
   const reuters = reutersSite() ?? null;
-  renderIf(ui.steps.sites.dyn, [sitesStep, reuters, data.jobs], () => {
+  renderIf(ui.steps.sites.dyn, [sitesStep, reuters, data.jobs, asideAccount()], () => {
     if (sitesStep.why && sitesStep.why !== "no_data") return [stepWhy(sitesStep)];
     if (!Array.isArray(data.sites)) return [stepWhy(sitesStep)];
     return [
@@ -2005,10 +2014,14 @@ function siteCard(site, compact) {
   const status = site.checking
     ? `${lb("siteStatus", site.status)} · ${tx("site.checking")}`
     : lb("siteStatus", site.status);
+  // The login sentences name the Aside browser account whose window the program uses.
+  const account = asideAccount();
   const say =
     guide.say === "site.do.login"
-      ? h("p", { class: "todo-line" }, rich("site.do.login", { url: link(site.loginUrl) }))
-      : h("p", { class: "todo-line" }, tx(guide.say));
+      ? h("p", { class: "todo-line" }, rich("site.do.login", { url: link(site.loginUrl), account }))
+      : h("p", { class: "todo-line" }, tx(guide.say, { account }));
+  // After logging in, Check now is what changes the status: its button says so, with a line under it.
+  const loginCheck = loginCheckPrimary(site);
   const requested =
     site.job?.state === "awaiting_user" && site.job.requestedAction
       ? [
@@ -2017,7 +2030,9 @@ function siteCard(site, compact) {
         ]
       : null;
   const actions = Array.isArray(site.actions) ? site.actions : [];
-  const primary = guide.primary ? siteAction(site, guide.primary, true) : null;
+  const primary = guide.primary
+    ? siteAction(site, guide.primary, true, loginCheck ? tx("action.checkLoggedIn") : undefined)
+    : null;
   const others = actions
     .filter((a) => a !== guide.primary && (!compact || a === "check"))
     .map((a) => siteAction(site, a, false));
@@ -2032,6 +2047,7 @@ function siteCard(site, compact) {
     say,
     requested,
     h("div", { class: "row actions" }, primary, others),
+    loginCheck ? h("p", { class: "small check-note" }, tx("site.do.loginCheckNote")) : null,
     loginHelp,
     detailList(`site:${site.key}`, [
       [tx("site.d.key"), site.key],
@@ -2074,12 +2090,13 @@ function offNotice(key) {
 }
 
 function renderSites() {
-  renderIf(ui.sitesList, [data.sites, data.status?.mode], () => {
+  // The account is part of the input: the login sentences and texts name it.
+  renderIf(ui.sitesList, [data.sites, data.status?.mode, asideAccount()], () => {
     if (!coreRunning() || !Array.isArray(data.sites)) return [offNotice("sites.off")];
     if (data.sites.length === 0) return [h("p", { class: "muted" }, tx("sites.empty"))];
     return data.sites.map((s) => siteCard(s, false));
   });
-  renderIf(ui.jobsList, [data.jobs, data.sites], () => {
+  renderIf(ui.jobsList, [data.jobs, data.sites, asideAccount()], () => {
     if (!Array.isArray(data.jobs)) return [];
     if (data.jobs.length === 0) return [h("p", { class: "muted" }, tx("jobs.empty"))];
     return data.jobs.map((job) => {

@@ -77,7 +77,11 @@ function canonicalize(url: string): string {
   if ((u.protocol !== "https:" && u.protocol !== "http:") || !isReutersHost(u.hostname)) return url;
   let path = u.pathname.replace(/\/{2,}/g, "/");
   if (path === "" || path === "/") return url;
-  const last = path.split("/").filter((s) => s !== "").pop() ?? "";
+  const last =
+    path
+      .split("/")
+      .filter((s) => s !== "")
+      .pop() ?? "";
   if (!path.endsWith("/") && !last.includes(".")) path = `${path}/`;
   return `${ORIGIN}${path}`;
 }
@@ -150,6 +154,8 @@ function isPaidArticle(html: string): boolean {
 
 /** The signed-in account control of the site header (rendered only for a logged-in session). */
 const SIGNED_IN_MARKER = 'data-testid="AccountButton"';
+/** The site header; absent when the page never rendered (bot check, blocked scripts). */
+const SITE_HEADER_MARKER = 'data-testid="SiteHeader"';
 
 /**
  * Pure verdict on article-page HTML. Reuters ships the paragraphs in the server HTML and applies its
@@ -227,7 +233,7 @@ function searchScript(apiUrl: string): string {
         return { status: 0, text: String(e && e.message ? e.message : e) };
       }
     });
-    return { status: result.status, text: result.text, signedIn: state.account };
+    return { status: result.status, text: result.text, signedIn: state.account, header: state.header };
   `;
 }
 
@@ -239,7 +245,9 @@ interface SearchArticle {
   authors: string[];
 }
 
-function parseSearchBody(text: string): { articles: SearchArticle[]; rawCount: number; total: number } | null {
+function parseSearchBody(
+  text: string,
+): { articles: SearchArticle[]; rawCount: number; total: number } | null {
   let body: unknown;
   try {
     body = JSON.parse(text);
@@ -259,7 +267,13 @@ function parseSearchBody(text: string): { articles: SearchArticle[]; rawCount: n
     if (a === null) continue;
     const path = str(a["canonical_url"]);
     const title = str(a["title"]) ?? str(a["basic_headline"]) ?? str(a["web"]);
-    if (path === null || !path.startsWith("/") || path.startsWith("//") || title === null || title.trim() === "") {
+    if (
+      path === null ||
+      !path.startsWith("/") ||
+      path.startsWith("//") ||
+      title === null ||
+      title.trim() === ""
+    ) {
       continue;
     }
     const authors: string[] = [];
@@ -320,8 +334,17 @@ async function search(req: AdapterSearchRequest, ctx: AdapterContext): Promise<A
       action: BLOCK_ACTION,
     });
   }
-  // The manifest requires the login: a search page without the signed-in account control means
-  // the Reuters session in Aside is gone, even when the API still answers.
+  // A search page without the site header never rendered: Reuters' bot check (DataDome) held the
+  // page, or its scripts were blocked. That is not a lapsed login; report the bot check so the
+  // bridge tries once and otherwise asks the user to pass it in Aside.
+  if (raw["header"] !== true) {
+    return searchFailure("access_denied", "Reuters answered with a bot check (the page did not render)", {
+      blocked: true,
+      action: BLOCK_ACTION,
+    });
+  }
+  // The manifest requires the login: a rendered search page without the signed-in account control
+  // means the Reuters session in Aside is gone, even when the API still answers.
   if (raw["signedIn"] !== true) {
     return searchFailure("auth_required", "Reuters is not signed in in Aside", { action: LOGIN_ACTION });
   }
@@ -533,13 +556,24 @@ async function read(ref: DocumentRef, ctx: AdapterContext): Promise<AdapterReadR
     );
   }
   const tab = await ctx.browser.openTab(url, { waitUntil: "domcontentloaded" });
-  const page = asArticlePage(await ctx.browser.runScript(READ_SCRIPT, { tab, title: "reuters read article" }));
+  const page = asArticlePage(
+    await ctx.browser.runScript(READ_SCRIPT, { tab, title: "reuters read article" }),
+  );
   if (page === null) {
     return readFailure("adapter_error", "the Reuters article script returned an unexpected result");
   }
 
   // Completeness first: never `ok` for a bot check, login/registration wall, or paywall.
-  const verdict = checkCompleteness({ url: page.url, httpStatus: page.httpStatus, html: page.html });
+  let verdict = checkCompleteness({ url: page.url, httpStatus: page.httpStatus, html: page.html });
+  if (verdict.status === "auth_required" && !page.html.includes(SITE_HEADER_MARKER)) {
+    // No site header at all: the page never rendered (bot check or blocked scripts), so the missing
+    // account control says nothing about the login.
+    verdict = {
+      status: "access_denied",
+      reason: "Reuters answered with a bot check (the page did not render)",
+      blocked: true,
+    };
+  }
   if (verdict.status !== "ok") {
     const action =
       verdict.status === "auth_required"

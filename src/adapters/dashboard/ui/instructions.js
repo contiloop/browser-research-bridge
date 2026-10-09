@@ -7,9 +7,9 @@
  * never acts on the consent page; it does not open or operate the program's local settings page.
  * The login text asks the AI to log the user in with the password already saved in the Aside
  * browser, to stop and tell the user when no password is saved or a code is asked for, and never to
- * ask the user for a password. The texts hold no secret and no settings-page address. The only
- * values put into a text are the tunnel id (not a secret) and a site's login address, both checked
- * for their form first. */
+ * ask the user for a password; it names the Aside browser account the program uses. The texts hold no
+ * secret and no settings-page address. The only values put into a text are the tunnel id (not a
+ * secret), a site's login address, and the Aside browser account id, all checked for their form first. */
 /* global URL */
 
 /** Canonical setup URLs from `tunnel-client --help`, and the official install guide (src/adapters/tunnel-client/AGENTS.md). */
@@ -97,11 +97,12 @@ const TEXTS = {
   },
 };
 
-/* The login text: `{step1}` becomes the first step, which names the site's login address. */
+/* The login text: `{account}` becomes the program's Aside browser account (the logins the program sees
+ * are those of that account's window), and `{step1}` the first step, which names the site's login address. */
 const LOGIN_TEXTS = {
   en: {
     text: [
-      "Please help me log in to one website in this browser. Follow these rules exactly:",
+      "Please help me log in to one website in the Aside browser, account {account}. Follow these rules exactly:",
       "- Do not open or operate the program's local settings page (the Browser Research Bridge settings page on this computer). Stay on the website named below.",
       "- Use only the password that is already saved in this browser for this site. Never ask me for a password or a code.",
       "- If no password is saved for this site, stop and tell me.",
@@ -118,7 +119,7 @@ const LOGIN_TEXTS = {
   },
   ko: {
     text: [
-      "이 브라우저에서 웹사이트 한 곳에 로그인하도록 도와주세요. 아래 규칙을 정확히 지켜 주세요.",
+      "Aside 브라우저(계정 {account})에서 웹사이트 한 곳에 로그인하도록 도와주세요. 아래 규칙을 정확히 지켜 주세요.",
       "- 이 프로그램의 로컬 설정 페이지(이 컴퓨터의 Browser Research Bridge 설정 페이지)는 열지도, 조작하지도 마세요. 아래에 적힌 웹사이트에서만 작업하세요.",
       "- 이 브라우저에 이 사이트용으로 이미 저장된 비밀번호만 쓰세요. 저에게 비밀번호나 인증 코드를 묻지 마세요.",
       "- 이 사이트에 저장된 비밀번호가 없으면 멈추고 저에게 알려 주세요.",
@@ -183,14 +184,26 @@ export function loginTarget({ loginUrl, hostnames, input } = {}) {
   return null;
 }
 
-/** The login text for the Aside AI in `lang` for a {@link loginTarget} result, or null without one. */
-export function loginText(lang, target) {
+/**
+ * An Aside browser account id as it may appear in the login text (`u0`, `u3`, …): one short word of
+ * letters, digits, and `._@+-`, so no space, line break, address with a port, or sentence can ride in.
+ */
+const ACCOUNT = /^[A-Za-z0-9][A-Za-z0-9._@+-]{0,63}$/;
+
+/**
+ * The login text for the Aside AI in `lang` for a {@link loginTarget} result, naming the program's
+ * Aside browser `account` (the page passes `GET /api/settings` `asideAccount.value`, or `u0` before the
+ * settings are loaded). Null without a target, or when the account is missing or not a plain account id.
+ */
+export function loginText(lang, target, account) {
   if (!target || (target.kind !== "url" && target.kind !== "host")) return null;
   const address = target.kind === "url" ? publicLoginUrl(target.address) : publicHostname(target.address);
   if (address === null) return null;
+  if (typeof account !== "string" || !ACCOUNT.test(account)) return null;
   const texts = LOGIN_TEXTS[lang] ?? LOGIN_TEXTS.en;
-  const step1 = texts[target.kind].replace("{address}", address);
-  return texts.text.replace("{step1}", step1);
+  // Replacer functions: a `$` in a value (an address may hold one) is taken literally.
+  const step1 = texts[target.kind].replace("{address}", () => address);
+  return texts.text.replace("{account}", () => account).replace("{step1}", () => step1);
 }
 
 const TUNNEL_ID = /^tunnel_[0-9a-f]{32}$/;

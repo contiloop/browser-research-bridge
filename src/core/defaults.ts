@@ -47,8 +47,13 @@ export const DEFAULT_MIN_INTERVAL_MS = 1500;
 /** Time one automatic captcha attempt may take (`captchaAttemptBudgetMs`). */
 export const DEFAULT_CAPTCHA_ATTEMPT_BUDGET_MS = 45_000;
 
-/** Tool-call budget that must remain for an attempt inside the call (`captchaInlineMinRemainingMs`). */
-export const DEFAULT_CAPTCHA_INLINE_MIN_REMAINING_MS = 40_000;
+/**
+ * Detection budget of one attempt (`captchaDetectBudgetMs`): from the start of the port's attempt
+ * (after the scheduler slot) through the politeness wait, the widened reload, the interstitial wait,
+ * and detection. A check that cannot be acted on costs a tool call at most this plus the slot wait and
+ * the tab restore that follows every attempt (normally well under a second).
+ */
+export const DEFAULT_CAPTCHA_DETECT_BUDGET_MS = 20_000;
 
 /** Tool-call budget kept back for the re-run after an attempt (`captchaRerunReserveMs`). */
 export const DEFAULT_CAPTCHA_RERUN_RESERVE_MS = 15_000;

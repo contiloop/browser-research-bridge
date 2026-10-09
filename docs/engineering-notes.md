@@ -90,12 +90,12 @@
 
 - **Symptom**: a step fails with `adapter_error` and a `browser shim violation` log naming a host such as `nid.naver.com`.
 - **Cause**: bridge-initiated requests and navigations, including server redirects, may only reach the site's `hostnames ∪ extraAllowedHosts` (subdomains included); requests the site's own scripts make to undeclared hosts are merely blocked and logged at debug level.
-- **Response**: declare login/SSO, API, and CDN hosts in `extraAllowedHosts`. Run with `BRIDGE_LOG_LEVEL=debug` and read the `requests blocked by the tab filter` lines to learn which hosts a site needs (Reuters needs `arcpublishing.com` for images and API data).
+- **Response**: declare login/SSO, API, and CDN hosts in `extraAllowedHosts`. Run with `BRIDGE_LOG_LEVEL=debug` and read the `requests blocked by the tab filter` lines to learn which hosts a site needs (Reuters needs `arcpublishing.com` for images and API data). A captcha vendor host is the exception: during a page script it means the site started a bot check (Reuters' in-page API call redirected to `geo.captcha-delivery.com`), and the step fails as a blocked `access_denied` "<site> answered with a bot check (<host>)", which gets the challenge path. Never declare a vendor host in a manifest; only the bridge's own attempt may reach them.
 
 ### A block page does not pause the site
 
 - **Symptom**: a site keeps being called while it shows a block or captcha page; the bridge log shows `captcha attempt` lines but no cool-down.
-- **Cause**: by design (decision 0015) only `rate_limited` starts the 10-minute cool-down. A `blocked: true` failure instead gets one challenge attempt and one re-run per tool call (with `captcha.auto` on), and the user is told to solve the captcha in Aside when that fails. Older documents, and the doc comments in `src/adapter-kit/completeness.ts` and `results.ts`, still say a block page cools the site down.
+- **Cause**: by design (decision 0015) only `rate_limited` starts the 10-minute cool-down. A `blocked: true` failure instead gets one quick challenge attempt per tool call (with `captcha.auto` on) and, unless the check is captcha-limited, one re-run; the user is told to solve the captcha in Aside when that fails. Older documents, and the doc comments in `src/adapter-kit/completeness.ts` and `results.ts`, still say a block page cools the site down.
 - **Response**: report real throttling ("too many requests", HTTP 429) as `rate_limited`, which still pauses the site; report a block or captcha page as `access_denied` with `blocked: true` (`readFailure`/`searchFailure` take `{ blocked }`); a paywall never sets it. To stop attempts altogether, turn off Settings → Captchas (`captcha.auto: false`).
 
 ### A challenge attempt sees no widget although the page shows one
@@ -104,11 +104,11 @@
 - **Cause**: a bridge tab's request filter (`Network.setBlockedURLs`) and guard CSP block every host outside the site's scope, so the vendor's widget frame (`google.com/recaptcha/…`, `hcaptcha.com`, `challenges.cloudflare.com`, `captcha-delivery.com`, `geetest.com`) was never loaded. Re-issuing the filter alone does not help: the guard's CSP `<meta>` and the init scripts belong to the already loaded document, and `Page.addScriptToEvaluateOnNewDocument` scripts apply only to the next one.
 - **Response**: the attempt widens the tab (filter re-issued, both guard init scripts removed by the identifiers kept in `__brbInit` and replaced with widened ones) and then reloads the challenge URL; a fresh tab is first opened normally and adopted, then widened and reloaded the same way. The tab is the attempt's target before the widening call goes out, so the restore (or the close) always covers it. Keep that order when changing `captcha.ts`/`repl-runtime.ts`; detection fixtures in `captcha.test.ts` describe pages as they look after the widened reload. A tab whose init scripts are unknown or cannot be removed must be closed, never reused.
 
-### DataDome's slider is reported `unknown`
+### DataDome's slider is reported `unknown`, and the site is captcha-limited
 
-- **Symptom**: on Reuters (or another DataDome site) the attempt returns `kind: unknown` with the slider visible, and the read keeps failing with "The captcha could not be solved automatically. Open <url> in Aside, solve it, then retry".
-- **Cause**: detection runs in the main frame only and sees inside no cross-origin frame. DataDome draws its slider inside its own `captcha-delivery.com` iframe, so only the frame's box is visible to the bridge, and Aside's `captcha.drag` needs the handle and track coordinates.
-- **Response**: none yet; the user solves it in Aside. Confirm the behavior live with `npm run browser:captcha-check -- <reuters url>` (`docs/tracking/findings.md`). Do not reach into the frame with page scripts or CDP frame targets; that would bypass the shim's frame rules.
+- **Symptom**: on Reuters (or another DataDome site) the attempt returns `kind: unknown` with no round while the slider is visible, and the call answers `access_denied` "reuters is captcha-limited: its bot check cannot be solved automatically. Open <url> in Aside, solve it, then retry". The `captcha-limited` log line follows the `captcha attempt` line. Before decision 0016 the same check cost every blocked call a full inline attempt (57–60 s on 2026-10-08) and then a pointless re-run.
+- **Cause**: detection runs in the main frame only and sees inside no cross-origin frame. DataDome draws its slider inside its own `captcha-delivery.com` iframe, so only the frame's box is visible to the bridge, and Aside's `captcha.drag` needs the handle and track coordinates. An attempt that could not act (`unknown` with no round, also "detection did not finish in time") is captcha-limited: no re-run, no background attempt. The detection budget (`captchaDetectBudgetMs`, 20 s, after the slot) caps the attempt's cost; when detection finishes early the call should answer within a few seconds (not yet observed live).
+- **Response**: the user solves it in Aside, then retries; nothing is remembered, so the next blocked call makes one more quick attempt. If a slow site keeps ending with "detection did not finish in time" on a check the solver could act on, raise `tunables.captchaDetectBudgetMs`. Confirm the behavior live with `npm run browser:captcha-check -- <reuters url>` (`docs/tracking/findings.md`; it runs without a detection budget). Do not reach into the frame with page scripts or CDP frame targets; that would bypass the shim's frame rules.
 
 ### Parallel calls hit a site faster than `minIntervalMs`
 
@@ -145,6 +145,12 @@
 - **Symptom**: `npm run browser:check` passes while the bridge reports `browser_unavailable`, or the reverse; `npm run browser:captcha-check` meets a different login or captcha state than the bridge.
 - **Cause**: both CLIs take the account from `--account`, then `ASIDE_ACCOUNT`, then `u0`; they ignore `asideAccount` in `config/bridge.json` and `BRIDGE_ASIDE_ACCOUNT`. `site:validate` does use the config.
 - **Response**: pass `-- --account <id>` explicitly when the bridge uses an account other than `u0`.
+
+### Logging in to a site in Aside changes nothing for the bridge
+
+- **Symptom**: the user logged in to a site in Aside, but its card stays `needs_login`, or Check now still reports `auth_required` and the bridge's tabs show the site logged out.
+- **Cause**: two separate things. Aside keeps logins per account, each with its own browser profile and window, and the bridge drives only the account `asideAccount` (default `u0`); on the owner's Mac `u0` is the Google-signed account with Profile 0 and `u3` a local account with Profile 1, so a login in the `u3` window is invisible to the bridge. And the status changes only after Check now (or the next scheduled health check); logging in alone changes nothing.
+- **Response**: log in in the window of the account the card names ("the Aside browser window of account u0 (its first profile)"), then press "Logged in? Check now". `aside account` lists the account ids; the Aside AI login text names the same account.
 
 ### The bridge commits onto whatever branch is checked out
 
@@ -222,3 +228,9 @@
 2. Set `PUBLIC_URL` in `.env`, then `launchctl kickstart -k gui/$(id -u)/com.browser-research-bridge` (or restart `npm start`).
 3. Verify: `curl -s -o /dev/null -w '%{http_code}\n' -X POST "$PUBLIC_URL/mcp"` prints `401` and `curl -s "$PUBLIC_URL/.well-known/oauth-protected-resource/mcp"` names `"resource": "<PUBLIC_URL>/mcp"`.
 4. Remove and re-add the Claude connector; consent with the passphrase.
+
+### Reuters turns `needs_login` right after a bot check
+
+- **Symptom**: during or just after a DataDome check a Reuters search or read reports `auth_required` "not signed in", the site becomes `needs_login`, and "Check now" a moment later may say the same, although the login in Aside is fine.
+- **Cause**: while the check holds the page (or its scripts are blocked) the page renders without the site header, so the signed-in account control is missing too; the adapter read that as a lapsed login (acceptance run 4, 2026-10-09).
+- **Response**: since Reuters adapter version 3 a page without `SiteHeader` is `access_denied` with `blocked: true` ("answered with a bot check (the page did not render)"), never `auth_required`. Keep parallel loads low on this site (the owner's install: `maxConcurrentPerSite: 2`, `concurrentStaggerMs: 1500`). If it still happens, pass the check in Aside and press "Logged in? Check now".

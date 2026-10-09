@@ -105,6 +105,11 @@ export interface FakeBrowser extends BrowserPort {
    * absent → null. Tests set it to stand for the page an adapter last showed.
    */
   lastUrls: Map<string, string>;
+  /**
+   * What a session's `runScript` throws, by site key (as if the port had failed the page-script step,
+   * e.g. with a bot check); absent → the script returns null.
+   */
+  scriptErrors: Map<string, unknown>;
   /** Every `solveChallenge` call (only when the port was built with a solver). */
   challenges: SolveChallengeOptions[];
 }
@@ -118,7 +123,8 @@ export function challengeAttempt(patch: Partial<ChallengeAttempt> = {}): Challen
 }
 
 /**
- * A browser port whose sessions do nothing; adapters under test never call it. With `solveChallenge`,
+ * A browser port whose sessions do nothing (a page script returns null, or throws the failure scripted
+ * in `scriptErrors`); there is no site behavior. With `solveChallenge`,
  * the port also offers the optional challenge operation and records its calls; without it, the port
  * has no `solveChallenge` at all (like an older browser).
  */
@@ -127,6 +133,7 @@ export function fakeBrowser(options: { solveChallenge?: FakeSolver | undefined }
     scopes: [],
     disposed: 0,
     lastUrls: new Map(),
+    scriptErrors: new Map(),
     challenges: [],
     async status() {
       return { reachable: true, account: "u0" };
@@ -141,7 +148,10 @@ export function fakeBrowser(options: { solveChallenge?: FakeSolver | undefined }
         openTab: async () => unsupported(),
         closeTab: async () => undefined,
         snapshot: async () => unsupported(),
-        runScript: async () => unsupported(),
+        runScript: async () => {
+          if (port.scriptErrors.has(scope.siteKey)) throw port.scriptErrors.get(scope.siteKey);
+          return null;
+        },
         fetch: async () => unsupported(),
         screenshot: async () => unsupported(),
         lastUrl: () => port.lastUrls.get(scope.siteKey) ?? null,

@@ -144,7 +144,7 @@ describe("loadConfig", () => {
       maxConcurrentTasks: 8,
       concurrentStaggerMs: 500,
       captchaAttemptBudgetMs: 45_000,
-      captchaInlineMinRemainingMs: 40_000,
+      captchaDetectBudgetMs: 20_000,
       captchaRerunReserveMs: 15_000,
       coolDownSeconds: 600,
       warmTabTtlSeconds: 300,
@@ -179,6 +179,25 @@ describe("loadConfig", () => {
         new RegExp(`${key} must be a positive number`),
       );
     }
+  });
+
+  it("captchaDetectBudgetMs: default 20000, overridable, positive; captchaInlineMinRemainingMs is retired", () => {
+    expect(DEFAULT_TUNABLES.captchaDetectBudgetMs).toBe(20_000);
+    expect(Object.keys(DEFAULT_TUNABLES)).not.toContain("captchaInlineMinRemainingMs");
+    writeJson({ tunables: { captchaDetectBudgetMs: 12_000 } });
+    const tuned = loadConfig({ rootDir: root, env: { BRIDGE_PASSPHRASE: GOOD } });
+    expect(tuned.tunables.captchaDetectBudgetMs).toBe(12_000);
+    expect(tuned.warnings).toEqual([]);
+    writeJson({ tunables: { captchaDetectBudgetMs: -5 } });
+    expect(() => loadConfig({ rootDir: root, env: { BRIDGE_PASSPHRASE: GOOD } })).toThrow(
+      /captchaDetectBudgetMs must be a positive number/,
+    );
+    // An existing value of the retired tunable is warned about and ignored like any unknown key.
+    writeJson({ tunables: { captchaInlineMinRemainingMs: 40_000, captchaRerunReserveMs: 10_000 } });
+    const old = loadConfig({ rootDir: root, env: { BRIDGE_PASSPHRASE: GOOD } });
+    expect(old.warnings).toEqual(['unknown tunable "captchaInlineMinRemainingMs" ignored']);
+    expect(old.tunables).toEqual({ ...DEFAULT_TUNABLES, captchaRerunReserveMs: 10_000 });
+    expect(Object.keys(old.tunables)).not.toContain("captchaInlineMinRemainingMs");
   });
 
   it("warns about and ignores an existing maxConcurrentSites value", () => {

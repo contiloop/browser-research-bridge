@@ -101,39 +101,6 @@
 ## DataDome's slider sits in a cross-origin frame the solver cannot see
 
 - **Problem**: the captcha solver detects widgets in the tab's main frame only and never reaches inside a cross-origin frame. DataDome (Reuters) draws its slider inside its own `captcha-delivery.com` iframe, so the attempt reports `kind: unknown` and does nothing.
-- **Blast radius**: a Reuters read or search that meets DataDome's slider still fails with "The captcha could not be solved automatically. Open <url> in Aside, solve it, then retry"; each tool call spends at most one attempt (up to 45 seconds when inline). Other vendors whose challenge lives inside their frame behave the same.
-- **Why not now**: acting inside the frame needs the frame's own coordinates (CDP frame targets or a script in the vendor's frame), which would bypass the shim's frame rules; the behavior on the live site has not been observed yet (T10).
-- **Approach**: confirm with `npm run browser:captcha-check -- <reuters url>`; if DataDome sliders are common, design a frame-aware detection that stays inside the bridge's privileged step and never runs page scripts in vendor frames.
-
-## A DataDome bot check costs every blocked call a full inline attempt
-
-- **Condition**: Reuters answers a search with the DataDome bot check ("Please enable JS and disable any ad blocker") while `captcha.auto` is on, as on 2026-10-08 16:13 UTC after three parallel ChatGPT searches.
-- **Symptom**: each blocked `search_sites` call took 57–60 s: the inline attempt ran out of its 45 s budget with `kind: "unknown", rounds: 0` (the widened reload of the DataDome page never reached detection), the three parallel calls shared that one attempt and all re-ran to `access_denied`; the next call started a second attempt, which ended in `adapter_error`. Afterwards Reuters showed its login wall and the site became `needs_login`.
-- **Blast radius**: ChatGPT waits about a minute per blocked call and still gets nothing; the DataDome challenge (its slider lives in the vendor's frame) is never solved by the bridge.
-- **Why not now**: found after the cycle's final review, on the live program. Candidate fix for the next cycle: after an attempt ends `unknown`/`unavailable` for a site, make further attempts on that site background-only (no inline wait) for a period, and let the adapter report the bot check with the "solve it in Aside" action at once; separately, decide whether DataDome's frame can be acted on through the accessibility tree of the vendor frame.
-
-## A bot check that arrives as an in-page request to the vendor host is reported as `adapter_error`, not as a blocked page
-
-- **Condition**: Reuters starts the DataDome check while the adapter's page script is running (seen on 2026-10-08 16:12 UTC with three parallel searches: the first answered `ok` with 15 results, the next two failed within 1.5 s).
-- **Symptom**: the page's own `window.fetch` call inside `page.evaluate` is redirected to `geo.captcha-delivery.com`; the tab filter blocks it and, because the request came from injected code, the shim counts it as the script's: "page script blocked by the bridge: request to geo.captcha-delivery.com is outside the site's hostnames" → `adapter_error`. The outcome carries no `blocked: true`, so no captcha attempt and no "solve it in Aside" action; the client only sees an adapter error.
-- **Blast radius**: any site whose bot check interrupts an API call made from inside the page; parallel loads make it more likely.
-- **Why not now**: found on the live program after the cycle closed. Candidate fix: when the blocked host of a shim violation is one of the captcha vendor hosts (`CAPTCHA_VENDOR_HOSTS`), map the step to `access_denied` with `blocked: true` and the bot-check message instead of `adapter_error`, so the attempt / user-action path runs; keep the violation log line.
-
-## A Reuters article read fails with `adapter_error` when the page loads its video player
-
-- **Condition**: a Reuters article that embeds a video; seen on 2026-10-08 16:32 UTC in a `read_documents` batch from ChatGPT (1 of 5 refs).
-- **Symptom**: the page requests `cd.elements.video`, which is not in the Reuters manifest's `extraAllowedHosts`; the tab filter blocks it and the shim attributes the request to the adapter's injected code, so the read ends `adapter_error` ("page script blocked by the bridge … outside the site's hostnames") instead of `ok`. ChatGPT reported it as a retryable page-script error, which is accurate: it is not a login or subscription problem.
-- **Blast radius**: single articles with a video embed; a retry may or may not hit the same timing.
-- **Why not now**: found after the cycle closed. Fix: add `elements.video` to `sites/reuters/manifest.json` `extraAllowedHosts` (bump `version`, note in `NOTES.md`), re-run `npm run site:validate -- reuters` against the live site with the owner's login, commit the rewritten `validation.json`, restart the bridge. Also worth checking whether a request the site's own player makes should be attributed to the adapter at all (`docs/BROWSER.md`, attribution rule).
-
-## The "Check now" button is easy to miss on a `needs_login` site card
-
-- **Condition**: after the page rebuild, a `needs_login` card shows the Aside AI login text's copy button prominently and "Check now" less prominently; on 2026-10-08 the owner logged in in Aside but the status stayed `needs_login` because the button was never pressed (no `POST /api/sites/<key>/check` in the log).
-- **Blast radius**: the user believes the login did not work.
-- **Why not now**: found after the owner's page review. Fix for the next page pass: on a `needs_login` card make "Check now" the primary action after the login step ("Logged in? Press Check now"), and say on the card that the status updates only after Check now.
-
-## Aside profiles: the program uses account `u0`, logins in another profile are invisible to it
-
-- **Condition**: Aside on the owner's Mac has two accounts (`u0`, the Google-signed one with Profile 0, and `u3`, a local account with Profile 1). The bridge uses `asideAccount: u0`.
-- **Symptom**: logging in to a site in the other profile's window changes nothing for the bridge; its tabs still show the site logged out.
-- **Why not now**: nothing to fix in code; the page's `needs_login` wording should name the profile ("log in in the Aside window of account u0"). Recorded for the next page pass; the Aside AI login text could also name the account.
+- **Blast radius**: a Reuters read or search that meets DataDome's slider is captcha-limited (decision 0016): the call answers at once with "reuters is captcha-limited: its bot check cannot be solved automatically. Open <url> in Aside, solve it, then retry", after one quick attempt bounded by `captchaDetectBudgetMs` (20 s); the user has to solve every such check by hand. Other vendors whose challenge lives inside their frame behave the same.
+- **Why not now**: acting inside the frame needs the frame's own coordinates (CDP frame targets or a script in the vendor's frame), which would bypass the shim's frame rules. On 2026-10-08 a live DataDome check ended `unknown` with no round because the widened reload never reached detection within the 45 s budget, so the in-frame case itself is still unobserved, and so is the captcha-limited answer.
+- **Approach**: confirm with `npm run browser:captcha-check -- <reuters url>`; if DataDome sliders are common, design a frame-aware detection that stays inside the bridge's privileged step and never runs page scripts in vendor frames (for example through the accessibility tree of the vendor frame).

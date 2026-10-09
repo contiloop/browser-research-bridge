@@ -8,14 +8,16 @@
  * leaves the status alone; the check is retried at the next run.
  *
  * "Check now" only: when the light check meets a block or captcha page and captcha attempts are on,
- * one challenge attempt runs (a pool task, after the check's exclusive task ended) and the light
- * check runs once more; the second result sets the status (with the captcha action when it is still
- * blocked, and the solver's fixed message added to the failure message, so the site card shows why).
- * Scheduled checks never attempt.
+ * one quick challenge attempt runs (a pool task, after the check's exclusive task ended). When it
+ * acted or found the check gone, the light check runs once more and the second result sets the status
+ * (with the captcha action when it is still blocked, and the solver's fixed message added to the
+ * failure message, so the site card shows why). When it is captcha-limited (nothing it can act on, or
+ * no solver), the second check is skipped and the first result stands with the captcha-limited
+ * sentence as message and action. Scheduled checks never attempt.
  */
 import { isServingStatus } from "../core/lifecycle.js";
 import type { Outcome, SiteLifecycleStatus } from "../core/models.js";
-import { errorToOutcome, isFailureStatus } from "../core/outcome.js";
+import { errorToOutcome, isBlockedError, isFailureStatus } from "../core/outcome.js";
 import type { Clock } from "../ports/clock.js";
 import { systemClock } from "../ports/clock.js";
 import type { Logger } from "../ports/logger.js";
@@ -48,13 +50,20 @@ export type HealthCheckFn = (
 export interface HealthChallenges {
   readonly enabled: boolean;
   /**
-   * One attempt (or the site's running one); `ran` false when nothing could be done. `message` is the
-   * solver's fixed text (never page content), absent when no solver ran.
+   * One quick attempt (or the site's running one); `ran` false when there is nothing to re-check.
+   * `limited`: captcha-limited, `action` is then the captcha-limited sentence. `message` is the solver's
+   * fixed text (never page content), absent when no solver ran.
    */
   attempt(
     key: string,
     url: string | null,
-  ): Promise<{ ran: boolean; result?: string; action: string; message?: string | undefined }>;
+  ): Promise<{
+    ran: boolean;
+    limited?: boolean | undefined;
+    result?: string;
+    action: string;
+    message?: string | undefined;
+  }>;
 }
 
 export interface HealthCheckerOptions {
@@ -174,7 +183,10 @@ export class HealthChecker {
         try {
           return await this.options.check(key, { ignoreCooldown: onDemand });
         } catch (error) {
-          return errorToOutcome(error);
+          // A thrown blocked failure is a block page whose URL is unknown (the attempt aims at the homepage).
+          const outcome: HealthCheckOutcome = errorToOutcome(error);
+          if (isBlockedError(error)) outcome.blocked = { url: null };
+          return outcome;
         }
       };
       let checked = await check();
@@ -182,15 +194,21 @@ export class HealthChecker {
       if (onDemand && challenges?.enabled === true && isChallenge(checked)) {
         // The check's exclusive task has ended; the attempt is a pool task of the site.
         const report = await challenges.attempt(key, checked.blocked?.url ?? null);
-        if (report.ran) checked = await check();
+        const limited = report.limited === true;
+        const recheck = report.ran && !limited;
+        if (recheck) checked = await check();
         logger?.info("check now captcha attempt", {
           site: key,
           attempt: report.result ?? null,
-          rechecked: report.ran,
+          limited,
+          rechecked: recheck,
           outcome: checked.status,
           message: report.message ?? null,
         });
-        if (!report.ran || isChallenge(checked)) {
+        if (limited) {
+          // The first result stands, with the captcha-limited sentence the site card shows.
+          checked = { ...checked, message: report.action, action: report.action };
+        } else if (!report.ran || isChallenge(checked)) {
           const detail = report.result === "solved" ? undefined : report.message;
           checked = {
             ...checked,
