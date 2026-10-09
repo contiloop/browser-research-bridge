@@ -1,0 +1,91 @@
+{
+  "version": 1,
+  "key": "wsj",
+  "form": "full",
+  "target": "staging",
+  "passed": true,
+  "startedAt": "2026-10-09T12:18:03.519Z",
+  "finishedAt": "2026-10-09T12:18:16.077Z",
+  "durationMs": 12558,
+  "adapterHash": "2f545feeb7e2ceadcd09bfc2c500de06214a606bfe56810d0c0a50cfc63071e4",
+  "manifestVersion": 2,
+  "gatedCheck": "passed",
+  "failure": null,
+  "steps": [
+    {
+      "name": "manifest",
+      "passed": true,
+      "status": null,
+      "message": "manifest is valid",
+      "durationMs": 0,
+      "details": {}
+    },
+    {
+      "name": "static",
+      "passed": true,
+      "status": null,
+      "message": "static check passed (1 files)",
+      "durationMs": 0,
+      "details": {
+        "files": 1
+      }
+    },
+    {
+      "name": "search",
+      "passed": true,
+      "status": "ok",
+      "message": "sample search returned 10 results",
+      "durationMs": 706,
+      "details": {
+        "results": 10,
+        "nextCursor": true
+      }
+    },
+    {
+      "name": "second_page",
+      "passed": true,
+      "status": "ok",
+      "message": "second page returned 10 results (10 new)",
+      "durationMs": 703,
+      "details": {
+        "results": 10,
+        "fresh": 10
+      }
+    },
+    {
+      "name": "read",
+      "passed": true,
+      "status": "ok",
+      "message": "sample read ok (6677 characters, subscriber)",
+      "durationMs": 869,
+      "details": {
+        "textLength": 6677,
+        "accessLevel": "subscriber",
+        "hasTitle": true,
+        "source": "sampleReadUrl"
+      }
+    },
+    {
+      "name": "gated",
+      "passed": true,
+      "status": "ok",
+      "message": "gated page reads as subscriber; logged-out form classified access_denied (WSJ answered with a DataDome bot check)",
+      "durationMs": 1156,
+      "details": {
+        "textLength": 8860,
+        "accessLevel": "subscriber",
+        "hasTitle": true,
+        "loggedOutHttpStatus": 401,
+        "loggedOutVerdict": "access_denied"
+      }
+    },
+    {
+      "name": "smoke",
+      "passed": true,
+      "status": "ok",
+      "message": "smokeTest passed",
+      "durationMs": 9124,
+      "details": {}
+    }
+  ]
+}

@@ -13,7 +13,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { inspect, parseEnv } from "node:util";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { copyPassphraseToClipboard, createSettingsStore, previewCaptchaAuto } from "./settings.js";
+import {
+  copyPassphraseToClipboard,
+  createSettingsStore,
+  previewAssistantAuto,
+  previewCaptchaAuto,
+} from "./settings.js";
 
 const GOOD = "correct horse battery";
 const TUNNEL = `tunnel_${"0f".repeat(16)}`;
@@ -127,6 +132,24 @@ describe("settings store", () => {
     });
   });
 
+  describe("read: assistantAuto", () => {
+    it("reports assistant.auto as assistantAuto: the default true, the stored boolean, or null", () => {
+      const s = store();
+      expect(s.read().assistantAuto).toEqual({ value: true });
+      writeConfig(JSON.stringify({ assistant: { effort: "high" } }));
+      expect(s.read().assistantAuto).toEqual({ value: true });
+      writeConfig(JSON.stringify({ assistant: { auto: false } }));
+      expect(s.read().assistantAuto).toEqual({ value: false });
+      // Independent of captcha.auto.
+      writeConfig(JSON.stringify({ captcha: { auto: false } }));
+      expect(s.read().assistantAuto).toEqual({ value: true });
+      for (const bad of ['{ "assistant": { "auto": "false" } }', '{ "assistant": true }', "{ broken"]) {
+        writeConfig(bad);
+        expect(s.read().assistantAuto, bad).toEqual({ value: null });
+      }
+    });
+  });
+
   describe("captchaAuto preview (PUT settings, before anything is written)", () => {
     const base = { ok: true as const, changed: [] };
 
@@ -162,6 +185,51 @@ describe("settings store", () => {
       });
       writeConfig("{ broken");
       expect(previewCaptchaAuto(s.read(), { captchaAuto: false }, base)).toMatchObject({
+        ok: false,
+        error: "file_unreadable",
+        message: expect.stringContaining(configFile) as string,
+      });
+    });
+  });
+
+  describe("assistantAuto preview (PUT settings, before anything is written)", () => {
+    const base = { ok: true as const, changed: [] };
+
+    it("adds assistantAuto to the changed fields only when the stored value (absent = true) differs", () => {
+      const s = store();
+      expect(previewAssistantAuto(s.read(), { assistantAuto: true }, base)).toEqual({
+        ok: true,
+        changed: [],
+      });
+      expect(previewAssistantAuto(s.read(), { assistantAuto: false }, base)).toEqual({
+        ok: true,
+        changed: ["assistantAuto"],
+      });
+      writeConfig(JSON.stringify({ assistant: { auto: false, effort: "low" } }));
+      expect(previewAssistantAuto(s.read(), { assistantAuto: false }, base)).toEqual({
+        ok: true,
+        changed: [],
+      });
+      expect(
+        previewAssistantAuto(s.read(), { assistantAuto: true }, { ok: true, changed: ["captchaAuto"] }),
+      ).toEqual({ ok: true, changed: ["captchaAuto", "assistantAuto"] });
+      expect(previewAssistantAuto(s.read(), { captchaAuto: false }, base)).toBe(base);
+    });
+
+    it("keeps an earlier refusal, refuses a non-boolean, and an unreadable config file", () => {
+      const s = store();
+      const invalid = {
+        ok: false as const,
+        error: "invalid" as const,
+        fields: { captchaAuto: "bad_value" as const },
+        message: "captchaAuto: bad_value",
+      };
+      expect(previewAssistantAuto(s.read(), { assistantAuto: false }, invalid)).toBe(invalid);
+      expect(
+        previewAssistantAuto(s.read(), { assistantAuto: "yes" as unknown as boolean }, base),
+      ).toMatchObject({ ok: false, error: "invalid", fields: { assistantAuto: "bad_value" } });
+      writeConfig("{ broken");
+      expect(previewAssistantAuto(s.read(), { assistantAuto: false }, base)).toMatchObject({
         ok: false,
         error: "file_unreadable",
         message: expect.stringContaining(configFile) as string,
@@ -513,6 +581,64 @@ describe("settings store", () => {
     it("refuses a captchaAuto change to an unreadable config file", async () => {
       writeConfig("{ broken");
       expect(await store().write({ captchaAuto: false })).toMatchObject({
+        ok: false,
+        error: "file_unreadable",
+        file: configFile,
+      });
+      expect(readFileSync(configFile, "utf8")).toBe("{ broken");
+    });
+
+    it("writes assistantAuto as a boolean under assistant.auto, in place, keeping assistant.effort", async () => {
+      const example = readFileSync(join(import.meta.dirname, "../../config/bridge.example.json"), "utf8");
+      expect(example).toContain('"assistant": { "auto": true, "effort": "low" }');
+      writeConfig(example);
+      const s = store();
+      expect(await s.write({ assistantAuto: true })).toEqual({ ok: true, changed: [] });
+      expect(await s.write({ assistantAuto: false })).toEqual({ ok: true, changed: ["assistantAuto"] });
+      expect(readFileSync(configFile, "utf8")).toBe(
+        example.replace(
+          '"assistant": { "auto": true, "effort": "low" }',
+          '"assistant": { "auto": false, "effort": "low" }',
+        ),
+      );
+      writeEnv(`BRIDGE_PASSPHRASE='${GOOD}'\n`);
+      const loaded = s.loadConfig();
+      expect(loaded.ok && loaded.config.assistant).toEqual({ auto: false, effort: "low" });
+      expect(s.read().assistantAuto).toEqual({ value: false });
+      expect(await s.write({ assistantAuto: false })).toEqual({ ok: true, changed: [] });
+      // The captcha setting is a separate field and stays as it was.
+      expect(loaded.ok && loaded.config.captcha).toEqual({ auto: true });
+    });
+
+    it("adds assistant.auto to a file without it and treats a missing value as the default true", async () => {
+      const s = store();
+      expect(await s.write({ assistantAuto: true })).toEqual({ ok: true, changed: [] });
+      expect(existsSync(configFile)).toBe(false);
+      writeConfig('{\n  "asideAccount": "u1",\n  "assistant": { "effort": "high" }\n}\n');
+      expect(await s.write({ assistantAuto: true })).toEqual({ ok: true, changed: [] });
+      expect(await s.write({ assistantAuto: false, captchaAuto: false })).toEqual({
+        ok: true,
+        changed: ["captchaAuto", "assistantAuto"],
+      });
+      expect(JSON.parse(readFileSync(configFile, "utf8"))).toEqual({
+        asideAccount: "u1",
+        assistant: { effort: "high", auto: false },
+        captcha: { auto: false },
+      });
+    });
+
+    it("refuses an assistantAuto that is not a boolean, or one for an unreadable config file, and writes nothing", async () => {
+      const s = store();
+      for (const bad of ["true", 1, null]) {
+        expect(await s.write({ assistantAuto: bad as unknown as boolean })).toMatchObject({
+          ok: false,
+          error: "invalid",
+          fields: { assistantAuto: "bad_value" },
+        });
+      }
+      expect(existsSync(configFile)).toBe(false);
+      writeConfig("{ broken");
+      expect(await s.write({ assistantAuto: false })).toMatchObject({
         ok: false,
         error: "file_unreadable",
         file: configFile,

@@ -17,6 +17,7 @@
   "onboarding": { "model": "claude-opus-5-5", "effort": "high", "runtime": "auto", "codexModel": null },
   "chatgpt": null,
   "captcha": { "auto": true },
+  "assistant": { "auto": true, "effort": "low" },
   "tunables": {
     "searchDefaultLimit": 10,
     "searchMaxLimit": 25,
@@ -39,6 +40,9 @@
     "captchaAttemptBudgetMs": 45000,
     "captchaDetectBudgetMs": 20000,
     "captchaRerunReserveMs": 15000,
+    "assistantTaskBudgetMs": 120000,
+    "assistantFailureWindowMs": 600000,
+    "assistantPauseMs": 600000,
     "consecutiveAdapterErrorsToDegrade": 3,
     "healthCheckIntervalSeconds": 86400,
     "minReadChars": 200,

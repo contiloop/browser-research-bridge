@@ -3,8 +3,9 @@
  * `config.ts`. Create it once, early at process start (it snapshots the environment then).
  *
  * Also here, next to the store and over the same sources:
- * - `previewCaptchaAuto`: the `captchaAuto` part of a `PUT settings` preview (what the store would
- *   refuse or change in `captcha.auto`), added to the settings page's preview of the other fields;
+ * - `previewCaptchaAuto` / `previewAssistantAuto`: the `captchaAuto` / `assistantAuto` parts of a
+ *   `PUT settings` preview (what the store would refuse or change in `captcha.auto` / `assistant.auto`),
+ *   added to the settings page's preview of the other fields;
  * - `copyPassphraseToClipboard`: "Copy passphrase". It takes the passphrase from where the store
  *   validates it (`.env`; a value forced from outside `.env` is `locked` and refused) and pipes it to
  *   `pbcopy` on standard input, so the value never reaches an HTTP response, the page, a log, a
@@ -21,7 +22,7 @@ import type {
 import { parseEnvText } from "../adapters/settings/env-file.js";
 import { FileSettingsStore } from "../adapters/settings/file-settings-store.js";
 import { StartupEnvironment } from "../adapters/settings/startup-environment.js";
-import { isCaptchaAutoSetting, passphraseProblem } from "../core/settings.js";
+import { isAssistantAutoSetting, isCaptchaAutoSetting, passphraseProblem } from "../core/settings.js";
 import type { EnvironmentMap, SettingsStore, SettingsView } from "../ports/settings-store.js";
 import { loadConfigResult, resolveSettingsPageLocation, type BridgeConfig } from "./config.js";
 
@@ -63,13 +64,38 @@ export function previewCaptchaAuto(
   change: PageSettingsChange,
   base: SettingsPreview,
 ): SettingsPreview {
-  if (!base.ok || change.captchaAuto === undefined) return base;
-  if (!isCaptchaAutoSetting(change.captchaAuto)) {
+  return previewSwitch(view, base, "captchaAuto", change.captchaAuto, isCaptchaAutoSetting);
+}
+
+/**
+ * Adds `assistantAuto` to a `PUT settings` preview, with the same rules as `previewCaptchaAuto`:
+ * an earlier refusal stands; a non-boolean is `invalid` (`bad_value`); an unreadable config file is
+ * `file_unreadable`; otherwise `assistantAuto` is listed as changed when the stored value (absent =
+ * `true`) differs.
+ */
+export function previewAssistantAuto(
+  view: SettingsView,
+  change: PageSettingsChange,
+  base: SettingsPreview,
+): SettingsPreview {
+  return previewSwitch(view, base, "assistantAuto", change.assistantAuto, isAssistantAutoSetting);
+}
+
+/** One boolean switch of `config/bridge.json` in a preview (`captchaAuto`, `assistantAuto`). */
+function previewSwitch(
+  view: SettingsView,
+  base: SettingsPreview,
+  field: "captchaAuto" | "assistantAuto",
+  value: boolean | undefined,
+  valid: (value: unknown) => value is boolean,
+): SettingsPreview {
+  if (!base.ok || value === undefined) return base;
+  if (!valid(value)) {
     return {
       ok: false,
       error: "invalid",
-      fields: { captchaAuto: "bad_value" },
-      message: "captchaAuto: bad_value",
+      fields: { [field]: "bad_value" },
+      message: `${field}: bad_value`,
     };
   }
   const { configFile } = view.files;
@@ -80,8 +106,8 @@ export function previewCaptchaAuto(
       message: configFile.problem ?? `${configFile.path} cannot be read`,
     };
   }
-  if (view.captchaAuto.value === change.captchaAuto) return base;
-  return { ok: true, changed: [...base.changed, "captchaAuto"] };
+  if (view[field].value === value) return base;
+  return { ok: true, changed: [...base.changed, field] };
 }
 
 const PASSPHRASE = "BRIDGE_PASSPHRASE";

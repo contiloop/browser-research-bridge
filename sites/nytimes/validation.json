@@ -1,0 +1,91 @@
+{
+  "version": 1,
+  "key": "nytimes",
+  "form": "full",
+  "target": "staging",
+  "passed": true,
+  "startedAt": "2026-10-09T11:51:45.210Z",
+  "finishedAt": "2026-10-09T11:52:06.249Z",
+  "durationMs": 21039,
+  "adapterHash": "02d965edd9049cdffa3ab3f307d26ee9d305bc5cf331af82ba51634f3d36b47b",
+  "manifestVersion": 1,
+  "gatedCheck": "passed",
+  "failure": null,
+  "steps": [
+    {
+      "name": "manifest",
+      "passed": true,
+      "status": null,
+      "message": "manifest is valid",
+      "durationMs": 0,
+      "details": {}
+    },
+    {
+      "name": "static",
+      "passed": true,
+      "status": null,
+      "message": "static check passed (1 files)",
+      "durationMs": 0,
+      "details": {
+        "files": 1
+      }
+    },
+    {
+      "name": "search",
+      "passed": true,
+      "status": "ok",
+      "message": "sample search returned 10 results",
+      "durationMs": 1001,
+      "details": {
+        "results": 10,
+        "nextCursor": true
+      }
+    },
+    {
+      "name": "second_page",
+      "passed": true,
+      "status": "ok",
+      "message": "second page returned 10 results (10 new)",
+      "durationMs": 972,
+      "details": {
+        "results": 10,
+        "fresh": 10
+      }
+    },
+    {
+      "name": "read",
+      "passed": true,
+      "status": "ok",
+      "message": "sample read ok (4764 characters, subscriber)",
+      "durationMs": 3695,
+      "details": {
+        "textLength": 4764,
+        "accessLevel": "subscriber",
+        "hasTitle": true,
+        "source": "sampleReadUrl"
+      }
+    },
+    {
+      "name": "gated",
+      "passed": true,
+      "status": "ok",
+      "message": "gated page reads as subscriber; logged-out form classified access_denied (block page marker \"Please enable JS and disable any ad blocker\")",
+      "durationMs": 3753,
+      "details": {
+        "textLength": 4619,
+        "accessLevel": "subscriber",
+        "hasTitle": true,
+        "loggedOutHttpStatus": 403,
+        "loggedOutVerdict": "access_denied"
+      }
+    },
+    {
+      "name": "smoke",
+      "passed": true,
+      "status": "ok",
+      "message": "smokeTest passed",
+      "durationMs": 11618,
+      "details": {}
+    }
+  ]
+}

@@ -12,6 +12,7 @@ import { HELPER_RUNTIME_IDS, JOB_STATES } from "../onboarding/types.js";
 import { CHATGPT_ERROR_CODES, CHATGPT_FIELD_CODES } from "../../app/chatgpt-connection.js";
 import { RUN_PROBLEM_CODES } from "../../app/run-mode.js";
 import { SETTINGS_FIELD_CODES } from "../../ports/settings-store.js";
+import { ASSISTANT_PURPOSES, ASSISTANT_REASON_CODES, ASSISTANT_VERDICTS } from "../../ports/assistant.js";
 import { DEFAULT_TUNABLES } from "../../app/config.js";
 import { DEFAULT_ASIDE_ACCOUNT } from "../../core/settings.js";
 import { API_ERROR_CODES } from "./api.js";
@@ -67,6 +68,21 @@ interface StateModule {
   DEFAULT_ASIDE_ACCOUNT: string;
   asideAccountOf(settings: unknown): string;
   formatBytes(n: unknown): string;
+  ASSISTANT_PURPOSES: string[];
+  ASSISTANT_VERDICTS: string[];
+  ASSISTANT_REASONS: string[];
+  assistantTask(site: unknown): {
+    purpose: string;
+    verdict: string | null;
+    reason: string | null;
+    at: string | null;
+    running: boolean;
+  } | null;
+  assistantWorkingSay(purpose: unknown): string;
+  assistantHeldReason(site: Record<string, unknown>): string | null;
+  assistantDetailParts(
+    site: unknown,
+  ): ({ set: string; value: string } | { key: string } | { time: string })[];
 }
 
 const uiUrl = (name: string): URL => new URL(`./ui/${name}`, import.meta.url);
@@ -158,6 +174,12 @@ describe("page wording (i18n.js)", () => {
       "site.do.fine",
       "site.do.checkFirst",
       "site.do.unknown",
+      // The Aside AI's sentences (assistantWorkingSay, assistantHeldReason) and its Details line.
+      "site.do.aiWorking",
+      "site.do.aiWorkingCaptcha",
+      "site.do.aiWorkingLogin",
+      ...state.ASSISTANT_REASONS.map((reason) => `site.do.aiHeld.${reason}`),
+      "site.d.aiRunning",
     ])
       used.add(key);
     for (const lang of LANGS) {
@@ -197,6 +219,7 @@ describe("page wording (i18n.js)", () => {
       "sites.explain",
       "conn.explain",
       "cap.explain",
+      "ai.explain",
       "rt.explain",
       "lang.explain",
     ]) {
@@ -206,13 +229,14 @@ describe("page wording (i18n.js)", () => {
 
   it("names things one way: Aside is always the Aside browser (or the Aside AI), in both languages", () => {
     for (const [key, text] of Object.entries(i18n.DICTIONARIES["en"]!)) {
-      for (const m of text.matchAll(/\bAside\b(?! browser| AI|'s settings)/g)) {
+      // "Aside's command-line tool" and "your Aside plan" (the subscription) are other things than the browser.
+      for (const m of text.matchAll(/\bAside\b(?! browser| AI|'s settings|'s command-line tool| plan\b)/g)) {
         expect.fail(`en ${key}: "Aside" at ${m.index} without "browser" or "AI": ${text}`);
       }
       expect(text, key).not.toMatch(/\bthe program's main part\b/);
     }
     for (const [key, text] of Object.entries(i18n.DICTIONARIES["ko"]!)) {
-      for (const m of text.matchAll(/Aside(?! 브라우저| AI|의 명령줄| 설정)/g)) {
+      for (const m of text.matchAll(/Aside(?! 브라우저| AI|의 명령줄| 설정| 요금제)/g)) {
         expect.fail(`ko ${key}: "Aside" at ${m.index} without "브라우저" or "AI": ${text}`);
       }
     }
@@ -241,6 +265,14 @@ describe("page wording (i18n.js)", () => {
     expect(ko["aside.explain"]).toMatch(/Aside 브라우저 안의 AI인 Aside AI/);
     expect(en["login.explain"]).toMatch(/Aside AI, the AI inside the Aside browser/);
     expect(ko["login.explain"]).toMatch(/Aside 브라우저 안의 AI인 Aside AI/);
+    // Settings → Aside AI: the term and "bot check" are explained before the switch uses them.
+    expect(en["ai.explain"]).toMatch(/^The Aside AI is the AI inside the Aside browser\. A bot check is/);
+    expect(ko["ai.explain"]).toMatch(/^Aside AI는 Aside 브라우저 안의 AI입니다\. 봇 검사는/);
+    // A site card's working sentence explains the term where it may first appear on the Sites tab.
+    for (const key of ["site.do.aiWorking", "site.do.aiWorkingCaptcha", "site.do.aiWorkingLogin"]) {
+      expect(en[key], key).toMatch(/^The Aside AI, the AI inside the Aside browser, is working on this site/);
+      expect(ko[key], key).toMatch(/^Aside 브라우저 안의 AI인 Aside AI가 이 사이트에서 작업하고 있습니다/);
+    }
   });
 
   it("says next to the captcha switch where a captcha picture goes (spec 6.5)", () => {
@@ -294,6 +326,59 @@ describe("page wording (i18n.js)", () => {
     }
   });
 
+  it("Settings → the Aside AI switch, its note, and the availability note, in both languages (spec 5)", () => {
+    const en = i18n.DICTIONARIES["en"]!;
+    const ko = i18n.DICTIONARIES["ko"]!;
+    expect(en["ai.switch"]).toBe("Let the Aside AI pass checks and log in");
+    expect(ko["ai.switch"]).toBe("Aside AI가 봇 검사를 통과하고 로그인하게 하기");
+    expect(en["ai.note"]).toBe(
+      "When a site shows a bot check or has logged you out, the Aside AI tries to pass the check or log in with the password saved in the Aside browser, and the request is retried. This uses your Aside plan.",
+    );
+    expect(ko["ai.note"]).toBe(
+      "사이트가 봇 검사를 띄우거나 로그아웃되면 Aside AI가 Aside 브라우저에 저장된 비밀번호로 검사를 통과하거나 로그인하고 요청을 다시 시도합니다. Aside 요금제를 사용합니다.",
+    );
+    // Aside CLI not found or signed out: sign it in with `aside login` (the command line with a copy button).
+    expect(en["ai.unavailable"]).toMatch(/^Aside's command-line tool was not found or is signed out/);
+    expect(en["ai.unavailable"]).toMatch(/Run the command below in the Terminal app/);
+    expect(ko["ai.unavailable"]).toMatch(/^Aside의 명령줄 도구를 찾을 수 없거나 로그인되어 있지 않아/);
+    expect(ko["ai.unavailable"]).toMatch(/‘터미널’ 앱에서 아래 명령을 실행한 뒤/);
+    // It points at the restart button by its own label (the program probes the tool again at start).
+    expect(en["ai.unavailable"]).toContain(en["restart.button"]);
+    expect(ko["ai.unavailable"]).toContain(ko["restart.button"]);
+    expect(instructions.COMMANDS["asideLogin"]).toBe("aside login");
+  });
+
+  it("each reason the Aside AI stopped for has a fixed sentence naming the account, in both languages", () => {
+    const en = i18n.DICTIONARIES["en"]!;
+    const ko = i18n.DICTIONARIES["ko"]!;
+    expect(i18n.t("en", "site.do.aiHeld.verification_code", { account: "u3" })).toBe(
+      "The site asked for a verification code — log in in the Aside browser window of account u3, then press Logged in? Check now.",
+    );
+    expect(i18n.t("ko", "site.do.aiHeld.verification_code", { account: "u3" })).toBe(
+      "사이트가 인증 코드를 요구했습니다. Aside 브라우저의 u3 계정 창에서 로그인한 뒤 ‘로그인했으면 지금 확인’을 누르세요.",
+    );
+    const loginReasons = ["no_saved_password", "verification_code", "question"];
+    for (const reason of ASSISTANT_REASON_CODES) {
+      const key = `site.do.aiHeld.${reason}`;
+      for (const lang of LANGS) {
+        const text = i18n.DICTIONARIES[lang]![key]!;
+        expect(text, `${lang} ${key}`).toBeTruthy();
+        expect(i18n.placeholders(text), `${lang} ${key}`).toEqual(["account"]);
+        expect(sentenceCount(text), `${lang} ${key}`).toBeLessThanOrEqual(2);
+      }
+      // The button it names is the one the card shows: "Logged in? Check now" after a login stop.
+      const button = loginReasons.includes(reason) ? "action.checkLoggedIn" : "action.check";
+      expect(en[key], key).toMatch(new RegExp(`then press ${en[button]!.replace("?", "\\?")}\\.$`));
+      expect(ko[key], key).toContain(ko[button]!);
+      if (!loginReasons.includes(reason)) expect(ko[key], key).not.toContain(ko["action.checkLoggedIn"]!);
+      expect(i18n.t("en", key, { account: "u3" }), key).toContain("the Aside browser window of account u3");
+      expect(i18n.t("ko", key, { account: "u3" }), key).toContain("Aside 브라우저의 u3 계정 창");
+    }
+    // The sentences differ per code (timed_out and other included).
+    const texts = new Set(ASSISTANT_REASON_CODES.map((r) => en[`site.do.aiHeld.${r}`]));
+    expect(texts.size).toBe(ASSISTANT_REASON_CODES.length);
+  });
+
   it("fills placeholders and falls back to the key", () => {
     expect(i18n.t("en", "step2.ok", { account: "u0" })).toContain("u0");
     expect(i18n.t("ko", "no.such.key")).toBe("no.such.key");
@@ -313,6 +398,10 @@ describe("labels of closed value sets (labels.js)", () => {
     helperCheckCode: HELPER_CHECK_CODES,
     // The kinds a paused helper job gives (spec 6.2); the page reads a missing one as `other`.
     blockKind: ["login", "captcha", "consent", "subscription", "other"],
+    // The last Aside AI task of a site (`GET /api/sites` `assistant`): the port's closed sets.
+    assistantPurpose: ASSISTANT_PURPOSES,
+    assistantVerdict: ASSISTANT_VERDICTS,
+    assistantReason: ASSISTANT_REASON_CODES,
   };
 
   it("each set has the members of the server's set (and the expected counts)", () => {
@@ -333,8 +422,14 @@ describe("labels of closed value sets (labels.js)", () => {
       helperRuntime: 3,
       helperCheckCode: 5,
       blockKind: 5,
+      assistantPurpose: 2,
+      assistantVerdict: 3,
+      assistantReason: 6,
     });
     expect([...state.BLOCK_KINDS].sort()).toEqual([...labels.VALUE_SETS["blockKind"]!].sort());
+    expect([...state.ASSISTANT_PURPOSES].sort()).toEqual([...ASSISTANT_PURPOSES].sort());
+    expect([...state.ASSISTANT_VERDICTS].sort()).toEqual([...ASSISTANT_VERDICTS].sort());
+    expect([...state.ASSISTANT_REASONS].sort()).toEqual([...ASSISTANT_REASON_CODES].sort());
   });
 
   it("errorCode, fieldCode, and problemCode are exactly the codes the server answers with", () => {
@@ -367,6 +462,21 @@ describe("labels of closed value sets (labels.js)", () => {
         }
       }
     }
+  });
+
+  it("names the Aside AI task's purpose, verdict, and reason in plain words", () => {
+    expect(labels.label("en", "assistantPurpose", "captcha")).toBe("Pass a bot check");
+    expect(labels.label("en", "assistantPurpose", "login")).toBe("Log in");
+    expect(labels.label("ko", "assistantPurpose", "login")).toBe("로그인");
+    expect(labels.label("en", "assistantVerdict", "needs_user")).toBe("Needs you");
+    expect(labels.label("ko", "assistantVerdict", "done")).toBe("완료");
+    expect(labels.label("en", "assistantReason", "verification_code")).toBe(
+      "The site asked for a verification code",
+    );
+    expect(labels.label("ko", "assistantReason", "no_saved_password")).toBe(
+      "Aside 브라우저에 이 사이트의 비밀번호가 저장되어 있지 않음",
+    );
+    expect(labels.label("en", "assistantReason", "brand_new")).toBe("brand_new");
   });
 
   it("shows an unknown value as received", () => {
@@ -1002,6 +1112,204 @@ describe("page logic (state.js)", () => {
     expect(source).toContain("renderIf(ui.sitesList, [data.sites, data.status?.mode, asideAccount()]");
     expect(source).toContain("renderIf(ui.jobsList, [data.jobs, data.sites, asideAccount()]");
     expect(source).toContain("renderIf(ui.steps.sites.dyn, [sitesStep, reuters, data.jobs, asideAccount()]");
+  });
+
+  it("the page script wires the Aside AI switch to assistantAuto and shows the availability note from the overview", async () => {
+    const source = await readFile(uiUrl("app.js"), "utf8");
+    // One switch component for both on/off settings: reads `settings[field]`, saves `{ [field]: boolean }`.
+    const form = /function switchForm\(\{[^)]*\}\) \{\n([\s\S]*?)\n\}\n/.exec(source)?.[1] ?? "";
+    expect(form).toContain("{ [field]: box.checked }");
+    expect(form).toContain("fieldEls: { [field]: fieldError }");
+    expect(form).toContain("Object.prototype.hasOwnProperty.call(settings, field)");
+    expect(form).toContain("const value = settings[field];");
+    expect(form).toContain("box.indeterminate = value !== true && value !== false;");
+    expect(form).toContain('tx("set.switchUnknown")');
+    // Both switches, with their own wording; the Aside AI switch carries the availability note.
+    expect(source).toMatch(
+      /captcha: switchForm\(\{\s*field: "captchaAuto",\s*id: "cap-auto",\s*explain: tx\("cap\.explain"\),\s*label: tx\("cap\.switch"\),\s*note: tx\("cap\.note"\),\s*\}\)/,
+    );
+    expect(source).toMatch(
+      /assistant: switchForm\(\{\s*field: "assistantAuto",\s*id: "ai-auto",\s*explain: tx\("ai\.explain"\),\s*label: tx\("ai\.switch"\),\s*note: tx\("ai\.note"\),\s*extra: assistantAvailability\(\),\s*\}\)/,
+    );
+    expect(source).toContain('h("h3", {}, tx("ai.title")),\n      ui.assistant.root,');
+    expect(source).toContain("ui.assistant.update(data.settings);");
+    // The overview is read with the lists while the program runs; only `false` shows the note.
+    expect(source).toContain('load("/overview")');
+    expect(source).toContain("data.overview = overview;");
+    const note = /function assistantAvailability\(\) \{\n([\s\S]*?)\n\}\n/.exec(source)?.[1] ?? "";
+    expect(note).toContain('tx("ai.unavailable")');
+    expect(note).toContain("codeLine(COMMANDS.asideLogin)");
+    expect(note).toContain("restartButton(");
+    expect(note).toContain("root.hidden = data.overview?.assistantAvailable !== false;");
+    // The Details line of a site's last task comes from state.js.
+    const card = /function siteCard\(site, compact\) \{\n([\s\S]*?)\n\}\n/.exec(source)?.[1] ?? "";
+    expect(card).toContain('[tx("site.d.aiTask"), assistantLine(site)]');
+    expect(source).toContain("assistantDetailParts(site).map(");
+  });
+
+  describe("a site's last Aside AI task (GET /api/sites `assistant`)", () => {
+    const at = "2026-10-09T05:00:00.000Z";
+    const site = (assistant: unknown, over: Record<string, unknown> = {}) => ({
+      key: "reuters",
+      status: "needs_login",
+      lastCheckedAt: "2026-10-09T04:00:00.000Z",
+      loginUrl: "https://www.reuters.com/account/sign-in/",
+      actions: ["repair", "check", "remove"],
+      job: null,
+      assistant,
+      ...over,
+    });
+    const running = (purpose: string) => ({ purpose, verdict: null, reason: null, at, running: true });
+    const ended = (purpose: string, verdict: string, reason: string | null) => ({
+      purpose,
+      verdict,
+      reason,
+      at,
+      running: false,
+    });
+
+    it("reads the task as given, or null without one", () => {
+      expect(state.assistantTask(site(null))).toBeNull();
+      expect(state.assistantTask(site(undefined))).toBeNull();
+      expect(state.assistantTask(site({ purpose: "" }))).toBeNull();
+      expect(state.assistantTask(null)).toBeNull();
+      expect(state.assistantTask(site(running("login")))).toEqual({
+        purpose: "login",
+        verdict: null,
+        reason: null,
+        at,
+        running: true,
+      });
+      expect(state.assistantTask(site({ purpose: "captcha", verdict: "done", running: "yes" }))).toEqual({
+        purpose: "captcha",
+        verdict: "done",
+        reason: null,
+        at: null,
+        running: false,
+      });
+    });
+
+    it("while the Aside AI works, the card says so (check / login) and has no prominent button", () => {
+      expect(state.siteGuidance(site(running("login")))).toEqual({
+        say: "site.do.aiWorkingLogin",
+        primary: null,
+      });
+      expect(state.siteGuidance(site(running("captcha"), { status: "active" }))).toEqual({
+        say: "site.do.aiWorkingCaptcha",
+        primary: null,
+      });
+      expect(state.assistantWorkingSay("something_new")).toBe("site.do.aiWorking");
+      expect(state.loginCheckPrimary(site(running("login")))).toBe(false);
+      // The login text for pasting into the Aside AI is not offered while it already works on the site.
+      expect(state.offersLoginHelp(site(running("login")))).toBe(false);
+      expect(state.offersLoginHelp(site(ended("login", "done", null)))).toBe(true);
+      // A helper job on the site still comes first.
+      expect(state.siteGuidance(site(running("login"), { job: { state: "running" } })).say).toBe(
+        "site.do.working",
+      );
+      for (const lang of LANGS) {
+        expect(i18n.t(lang, "site.do.aiWorkingLogin")).not.toBe(i18n.t(lang, "site.do.aiWorkingCaptcha"));
+      }
+      expect(i18n.t("en", "site.do.aiWorkingCaptcha")).toBe(
+        "The Aside AI, the AI inside the Aside browser, is working on this site (bot check).",
+      );
+      expect(i18n.t("en", "site.do.aiWorkingLogin")).toBe(
+        "The Aside AI, the AI inside the Aside browser, is working on this site (login).",
+      );
+    });
+
+    it("after a task that needs the user, the card gives the reason's sentence, led by Check now", () => {
+      const held = site(ended("login", "needs_user", "verification_code"));
+      expect(state.assistantHeldReason(held)).toBe("verification_code");
+      expect(state.siteGuidance(held)).toEqual({ say: "site.do.aiHeld.verification_code", primary: "check" });
+      // A login stop: the button reads "Logged in? Check now", as the sentence says.
+      expect(state.loginCheckPrimary(held)).toBe(true);
+      for (const reason of ["no_saved_password", "question"]) {
+        expect(state.loginCheckPrimary(site(ended("login", "needs_user", reason)))).toBe(true);
+      }
+      // A check that was not passed, or another stop: plain Check now.
+      const check = site(ended("captcha", "needs_user", "check_not_passed"), { status: "active" });
+      expect(state.siteGuidance(check)).toEqual({ say: "site.do.aiHeld.check_not_passed", primary: "check" });
+      expect(state.loginCheckPrimary(check)).toBe(false);
+      // An unknown or missing reason reads as `other`.
+      expect(state.assistantHeldReason(site(ended("login", "needs_user", "brand_new")))).toBe("other");
+      expect(state.assistantHeldReason(site(ended("login", "needs_user", null)))).toBe("other");
+      // Without Check now among the actions (the site is busy), nothing is prominent.
+      expect(state.siteGuidance({ ...held, actions: ["repair", "remove"] }).primary).toBeNull();
+      // Every sentence it can choose exists in both languages.
+      for (const reason of ASSISTANT_REASON_CODES) {
+        const say = state.siteGuidance(site(ended("login", "needs_user", reason))).say;
+        expect(say).toBe(`site.do.aiHeld.${reason}`);
+        for (const lang of LANGS) expect(i18n.DICTIONARIES[lang], `${lang} ${say}`).toHaveProperty([say]);
+      }
+    });
+
+    it("the reason's sentence gives way once the site works again or was checked after the task", () => {
+      // `done` and `failed` leave today's sentence (the program tries again by itself or the check decides).
+      expect(state.assistantHeldReason(site(ended("login", "done", null)))).toBeNull();
+      expect(state.siteGuidance(site(ended("login", "failed", "timed_out"))).say).toBe("site.do.login");
+      // An active site: only until a check ran after the task ended.
+      const captcha = ended("captcha", "needs_user", "check_not_passed");
+      expect(state.assistantHeldReason(site(captcha, { status: "active" }))).toBe("check_not_passed");
+      expect(
+        state.siteGuidance(site(captcha, { status: "active", lastCheckedAt: "2026-10-09T06:00:00.000Z" })),
+      ).toEqual({ say: "site.do.fine", primary: null });
+      // A needs_login site keeps it until the status changes (Check now starts a new task or confirms).
+      expect(
+        state.assistantHeldReason(
+          site(ended("login", "needs_user", "no_saved_password"), {
+            lastCheckedAt: "2026-10-09T06:00:00.000Z",
+          }),
+        ),
+      ).toBe("no_saved_password");
+      // Other states keep their own guidance (Repair, the helper).
+      expect(state.siteGuidance(site(captcha, { status: "degraded" })).say).toBe("site.do.degraded");
+      expect(state.siteGuidance(site(captcha, { status: "failed" })).say).toBe("site.do.failed");
+    });
+
+    it("the Details line: purpose, result, reason, and when, with a label for each part in both languages", () => {
+      expect(state.assistantDetailParts(site(null))).toEqual([]);
+      expect(state.assistantDetailParts(site(running("login")))).toEqual([
+        { set: "assistantPurpose", value: "login" },
+        { key: "site.d.aiRunning" },
+        { time: at },
+      ]);
+      expect(state.assistantDetailParts(site(ended("login", "needs_user", "verification_code")))).toEqual([
+        { set: "assistantPurpose", value: "login" },
+        { set: "assistantVerdict", value: "needs_user" },
+        { set: "assistantReason", value: "verification_code" },
+        { time: at },
+      ]);
+      expect(state.assistantDetailParts(site(ended("captcha", "done", null)))).toEqual([
+        { set: "assistantPurpose", value: "captcha" },
+        { set: "assistantVerdict", value: "done" },
+        { time: at },
+      ]);
+      // Rendered as the page does it: every part has its own words in both languages.
+      for (const lang of LANGS) {
+        const line = state
+          .assistantDetailParts(site(ended("login", "needs_user", "verification_code")))
+          .map((part) =>
+            "key" in part
+              ? i18n.t(lang, part.key)
+              : "time" in part
+                ? part.time
+                : labels.label(lang, part.set, part.value),
+          )
+          .join(" · ");
+        expect(line, lang).toBe(
+          [
+            labels.LABELS[lang]!["assistantPurpose"]!["login"],
+            labels.LABELS[lang]!["assistantVerdict"]!["needs_user"],
+            labels.LABELS[lang]!["assistantReason"]!["verification_code"],
+            at,
+          ].join(" · "),
+        );
+        expect(i18n.DICTIONARIES[lang]!["site.d.aiTask"]).toBeTruthy();
+        expect(i18n.DICTIONARIES[lang]!["site.d.aiRunning"]).toBeTruthy();
+      }
+      expect(i18n.t("en", "site.d.aiTask")).toBe("Last Aside AI task");
+    });
   });
 
   it("formats sizes", () => {

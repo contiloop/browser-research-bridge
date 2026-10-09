@@ -1,6 +1,7 @@
 /* Pure page logic of the settings page: the Getting started checklist and its "what to do next"
  * line, the helper's readiness, ChatGPT sub-step states, the "what to do now" choice per site (and when
- * its button reads "Logged in? Check now"), when a site or a paused job offers the Aside AI login text,
+ * its button reads "Logged in? Check now"), a site's last Aside AI task (its sentence while it runs or
+ * waits for the user, and its Details line), when a site or a paused job offers the Aside AI login text,
  * the Aside browser account the page names, the passphrase generator, and the language choice. No DOM
  * and no network, so the unit tests import it directly. */
 
@@ -176,8 +177,12 @@ export function jobPausedForLogin(job) {
   return job?.state === "awaiting_user" && blockKind(job) === "login";
 }
 
-/** Whether a site card offers the Aside AI login text: the site needs a login, or its job is paused for one. */
+/**
+ * Whether a site card offers the Aside AI login text: the site needs a login, or its job is paused for
+ * one; not while the Aside AI is already working on the site by itself.
+ */
 export function offersLoginHelp(site) {
+  if (assistantTask(site)?.running) return false;
   return site?.status === "needs_login" || jobPausedForLogin(site?.job);
 }
 
@@ -211,10 +216,91 @@ export function chatgptSubsteps(chatgpt) {
   });
 }
 
+/** What an Aside AI task is for (`GET /api/sites` `assistant.purpose`; the server's closed set). */
+export const ASSISTANT_PURPOSES = ["captcha", "login"];
+/** How an Aside AI task ended (`assistant.verdict`; null while it runs). */
+export const ASSISTANT_VERDICTS = ["done", "failed", "needs_user"];
+/** Why an Aside AI task did not end `done` (`assistant.reason`). */
+export const ASSISTANT_REASONS = [
+  "no_saved_password",
+  "verification_code",
+  "question",
+  "check_not_passed",
+  "timed_out",
+  "other",
+];
+
+/** The reasons whose sentence asks the user to log in (the card's button then reads "Logged in? Check now"). */
+const LOGIN_REASONS = ["no_saved_password", "verification_code", "question"];
+
+/**
+ * A site's last (or running) Aside AI task from `GET /api/sites` (`site.assistant`), with its fields
+ * checked: `{ purpose, verdict, reason, at, running }`, or null when the site has none. Values are kept
+ * as received (an unknown one is shown as received).
+ */
+export function assistantTask(site) {
+  const task = site?.assistant;
+  if (!task || typeof task !== "object" || typeof task.purpose !== "string" || task.purpose === "")
+    return null;
+  const text = (value) => (typeof value === "string" && value !== "" ? value : null);
+  return {
+    purpose: task.purpose,
+    verdict: text(task.verdict),
+    reason: text(task.reason),
+    at: text(task.at),
+    running: task.running === true,
+  };
+}
+
+/** The card's sentence while the Aside AI works on a site, by the task's purpose. */
+export function assistantWorkingSay(purpose) {
+  if (purpose === "captcha") return "site.do.aiWorkingCaptcha";
+  if (purpose === "login") return "site.do.aiWorkingLogin";
+  return "site.do.aiWorking";
+}
+
+/** Whether `checkedAt` (the site's last check) is later than `at` (both ISO times). */
+function checkedSince(checkedAt, at) {
+  const checked = typeof checkedAt === "string" ? Date.parse(checkedAt) : Number.NaN;
+  const ended = typeof at === "string" ? Date.parse(at) : Number.NaN;
+  return Number.isFinite(checked) && Number.isFinite(ended) && checked > ended;
+}
+
+/**
+ * The reason the card gives when the site's last Aside AI task ended `needs_user` (the program then
+ * waits for the user, until Check now): on a `needs_login` site, and on an `active` site until a check
+ * ran after the task. An unknown reason reads as `other`. Null otherwise.
+ */
+export function assistantHeldReason(site) {
+  const task = assistantTask(site);
+  if (!task || task.running || task.verdict !== "needs_user") return null;
+  const waiting =
+    site.status === "needs_login" || (site.status === "active" && !checkedSince(site.lastCheckedAt, task.at));
+  if (!waiting) return null;
+  return ASSISTANT_REASONS.includes(task.reason) ? task.reason : "other";
+}
+
+/**
+ * The Details line of a site's last Aside AI task, as parts in order: what it was for, how it ended
+ * ("in progress" while it runs), why (when a reason is given), and when. A part is `{ set, value }` (a
+ * label from labels.js), `{ key }` (a dictionary text), or `{ time }` (an ISO time). Empty without a task.
+ */
+export function assistantDetailParts(site) {
+  const task = assistantTask(site);
+  if (!task) return [];
+  const parts = [{ set: "assistantPurpose", value: task.purpose }];
+  if (task.running) parts.push({ key: "site.d.aiRunning" });
+  else if (task.verdict !== null) parts.push({ set: "assistantVerdict", value: task.verdict });
+  if (!task.running && task.reason !== null) parts.push({ set: "assistantReason", value: task.reason });
+  if (task.at !== null) parts.push({ time: task.at });
+  return parts;
+}
+
 /**
  * What a site row says and which action it shows prominently (one thing to do at a time).
  * Returns `{ say, primary }`: `say` is a dictionary key (`site.do.*`), `primary` one of the site's
- * `actions` or null.
+ * `actions` or null. While the Aside AI works on the site the card says so and has nothing prominent;
+ * after a task that ended `needs_user` it gives that reason's sentence, led by Check now.
  */
 export function siteGuidance(site) {
   const actions = Array.isArray(site.actions) ? site.actions : [];
@@ -224,6 +310,10 @@ export function siteGuidance(site) {
     return { say: "site.do.working", primary: null };
   if (job && job.state === "awaiting_user") return { say: "site.do.awaiting", primary: has("retry") };
   if (job && job.state === "failed" && has("retry")) return { say: "site.do.jobFailed", primary: "retry" };
+  const task = assistantTask(site);
+  if (task?.running) return { say: assistantWorkingSay(task.purpose), primary: null };
+  const held = assistantHeldReason(site);
+  if (held !== null) return { say: `site.do.aiHeld.${held}`, primary: has("check") };
   switch (site.status) {
     case "needs_login":
       return { say: site.loginUrl ? "site.do.login" : "site.do.loginNoUrl", primary: has("check") };
@@ -242,14 +332,23 @@ export function siteGuidance(site) {
   }
 }
 
+/** The card sentences that ask the user to log in. */
+const LOGIN_SAYS = [
+  "site.do.login",
+  "site.do.loginNoUrl",
+  ...LOGIN_REASONS.map((r) => `site.do.aiHeld.${r}`),
+];
+
 /**
  * A site card whose one thing to do is logging in, with Check now as its prominent action (a
- * `needs_login` site without a helper job in the way). Its button then reads "Logged in? Check now" and
- * the card says that the status changes only after Check now. A job paused for a login keeps Retry.
+ * `needs_login` site without a helper job in the way, or a site whose Aside AI task stopped for a login
+ * only the user can do). Its button then reads "Logged in? Check now" and the card says that the status
+ * changes only after Check now. A job paused for a login keeps Retry; while the Aside AI works, no button
+ * is prominent.
  */
 export function loginCheckPrimary(site) {
   const guide = siteGuidance(site);
-  return (guide.say === "site.do.login" || guide.say === "site.do.loginNoUrl") && guide.primary === "check";
+  return LOGIN_SAYS.includes(guide.say) && guide.primary === "check";
 }
 
 /** The program's Aside browser account when none is known yet (the settings not loaded): `u0`. */

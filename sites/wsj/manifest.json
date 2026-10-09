@@ -1,0 +1,22 @@
+{
+  "key": "wsj",
+  "name": "The Wall Street Journal",
+  "hostnames": ["www.wsj.com"],
+  "extraAllowedHosts": [],
+  "loginUrl": "https://www.wsj.com/client/login",
+  "requiresLogin": true,
+  "timezone": "America/New_York",
+  "capabilities": {
+    "search": true,
+    "read": true,
+    "dateFilter": false,
+    "pagination": true
+  },
+  "sampleQuery": "inflation",
+  "sampleReadUrl": "https://www.wsj.com/economy/consumers/inflation-midterm-election-2026-0f809bec",
+  "gatedSampleUrl": "https://www.wsj.com/economy/us-inflation-consumer-price-index-january-2022-11644452274",
+  "minReadChars": 1000,
+  "minIntervalMs": 3000,
+  "createdBy": "agent",
+  "version": 2
+}

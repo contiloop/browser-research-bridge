@@ -1,7 +1,8 @@
 /**
  * Dashboard JSON API. Mounted under `/api` behind the guards of ./security.ts.
  *
- * Reads: overview (public URL, MCP URL), browser status, sites, jobs, job log, job events (SSE),
+ * Reads: overview (public URL, MCP URL, whether the Aside AI answers), browser status, sites (with
+ * each site's last Aside AI task), jobs, job log, job events (SSE),
  * OAuth clients, cache sizes. Writes: Add / Retry / Repair / Check now / Remove, job retry/cancel,
  * OAuth revoke, cache clear. Responses never carry the admin token, the passphrase, or OAuth token
  * values (only token ids, which are storage hashes).
@@ -188,8 +189,10 @@ interface Answer {
   body: Record<string, unknown>;
 }
 
-/** The string fields of `PUT settings` (`captchaAuto` is the one boolean field). */
+/** The string fields of `PUT settings`. */
 const PAGE_FIELDS = ["passphrase", "helperRuntime", "asideAccount"] as const;
+/** The boolean fields of `PUT settings`. */
+const PAGE_SWITCHES = ["captchaAuto", "assistantAuto"] as const;
 
 /**
  * Every `error` code the settings-page API answers with (this module, the guards in security.ts,
@@ -451,10 +454,11 @@ export function createApi(input: DashboardDeps | DashboardSource, options: ApiOp
         fields["helperRuntime"] = "bad_value";
       }
     }
-    const captchaAuto = body["captchaAuto"];
-    if (captchaAuto !== undefined) {
-      if (typeof captchaAuto !== "boolean") fields["captchaAuto"] = "bad_value";
-      else change.captchaAuto = captchaAuto;
+    for (const name of PAGE_SWITCHES) {
+      const value = body[name];
+      if (value === undefined) continue;
+      if (typeof value !== "boolean") fields[name] = "bad_value";
+      else change[name] = value;
     }
     const disconnect = body["disconnectApps"];
     if (disconnect !== undefined && typeof disconnect !== "boolean") fields["disconnectApps"] = "bad_value";
@@ -495,6 +499,8 @@ export function createApi(input: DashboardDeps | DashboardSource, options: ApiOp
       dashboardUrl: options.adminOrigin(),
       asideAccount: deps.config.asideAccount,
       adminTokenFile: options.tokenFile,
+      // Whether the Aside AI's CLI answered its probe (null before it did, or without a coordinator).
+      assistantAvailable: deps.assistant?.available() ?? null,
     }),
   );
 
@@ -502,6 +508,7 @@ export function createApi(input: DashboardDeps | DashboardSource, options: ApiOp
 
   api.get("/sites", async (c) => {
     const bySite = await deps.fileCache.statsBySite();
+    const assistant = deps.assistant;
     const sites = deps.registry.list().map((site) => {
       const job = deps.jobs.get(site.key);
       const checking = deps.health.isChecking(site.key);
@@ -522,6 +529,8 @@ export function createApi(input: DashboardDeps | DashboardSource, options: ApiOp
         cache: bySite[site.key] ?? { entries: 0, bytes: 0 },
         job: job ? jobSummary(job) : null,
         actions: siteActions(site, job, checking),
+        // The site's last (or running) Aside AI task: codes and times only.
+        assistant: assistant?.view(site.key) ?? null,
       };
     });
     return c.json({ sites });
@@ -702,6 +711,7 @@ export function createApi(input: DashboardDeps | DashboardSource, options: ApiOp
       helperRuntime: { value: view.helperRuntime.value, supported: supportedRuntimes() },
       asideAccount: { value: view.asideAccount.value, locked: view.asideAccount.locked },
       captchaAuto: view.captchaAuto.value,
+      assistantAuto: view.assistantAuto.value,
       info: { ...page.info(), ...(options.adminPort ? { adminPort: options.adminPort() } : {}) },
     });
   });

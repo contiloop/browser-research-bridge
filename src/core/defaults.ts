@@ -57,3 +57,15 @@ export const DEFAULT_CAPTCHA_DETECT_BUDGET_MS = 20_000;
 
 /** Tool-call budget kept back for the re-run after an attempt (`captchaRerunReserveMs`). */
 export const DEFAULT_CAPTCHA_RERUN_RESERVE_MS = 15_000;
+
+// Aside AI assistant defaults (`assistant.*` in config/bridge.json), defined only here: the config
+// loader's tunables and the code that runs assistant tasks fall back to these.
+
+/** Time one Aside AI task (a human check or a login) may take before it is stopped (`assistantTaskBudgetMs`). */
+export const DEFAULT_ASSISTANT_TASK_BUDGET_MS = 120_000;
+
+/** Window in which repeated assistant failures for a site are counted (`assistantFailureWindowMs`). */
+export const DEFAULT_ASSISTANT_FAILURE_WINDOW_MS = 600_000;
+
+/** How long assistant tasks for a site pause after repeated failures (`assistantPauseMs`). */
+export const DEFAULT_ASSISTANT_PAUSE_MS = 600_000;

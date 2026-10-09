@@ -136,6 +136,88 @@ describe("loadConfig", () => {
       codexModel: null,
     });
     expect(fromExample.captcha).toEqual({ auto: true });
+    expect(fromExample.assistant).toEqual({ auto: true, effort: "low" });
+  });
+
+  it("loads assistant.auto (default true) and assistant.effort (default low) from the config file only", () => {
+    const defaults = loadConfig({ rootDir: root, env: { BRIDGE_PASSPHRASE: GOOD } });
+    expect(defaults.assistant).toEqual({ auto: true, effort: "low" });
+    expect(defaults.warnings).toEqual([]);
+    writeJson({ assistant: { auto: false, effort: "medium" } });
+    // No environment override: variables with those names change nothing.
+    const off = loadConfig({
+      rootDir: root,
+      env: {
+        BRIDGE_PASSPHRASE: GOOD,
+        BRIDGE_ASSISTANT_AUTO: "true",
+        BRIDGE_ASSISTANT_EFFORT: "max",
+        ASSISTANT_EFFORT: "max",
+      },
+    });
+    expect(off.assistant).toEqual({ auto: false, effort: "medium" });
+    expect(off.warnings).toEqual([]);
+    writeJson({ assistant: {} });
+    expect(loadConfig({ rootDir: root, env: { BRIDGE_PASSPHRASE: GOOD } }).assistant).toEqual({
+      auto: true,
+      effort: "low",
+    });
+    for (const effort of ["off", "minimal", "low", "medium", "high", "xhigh", "max", "ultrabrowse"]) {
+      writeJson({ assistant: { effort } });
+      expect(loadConfig({ rootDir: root, env: { BRIDGE_PASSPHRASE: GOOD } }).assistant.effort).toBe(effort);
+    }
+  });
+
+  it("refuses an assistant setting of the wrong type or an unknown effort as config_invalid", () => {
+    for (const bad of [{ auto: "yes" }, { auto: null }, { auto: 1 }]) {
+      writeJson({ assistant: bad });
+      expect(() => loadConfig({ rootDir: root, env: { BRIDGE_PASSPHRASE: GOOD } })).toThrow(
+        /assistant\.auto/,
+      );
+      const result = loadConfigResult({ rootDir: root, env: { BRIDGE_PASSPHRASE: GOOD } });
+      expect(result.ok ? null : result.problem.code).toBe("config_invalid");
+    }
+    for (const bad of ["LOW", "extreme", "", " low", null, 3, ["low"]]) {
+      writeJson({ assistant: { effort: bad } });
+      expect(() => loadConfig({ rootDir: root, env: { BRIDGE_PASSPHRASE: GOOD } }), String(bad)).toThrow(
+        /assistant\.effort/,
+      );
+      const result = loadConfigResult({ rootDir: root, env: { BRIDGE_PASSPHRASE: GOOD } });
+      expect(result.ok ? null : result.problem.code).toBe("config_invalid");
+    }
+    for (const bad of [true, "on", ["auto"], null]) {
+      writeJson({ assistant: bad });
+      expect(() => loadConfig({ rootDir: root, env: { BRIDGE_PASSPHRASE: GOOD } }), String(bad)).toThrow(
+        /assistant/,
+      );
+    }
+  });
+
+  it("has the assistant tunables with their defaults, overridable and positive", () => {
+    expect(DEFAULT_TUNABLES).toMatchObject({
+      assistantTaskBudgetMs: 120_000,
+      assistantFailureWindowMs: 600_000,
+      assistantPauseMs: 600_000,
+    });
+    writeJson({
+      tunables: {
+        assistantTaskBudgetMs: 90_000,
+        assistantFailureWindowMs: 300_000,
+        assistantPauseMs: 60_000,
+      },
+    });
+    const tuned = loadConfig({ rootDir: root, env: { BRIDGE_PASSPHRASE: GOOD } });
+    expect(tuned.tunables).toMatchObject({
+      assistantTaskBudgetMs: 90_000,
+      assistantFailureWindowMs: 300_000,
+      assistantPauseMs: 60_000,
+    });
+    expect(tuned.warnings).toEqual([]);
+    for (const key of ["assistantTaskBudgetMs", "assistantFailureWindowMs", "assistantPauseMs"]) {
+      writeJson({ tunables: { [key]: 0 } });
+      expect(() => loadConfig({ rootDir: root, env: { BRIDGE_PASSPHRASE: GOOD } }), key).toThrow(
+        new RegExp(`${key} must be a positive number`),
+      );
+    }
   });
 
   it("has the browser pool and captcha tunables with their defaults, and no maxConcurrentSites", () => {

@@ -191,6 +191,22 @@ const en = {
   "site.do.fine": "Working. Nothing to do.",
   "site.do.checkFirst": "Ready. Press Check now once to confirm it works.",
   "site.do.unknown": "No action is suggested for this state.",
+  "site.do.aiWorking": "The Aside AI, the AI inside the Aside browser, is working on this site.",
+  "site.do.aiWorkingCaptcha":
+    "The Aside AI, the AI inside the Aside browser, is working on this site (bot check).",
+  "site.do.aiWorkingLogin": "The Aside AI, the AI inside the Aside browser, is working on this site (login).",
+  "site.do.aiHeld.no_saved_password":
+    "No password for this site is saved in the Aside browser — log in in the Aside browser window of account {account}, then press Logged in? Check now.",
+  "site.do.aiHeld.verification_code":
+    "The site asked for a verification code — log in in the Aside browser window of account {account}, then press Logged in? Check now.",
+  "site.do.aiHeld.question":
+    "The site asked a question only you can answer — log in in the Aside browser window of account {account}, then press Logged in? Check now.",
+  "site.do.aiHeld.check_not_passed":
+    "The Aside AI could not pass the site's bot check — pass it in the Aside browser window of account {account}, then press Check now.",
+  "site.do.aiHeld.timed_out":
+    "The Aside AI ran out of time on this site — log in or pass the check yourself in the Aside browser window of account {account}, then press Check now.",
+  "site.do.aiHeld.other":
+    "The Aside AI needs your help with this site — log in or pass the check yourself in the Aside browser window of account {account}, then press Check now.",
   "site.checking": "checking…",
   "site.lastChecked": "Last checked: {time}",
   "site.d.key": "Site key",
@@ -202,6 +218,8 @@ const en = {
   "site.d.runtime": "Helper ran on",
   "site.d.cache": "Saved pages",
   "site.d.lastChecked": "Last checked",
+  "site.d.aiTask": "Last Aside AI task",
+  "site.d.aiRunning": "in progress",
   "job.d.id": "Job id",
   "job.d.attempts": "Attempts",
   "job.d.commit": "Saved version (commit)",
@@ -377,7 +395,17 @@ const en = {
   "cap.switch": "Solve captchas automatically",
   "cap.note":
     "Checkbox and slider captchas are solved in the Aside browser on this Mac. For text captchas, the picture of the captcha is sent to the AI model configured in Aside's settings.",
-  "cap.unknown": "The current value could not be read from the settings file; saving writes the value shown.",
+  "set.switchUnknown":
+    "The current value could not be read from the settings file; saving writes the value shown.",
+
+  "ai.title": "Aside AI",
+  "ai.explain":
+    "The Aside AI is the AI inside the Aside browser. A bot check is a test, such as a captcha, that a site shows to make sure a person is visiting.",
+  "ai.switch": "Let the Aside AI pass checks and log in",
+  "ai.note":
+    "When a site shows a bot check or has logged you out, the Aside AI tries to pass the check or log in with the password saved in the Aside browser, and the request is retried. This uses your Aside plan.",
+  "ai.unavailable":
+    "Aside's command-line tool was not found or is signed out, so the Aside AI cannot help. Run the command below in the Terminal app, then press Restart the program.",
 
   "lang.title": "Page language",
   "lang.explain": "The language of this page. It is remembered in this browser and changes nothing else.",
@@ -600,6 +628,21 @@ const ko = {
   "site.do.fine": "정상 작동 중입니다. 할 일이 없습니다.",
   "site.do.checkFirst": "준비되었습니다. 지금 확인을 한 번 눌러 작동하는지 확인하세요.",
   "site.do.unknown": "이 상태에서 권하는 조치가 없습니다.",
+  "site.do.aiWorking": "Aside 브라우저 안의 AI인 Aside AI가 이 사이트에서 작업하고 있습니다.",
+  "site.do.aiWorkingCaptcha": "Aside 브라우저 안의 AI인 Aside AI가 이 사이트에서 작업하고 있습니다(봇 검사).",
+  "site.do.aiWorkingLogin": "Aside 브라우저 안의 AI인 Aside AI가 이 사이트에서 작업하고 있습니다(로그인).",
+  "site.do.aiHeld.no_saved_password":
+    "Aside 브라우저에 이 사이트의 비밀번호가 저장되어 있지 않습니다. Aside 브라우저의 {account} 계정 창에서 로그인한 뒤 ‘로그인했으면 지금 확인’을 누르세요.",
+  "site.do.aiHeld.verification_code":
+    "사이트가 인증 코드를 요구했습니다. Aside 브라우저의 {account} 계정 창에서 로그인한 뒤 ‘로그인했으면 지금 확인’을 누르세요.",
+  "site.do.aiHeld.question":
+    "사이트가 사용자만 답할 수 있는 질문을 했습니다. Aside 브라우저의 {account} 계정 창에서 로그인한 뒤 ‘로그인했으면 지금 확인’을 누르세요.",
+  "site.do.aiHeld.check_not_passed":
+    "Aside AI가 사이트의 봇 검사를 통과하지 못했습니다. Aside 브라우저의 {account} 계정 창에서 직접 통과한 뒤 지금 확인을 누르세요.",
+  "site.do.aiHeld.timed_out":
+    "Aside AI가 이 사이트에서 시간 안에 끝내지 못했습니다. Aside 브라우저의 {account} 계정 창에서 직접 로그인하거나 검사를 통과한 뒤 지금 확인을 누르세요.",
+  "site.do.aiHeld.other":
+    "Aside AI가 이 사이트에서 도움이 필요합니다. Aside 브라우저의 {account} 계정 창에서 직접 로그인하거나 검사를 통과한 뒤 지금 확인을 누르세요.",
   "site.checking": "확인하는 중…",
   "site.lastChecked": "마지막 확인: {time}",
   "site.d.key": "사이트 키",
@@ -611,6 +654,8 @@ const ko = {
   "site.d.runtime": "도우미가 사용한 AI",
   "site.d.cache": "저장된 페이지",
   "site.d.lastChecked": "마지막 확인",
+  "site.d.aiTask": "최근 Aside AI 작업",
+  "site.d.aiRunning": "진행 중",
   "job.d.id": "작업 ID",
   "job.d.attempts": "시도 횟수",
   "job.d.commit": "저장된 버전 (커밋)",
@@ -784,7 +829,16 @@ const ko = {
   "cap.switch": "캡차 자동으로 풀기",
   "cap.note":
     "체크박스와 슬라이더 캡차는 이 Mac의 Aside 브라우저 안에서 풉니다. 글자 캡차는 캡차 그림이 Aside 설정에 지정된 AI 모델로 전송됩니다.",
-  "cap.unknown": "설정 파일에서 지금 값을 읽지 못했습니다. 저장하면 화면에 보이는 값이 기록됩니다.",
+  "set.switchUnknown": "설정 파일에서 지금 값을 읽지 못했습니다. 저장하면 화면에 보이는 값이 기록됩니다.",
+
+  "ai.title": "Aside AI",
+  "ai.explain":
+    "Aside AI는 Aside 브라우저 안의 AI입니다. 봇 검사는 캡차처럼, 사람이 방문했는지 확인하려고 사이트가 보여 주는 테스트입니다.",
+  "ai.switch": "Aside AI가 봇 검사를 통과하고 로그인하게 하기",
+  "ai.note":
+    "사이트가 봇 검사를 띄우거나 로그아웃되면 Aside AI가 Aside 브라우저에 저장된 비밀번호로 검사를 통과하거나 로그인하고 요청을 다시 시도합니다. Aside 요금제를 사용합니다.",
+  "ai.unavailable":
+    "Aside의 명령줄 도구를 찾을 수 없거나 로그인되어 있지 않아 Aside AI가 도울 수 없습니다. ‘터미널’ 앱에서 아래 명령을 실행한 뒤 프로그램 다시 시작을 누르세요.",
 
   "lang.title": "페이지 언어",
   "lang.explain": "이 페이지의 언어입니다. 이 브라우저에 기억되며, 다른 것은 바꾸지 않습니다.",

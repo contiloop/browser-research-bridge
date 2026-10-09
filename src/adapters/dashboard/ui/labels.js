@@ -24,6 +24,16 @@ export const VALUE_SETS = {
   helperRuntime: ["auto", "claude", "codex"],
   helperCheckCode: ["ok", "not_installed", "not_signed_in", "limit_reached", "failed"],
   blockKind: ["login", "captcha", "consent", "subscription", "other"],
+  assistantPurpose: ["captcha", "login"],
+  assistantVerdict: ["done", "failed", "needs_user"],
+  assistantReason: [
+    "no_saved_password",
+    "verification_code",
+    "question",
+    "check_not_passed",
+    "timed_out",
+    "other",
+  ],
   errorCode: [
     "invalid",
     "busy",
@@ -110,6 +120,23 @@ const en = {
     consent: "Needs you to accept something on the site, such as its terms or cookies",
     subscription: "Needs a subscription to the site",
     other: "Needs something else from you",
+  },
+  assistantPurpose: {
+    captcha: "Pass a bot check",
+    login: "Log in",
+  },
+  assistantVerdict: {
+    done: "Finished",
+    failed: "Did not succeed",
+    needs_user: "Needs you",
+  },
+  assistantReason: {
+    no_saved_password: "No password for this site is saved in the Aside browser",
+    verification_code: "The site asked for a verification code",
+    question: "The site asked a question only you can answer",
+    check_not_passed: "The bot check could not be passed",
+    timed_out: "It took too long and was stopped",
+    other: "Another problem",
   },
   errorCode: {
     invalid: "Some of what you entered is not accepted.",
@@ -205,6 +232,23 @@ const ko = {
     consent: "사이트에서 약관이나 쿠키 같은 것에 동의해 주어야 함",
     subscription: "사이트 구독이 필요함",
     other: "그 밖의 조치가 필요함",
+  },
+  assistantPurpose: {
+    captcha: "봇 검사 통과",
+    login: "로그인",
+  },
+  assistantVerdict: {
+    done: "완료",
+    failed: "성공하지 못함",
+    needs_user: "사용자 조치 필요",
+  },
+  assistantReason: {
+    no_saved_password: "Aside 브라우저에 이 사이트의 비밀번호가 저장되어 있지 않음",
+    verification_code: "사이트가 인증 코드를 요구함",
+    question: "사이트가 사용자만 답할 수 있는 질문을 함",
+    check_not_passed: "봇 검사를 통과하지 못함",
+    timed_out: "시간이 너무 오래 걸려 멈춤",
+    other: "그 밖의 문제",
   },
   errorCode: {
     invalid: "입력한 내용 중 받아들일 수 없는 것이 있습니다.",

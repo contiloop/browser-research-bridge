@@ -9,10 +9,12 @@ import {
   sleep,
 } from "../../../test/support/mcp-fixtures.js";
 import type { FakeSiteSpec, McpWorld, WorldOptions } from "../../../test/support/mcp-fixtures.js";
+import { FakeSiteAssistant } from "../../../test/support/fake-site-assistant.js";
 import { challengeAttempt } from "../../../test/support/site-fixtures.js";
 import { encodeUrlLocalId } from "../../core/ids.js";
 import type { DocumentRef } from "../../core/models.js";
 import { OutcomeError } from "../../core/outcome.js";
+import { ASSISTANT_WORKING_ACTIONS, assistantAction } from "./assistant-tasks.js";
 import { captchaLimitedAction, captchaUnsolvedAction } from "./challenge.js";
 import { perItemBudget } from "./read-service.js";
 
@@ -784,5 +786,281 @@ describe("a bot check thrown by a page-script step of a read", () => {
     expect(out.status).toBe("adapter_error");
     expect(w.browser.challenges).toEqual([]);
     expect(w.count("alpha").read).toBe(1);
+  });
+});
+
+describe("Aside AI tasks after a live read (background)", () => {
+  const ARTICLE = "https://alpha.example.com/articles/5";
+  const LOGIN = ASSISTANT_WORKING_ACTIONS.login;
+  const CAPTCHA = ASSISTANT_WORKING_ACTIONS.captcha;
+  const loginWall = { status: "auth_required", message: "not signed in" } as const;
+  const blockedRead = { status: "access_denied", message: "captcha page", blocked: true } as const;
+  const LIMITED = { solved: false, kind: "unknown", rounds: 0, message: "cannot handle" } as const;
+
+  describe("login", () => {
+    it("auth_required: the site turns needs_login, one login task starts in the background, the call answers at once", async () => {
+      const fake = new FakeSiteAssistant().hold();
+      const w = await make([{ key: "alpha", read: async () => loginWall }], { assistant: { fake } });
+      const out = await w.read.fetch(ARTICLE);
+      expect(out).toEqual({
+        ref: ARTICLE,
+        status: "auth_required",
+        error: { code: "auth_required", message: "not signed in", site: "alpha", action: LOGIN },
+      });
+      expect(w.registry.get("alpha")?.status).toBe("needs_login");
+      expect(w.assistantTasks?.workingAction("alpha")).toBe(LOGIN);
+      await new Promise((r) => setTimeout(r, 5));
+      expect(fake.tasks).toHaveLength(1);
+      expect(fake.tasks[0]).toMatchObject({ site: "alpha", purpose: "login", url: ARTICLE });
+      // While it runs: a read of the needs_login site still reaches the adapter, and answers "working now".
+      const again = await w.read.readDocuments([ARTICLE, "alpha:7"]);
+      expect(again.items.map((i) => i.error?.action)).toEqual([LOGIN, LOGIN]);
+      expect(fake.tasks).toHaveLength(1);
+      expect(w.count("alpha").read).toBe(3);
+      fake.release();
+      await w.assistantTasks?.settled();
+      expect(w.assistantTasks?.view("alpha")).toMatchObject({ purpose: "login", verdict: "done" });
+      // done alone changes nothing: the site stays needs_login until a check passes.
+      expect(w.registry.get("alpha")?.status).toBe("needs_login");
+    });
+
+    it("the setting off, an unavailable assistant, or a paused site: today's login action, no task", async () => {
+      const today = "Log in to alpha in Aside, then click Check now in the dashboard";
+      const off = await make([{ key: "alpha", read: async () => loginWall }], {
+        assistant: { settings: { auto: false } },
+      });
+      expect((await off.read.fetch(ARTICLE)).error?.action).toBe(today);
+      expect(off.assistant?.tasks).toEqual([]);
+      await off.cleanup();
+
+      const fake = new FakeSiteAssistant();
+      fake.availableValue = false;
+      const unavailable = await make([{ key: "alpha", read: async () => loginWall }], {
+        assistant: { fake },
+      });
+      expect((await unavailable.read.fetch(ARTICLE)).error?.action).toBe(today);
+      expect(fake.tasks).toEqual([]);
+      await unavailable.cleanup();
+
+      const failing = new FakeSiteAssistant().next({ verdict: "failed" }).next({ verdict: "failed" });
+      const paused = await make([{ key: "alpha", read: async () => loginWall }], {
+        assistant: { fake: failing },
+      });
+      for (let i = 0; i < 2; i++) {
+        expect((await paused.read.fetch(ARTICLE)).error?.action).toBe(LOGIN);
+        await paused.assistantTasks?.settled();
+      }
+      expect((await paused.read.fetch(ARTICLE)).error?.action).toBe(today);
+      expect(failing.tasks).toHaveLength(2);
+    });
+
+    it("needs_user holds the site: calls answer with the reason's sentence and no task starts", async () => {
+      const fake = new FakeSiteAssistant().next({ verdict: "needs_user", reason: "no_saved_password" });
+      const w = await make([{ key: "alpha", read: async () => loginWall }], {
+        assistant: { fake, settings: { account: "u3" } },
+      });
+      await w.read.fetch(ARTICLE);
+      await w.assistantTasks?.settled();
+      const out = await w.read.fetch(ARTICLE);
+      expect(out.error?.action).toBe(assistantAction("no_saved_password", "u3"));
+      expect(out.error?.message).toBe("not signed in");
+      expect(fake.tasks).toHaveLength(1);
+    });
+
+    it("a read that comes back ok from a needs_login site starts nothing", async () => {
+      const w = await make([{ key: "alpha", read: reader("alpha") }], { assistant: {} });
+      await setNeedsLogin(w, "alpha");
+      expect((await w.read.fetch(ARTICLE)).status).toBe("ok");
+      expect(w.assistant?.tasks).toEqual([]);
+    });
+  });
+
+  describe("captcha", () => {
+    it("captcha.auto off: the blocked failure as access_denied with the working sentence; a captcha task on the read's page", async () => {
+      const w = await make([{ key: "alpha", read: async () => blockedRead }], {
+        challenge: { settings: { auto: false } },
+        assistant: {},
+      });
+      const out = await w.read.fetch(ARTICLE);
+      expect(out.error).toEqual({
+        code: "access_denied",
+        message: "captcha page",
+        site: "alpha",
+        action: CAPTCHA,
+      });
+      expect(w.browser.challenges).toEqual([]);
+      await w.assistantTasks?.settled();
+      expect(w.assistant?.tasks.map((t) => [t.purpose, t.url])).toEqual([["captcha", ARTICLE]]);
+      // No coordinator at all behaves the same.
+      const bare = await make([{ key: "alpha", read: async () => blockedRead }], { assistant: {} });
+      expect((await bare.read.fetch(ARTICLE)).error?.action).toBe(CAPTCHA);
+    });
+
+    it("the own attempt is captcha-limited: the captcha-limited failure with the working sentence; the task starts after the report", async () => {
+      const w = await make([{ key: "alpha", read: async () => blockedRead }], {
+        challenge: { solve: async () => challengeAttempt(LIMITED) },
+        assistant: {},
+      });
+      const out = await w.read.fetch(ARTICLE);
+      expect(out.error).toEqual({
+        code: "access_denied",
+        message: captchaLimitedAction("alpha", ARTICLE),
+        site: "alpha",
+        action: CAPTCHA,
+      });
+      await w.assistantTasks?.settled();
+      expect(w.browser.challenges).toHaveLength(1);
+      expect(w.assistant?.tasks.map((t) => t.purpose)).toEqual(["captcha"]);
+    });
+
+    it("the own attempt acted on the page: today's flow (re-run, could-not-be-solved action), no task", async () => {
+      const w = await make([{ key: "alpha", read: async () => blockedRead }], {
+        challenge: { solve: async () => challengeAttempt({ solved: false, kind: "slider", rounds: 2 }) },
+        assistant: {},
+      });
+      const out = await w.read.fetch(ARTICLE);
+      expect(out.error?.action).toBe(captchaUnsolvedAction(ARTICLE, "answered"));
+      expect(w.count("alpha").read).toBe(2);
+      await w.assistantTasks?.settled();
+      expect(w.assistant?.tasks).toEqual([]);
+    });
+
+    it("the own attempt went to the background: the working sentence now; the task starts only if that attempt did not act", async () => {
+      for (const [attempt, tasks] of [
+        [LIMITED, 1],
+        [{ solved: true, kind: "checkbox", rounds: 1 }, 0],
+      ] as const) {
+        let release!: () => void;
+        const gate = new Promise<void>((r) => (release = r));
+        const w = await make([{ key: "alpha", read: async () => blockedRead }], {
+          challenge: {
+            settings: { detectBudgetMs: 200_000 },
+            solve: async () => {
+              await gate;
+              return challengeAttempt(attempt);
+            },
+          },
+          assistant: {},
+        });
+        const out = await w.read.fetch(ARTICLE);
+        expect(out.error).toEqual({
+          code: "access_denied",
+          message: "captcha page",
+          site: "alpha",
+          action: CAPTCHA,
+        });
+        expect(w.challenges?.inFlight("alpha")).toBe(true);
+        await new Promise((r) => setTimeout(r, 5));
+        expect(w.assistant?.tasks).toEqual([]);
+        release();
+        await w.challenges?.settled();
+        await w.assistantTasks?.settled();
+        expect(w.assistant?.tasks).toHaveLength(tasks);
+        await w.cleanup();
+        world = null;
+      }
+    });
+
+    it("the own attempt did not run (browser unavailable): the failure with the working sentence; a captcha task starts", async () => {
+      const w = await make([{ key: "alpha", read: async () => blockedRead }], {
+        challenge: {
+          solve: async () => {
+            throw new OutcomeError("browser_unavailable", "Aside is not running");
+          },
+        },
+        assistant: {},
+      });
+      const out = await w.read.fetch(ARTICLE);
+      expect(out.error).toEqual({
+        code: "access_denied",
+        message: "captcha page",
+        site: "alpha",
+        action: CAPTCHA,
+      });
+      // The attempt did not act: no re-run.
+      expect(w.count("alpha").read).toBe(1);
+      expect(w.browser.challenges).toHaveLength(1);
+      await w.challenges?.settled();
+      await w.assistantTasks?.settled();
+      expect(w.assistant?.tasks.map((t) => [t.purpose, t.url])).toEqual([["captcha", ARTICLE]]);
+    });
+
+    it("the own attempt did not run and no task may start (setting off): today's could-not-be-solved action", async () => {
+      const w = await make([{ key: "alpha", read: async () => blockedRead }], {
+        challenge: {
+          solve: async () => {
+            throw new OutcomeError("browser_unavailable", "Aside is not running");
+          },
+        },
+        assistant: { settings: { auto: false } },
+      });
+      const out = await w.read.fetch(ARTICLE);
+      expect(out.error?.action).toBe(captchaUnsolvedAction(ARTICLE));
+      expect(w.assistant?.tasks).toEqual([]);
+    });
+
+    it("a blocked auth_required with captcha.auto off keeps auth_required and starts a login task, not a captcha task", async () => {
+      const blockedLogin = { status: "auth_required", message: "sign in to continue", blocked: true } as const;
+      const w = await make([{ key: "alpha", read: async () => blockedLogin }], {
+        challenge: { settings: { auto: false } },
+        assistant: {},
+      });
+      const out = await w.read.fetch(ARTICLE);
+      expect(out).toEqual({
+        ref: ARTICLE,
+        status: "auth_required",
+        error: { code: "auth_required", message: "sign in to continue", site: "alpha", action: LOGIN },
+      });
+      expect(w.registry.get("alpha")?.status).toBe("needs_login");
+      await w.assistantTasks?.settled();
+      expect(w.assistant?.tasks.map((t) => [t.purpose, t.url])).toEqual([["login", ARTICLE]]);
+    });
+
+    it("while a task works on the site, a blocked read skips the own attempt and answers with the working sentence", async () => {
+      const fake = new FakeSiteAssistant().hold();
+      const w = await make([{ key: "alpha", read: async () => blockedRead }], {
+        challenge: { solve: async () => challengeAttempt(LIMITED) },
+        assistant: { fake },
+      });
+      await w.read.fetch(ARTICLE);
+      await new Promise((r) => setTimeout(r, 5));
+      expect(fake.tasks).toHaveLength(1);
+      const out = await w.read.fetch(ARTICLE);
+      expect(out.error?.action).toBe(CAPTCHA);
+      expect(w.browser.challenges).toHaveLength(1);
+      fake.release();
+      await w.assistantTasks?.settled();
+    });
+
+    it("a captcha done followed by another blocked read within the window counts as failed; two pause the site", async () => {
+      const w = await make([{ key: "alpha", read: async () => blockedRead }], {
+        challenge: { settings: { auto: false } },
+        assistant: {},
+      });
+      for (let i = 0; i < 2; i++) {
+        expect((await w.read.fetch(ARTICLE)).error?.action).toBe(CAPTCHA);
+        await w.assistantTasks?.settled();
+      }
+      // The second blocked read counted the first done; this one counts the second: paused.
+      const out = await w.read.fetch(ARTICLE);
+      expect(out.error?.action).toBe(
+        "Open alpha in Aside and check the subscription, captcha, or block page, then retry",
+      );
+      expect(w.assistant?.tasks).toHaveLength(2);
+    });
+
+    it("a throttle page (rate_limited) gets no task", async () => {
+      const w = await make(
+        [
+          {
+            key: "alpha",
+            read: async () => ({ status: "rate_limited", message: "slow down", blocked: true }),
+          },
+        ],
+        { challenge: { settings: { auto: false } }, assistant: {} },
+      );
+      expect((await w.read.fetch(ARTICLE)).status).toBe("rate_limited");
+      expect(w.assistant?.tasks).toEqual([]);
+    });
   });
 });

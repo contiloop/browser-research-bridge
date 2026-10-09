@@ -24,8 +24,15 @@ import { FileCache } from "../adapters/storage/cache-store.js";
 import { FileSiteStateStore } from "../adapters/storage/site-state-store.js";
 import type { Outcome } from "../core/models.js";
 import { OutcomeError } from "../core/outcome.js";
+import { FakeSiteAssistant } from "../../test/support/fake-site-assistant.js";
+import { MemoryLogger } from "../../test/support/oauth-harness.js";
+import {
+  ASSISTANT_WORKING_ACTIONS,
+  AssistantTaskCoordinator,
+  DEFAULT_ASSISTANT_TASK_SETTINGS,
+} from "../adapters/mcp/assistant-tasks.js";
 import { HealthChecker } from "./health.js";
-import type { HealthChallenges, HealthCheckOutcome } from "./health.js";
+import type { HealthAssistant, HealthChallenges, HealthCheckOutcome } from "./health.js";
 
 describe("HealthChecker", () => {
   let tmp: { dir: string; cleanup: () => Promise<void> };
@@ -484,6 +491,227 @@ describe("HealthChecker", () => {
         message: `search: ${BOT}`,
       });
       expect(registry.get("alpha")).toMatchObject({ status: "degraded", lastFailure: `search: ${BOT}` });
+    });
+  });
+
+  describe("the Aside AI: login tasks and the login confirmation", () => {
+    const LOGIN = ASSISTANT_WORKING_ACTIONS.login;
+    let assistantCalls: string[];
+    let loginAnswer: string | null;
+
+    const stubAssistant = (): HealthAssistant => ({
+      clearHold: (key) => assistantCalls.push(`clear ${key}`),
+      login: async (key, request) => {
+        assistantCalls.push(`login ${key} ${request.trigger} ${String(request.url)}`);
+        return loginAnswer;
+      },
+    });
+
+    const withAssistant = (assistant: HealthAssistant, challenges?: HealthChallenges) =>
+      new HealthChecker({
+        registry,
+        scheduler,
+        intervalMs: 86_400_000,
+        clock: { now: () => new Date(nowMs) },
+        logger: silentLogger,
+        check: async (key, opts) => {
+          calls.push({ key, ignoreCooldown: opts.ignoreCooldown });
+          const o = outcomes.get(key) ?? { status: "ok" };
+          if (o instanceof Error) throw o;
+          return o;
+        },
+        assistant,
+        ...(challenges ? { challenges } : {}),
+      });
+
+    beforeEach(() => {
+      assistantCalls = [];
+      loginAnswer = LOGIN;
+    });
+
+    it("a scheduled check that finds auth_required starts a login task and leaves the re-check to it", async () => {
+      outcomes.set("alpha", { status: "auth_required", message: "login wall" });
+      const pass = await withAssistant(stubAssistant()).runDue();
+      expect(assistantCalls).toEqual(["login alpha health check null"]);
+      expect(registry.get("alpha")).toMatchObject({ status: "needs_login", lastFailure: "login wall" });
+      expect(pass.find((r) => r.site === "alpha")?.outcome).toEqual({
+        status: "auth_required",
+        message: "login wall",
+        action: LOGIN,
+      });
+      expect(calls.map((c) => c.key)).toEqual(["alpha", "beta"]);
+    });
+
+    it("Check now clears the pause and hold first, then starts a login task on auth_required", async () => {
+      outcomes.set("alpha", { status: "auth_required", message: "login wall" });
+      const r = await withAssistant(stubAssistant()).runNow("alpha");
+      expect(assistantCalls).toEqual(["clear alpha", "login alpha check now null"]);
+      expect(r.outcome).toEqual({ status: "auth_required", message: "login wall", action: LOGIN });
+      // A passing check or another failure starts nothing.
+      assistantCalls = [];
+      outcomes.set("alpha", { status: "ok" });
+      expect((await withAssistant(stubAssistant()).runNow("alpha")).status).toBe("active");
+      expect(assistantCalls).toEqual(["clear alpha"]);
+      // No task (setting off, paused, unavailable): today's action stands.
+      loginAnswer = null;
+      outcomes.set("alpha", { status: "auth_required", message: "login wall", action: "today" });
+      expect((await withAssistant(stubAssistant()).runNow("alpha")).outcome?.action).toBe("today");
+    });
+
+    it("Check now on a busy site still clears the hold (the user says they logged in)", async () => {
+      let release!: () => void;
+      const busy = scheduler.runForSite(
+        { site: "alpha", holder: "assistant", acquireTimeoutMs: 1000, minIntervalMs: 0 },
+        () => new Promise<void>((resolve) => (release = resolve)),
+      );
+      await Promise.resolve();
+      const r = await withAssistant(stubAssistant()).runNow("alpha");
+      expect(r).toMatchObject({ ran: false, skipped: "site busy: assistant" });
+      expect(assistantCalls).toEqual(["clear alpha"]);
+      release();
+      await busy;
+    });
+
+    describe("confirmLogin", () => {
+      beforeEach(async () => {
+        outcomes.set("alpha", { status: "auth_required", message: "login wall" });
+        await checker().runNow("alpha");
+        calls = [];
+      });
+
+      it("a pass returns the site to active (cache cleared, login confirmed) and starts nothing", async () => {
+        await cache.set("read", "alpha:1", "doc", { ttlMs: 60_000, sites: ["alpha"] });
+        outcomes.set("alpha", { status: "ok" });
+        const h = withAssistant(stubAssistant());
+        const r = await h.confirmLogin("alpha");
+        expect(r).toEqual({ site: "alpha", ran: true, outcome: { status: "ok" }, status: "active" });
+        expect(registry.get("alpha")?.lastLoginConfirmedAt).toBe(new Date(nowMs).toISOString());
+        expect(await cache.get("read", "alpha:1")).toBeUndefined();
+        expect(calls).toEqual([{ key: "alpha", ignoreCooldown: false }]);
+        expect(assistantCalls).toEqual([]);
+      });
+
+      it("auth_required keeps needs_login and starts no task; a blocked page gets no captcha attempt", async () => {
+        const attempts: string[] = [];
+        const challenges: HealthChallenges = {
+          enabled: true,
+          attempt: async (key) => {
+            attempts.push(key);
+            return { ran: true, action: "x" };
+          },
+        };
+        const h = withAssistant(stubAssistant(), challenges);
+        const r = await h.confirmLogin("alpha");
+        expect(r).toMatchObject({ ran: true, outcome: { status: "auth_required" }, status: "needs_login" });
+        outcomes.set("alpha", {
+          status: "access_denied",
+          message: "captcha",
+          blocked: { url: null },
+        } as HealthCheckOutcome);
+        const blocked = await h.confirmLogin("alpha");
+        expect(blocked.outcome).toEqual({ status: "access_denied", message: "captcha" });
+        expect(attempts).toEqual([]);
+        expect(assistantCalls).toEqual([]);
+      });
+
+      it("runs while other tasks hold the site (no idle precondition)", async () => {
+        let release!: () => void;
+        const busy = scheduler.runForSite(
+          { site: "alpha", holder: "search", acquireTimeoutMs: 1000, minIntervalMs: 0 },
+          () => new Promise<void>((resolve) => (release = resolve)),
+        );
+        await Promise.resolve();
+        outcomes.set("alpha", { status: "ok" });
+        const r = await withAssistant(stubAssistant()).confirmLogin("alpha");
+        expect(r).toMatchObject({ ran: true, status: "active" });
+        release();
+        await busy;
+      });
+
+      it("busy (no place in time), cooling down, or browser unavailable: nothing recorded", async () => {
+        const h = withAssistant(stubAssistant());
+        outcomes.set("alpha", { status: "timeout", message: "search: site busy: repair running" });
+        const busy = await h.confirmLogin("alpha");
+        expect(busy).toMatchObject({ ran: false, skipped: "site busy: repair running" });
+        expect(busy.outcome).toBeUndefined();
+        expect(registry.get("alpha")).toMatchObject({ status: "needs_login", lastFailure: "login wall" });
+
+        outcomes.set("alpha", { status: "browser_unavailable", message: "Aside is not running" });
+        const down = await h.confirmLogin("alpha");
+        expect(down.outcome?.status).toBe("browser_unavailable");
+        expect(registry.get("alpha")).toMatchObject({ status: "needs_login", lastFailure: "login wall" });
+
+        scheduler.setCooldown("alpha", nowMs + 60_000);
+        expect(await h.confirmLogin("alpha")).toMatchObject({ ran: false, skipped: "site is cooling down" });
+        scheduler.clearCooldown("alpha");
+
+        expect(await h.confirmLogin("nope")).toMatchObject({ ran: false, skipped: "site not registered" });
+      });
+
+      it("a confirmation stopped at core stop (its signal) records nothing", async () => {
+        const controller = new AbortController();
+        const h = new HealthChecker({
+          registry,
+          scheduler,
+          intervalMs: 86_400_000,
+          logger: silentLogger,
+          check: async (_key, opts) => {
+            expect(opts.signal).toBe(controller.signal);
+            controller.abort();
+            return { status: "timeout", message: "the check was stopped" };
+          },
+        });
+        expect(await h.confirmLogin("alpha", controller.signal)).toMatchObject({
+          ran: false,
+          skipped: "stopped",
+        });
+        expect(registry.get("alpha")).toMatchObject({ status: "needs_login", lastFailure: "login wall" });
+      });
+    });
+
+    it("end to end with the coordinator: a login task's done is confirmed by the light check (active), or counted", async () => {
+      const fake = new FakeSiteAssistant().hold();
+      const logger = new MemoryLogger();
+      const late: { health: HealthChecker | null } = { health: null };
+      const tasks = new AssistantTaskCoordinator({
+        settings: { ...DEFAULT_ASSISTANT_TASK_SETTINGS },
+        assistant: fake,
+        scheduler,
+        registry,
+        logger,
+        clock: { now: () => new Date(nowMs) },
+        confirmLogin: (key) => late.health!.confirmLogin(key),
+      });
+      await tasks.probe();
+      const health = withAssistant(tasks);
+      late.health = health;
+      outcomes.set("alpha", { status: "auth_required", message: "login wall" });
+      const first = await health.runDue();
+      expect(first.find((r) => r.site === "alpha")?.outcome?.action).toBe(LOGIN);
+      // The user's password was saved: the AI logs in, and the light check confirms it.
+      outcomes.set("alpha", { status: "ok" });
+      await new Promise((r) => setTimeout(r, 20));
+      fake.release();
+      await tasks.settled();
+      expect(fake.tasks.map((t) => [t.site, t.purpose])).toEqual([["alpha", "login"]]);
+      expect(registry.get("alpha")?.status).toBe("active");
+
+      // Still auth_required after two done tasks: both counted, the site pauses (no third task).
+      outcomes.set("alpha", { status: "auth_required", message: "login wall" });
+      await registry.recordHealthCheck("alpha", { status: "auth_required", message: "login wall" });
+      fake.unhold();
+      for (let i = 0; i < 2; i++) {
+        await tasks.login("alpha", { url: null, trigger: "fetch" });
+        await tasks.settled();
+      }
+      expect(registry.get("alpha")?.status).toBe("needs_login");
+      expect(await tasks.login("alpha", { url: null, trigger: "fetch" })).toBeNull();
+      expect(fake.tasks).toHaveLength(3);
+      // Check now clears the pause: a new task starts.
+      await health.runNow("alpha");
+      await tasks.settled();
+      expect(fake.tasks).toHaveLength(4);
+      await tasks.dispose();
     });
   });
 });

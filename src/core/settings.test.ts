@@ -1,9 +1,14 @@
 import { describe, expect, it } from "vitest";
 import {
+  ASSISTANT_EFFORTS,
   CONFIG_PROBLEM_CODES,
+  DEFAULT_ASSISTANT_AUTO,
+  DEFAULT_ASSISTANT_EFFORT,
   DEFAULT_CAPTCHA_AUTO,
   HELPER_RUNTIME_SETTINGS,
   MIN_PASSPHRASE_LENGTH,
+  isAssistantAutoSetting,
+  isAssistantEffort,
   isCaptchaAutoSetting,
   isHelperRuntimeSetting,
   isTunnelId,
@@ -34,6 +39,33 @@ describe("settings rules", () => {
     expect(isCaptchaAutoSetting(true)).toBe(true);
     expect(isCaptchaAutoSetting(false)).toBe(true);
     for (const bad of ["true", 1, 0, null, undefined, {}]) expect(isCaptchaAutoSetting(bad)).toBe(false);
+  });
+
+  it("has assistant.auto on by default and accepts only booleans for it", () => {
+    expect(DEFAULT_ASSISTANT_AUTO).toBe(true);
+    expect(isAssistantAutoSetting(true)).toBe(true);
+    expect(isAssistantAutoSetting(false)).toBe(true);
+    for (const bad of ["true", "false", 1, 0, null, undefined, {}, []]) {
+      expect(isAssistantAutoSetting(bad), JSON.stringify(bad)).toBe(false);
+    }
+  });
+
+  it("knows Aside's effort names, defaults assistant.effort to low, and refuses anything else", () => {
+    expect([...ASSISTANT_EFFORTS]).toEqual([
+      "off",
+      "minimal",
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+      "ultrabrowse",
+    ]);
+    expect(DEFAULT_ASSISTANT_EFFORT).toBe("low");
+    for (const effort of ASSISTANT_EFFORTS) expect(isAssistantEffort(effort), effort).toBe(true);
+    for (const bad of ["LOW", " low", "low ", "", "extreme", "--effort", 1, null, undefined, {}]) {
+      expect(isAssistantEffort(bad), JSON.stringify(bad)).toBe(false);
+    }
   });
 
   it("knows exactly three configuration problem codes", () => {

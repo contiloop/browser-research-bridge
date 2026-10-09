@@ -9,6 +9,7 @@ import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { FakeSiteAssistant } from "../../test/support/fake-site-assistant.js";
 import { stubHelpers } from "../../test/support/mcp-fixtures.js";
 import { MemoryLogger } from "../../test/support/oauth-harness.js";
 import { fakeBrowser } from "../../test/support/site-fixtures.js";
@@ -183,6 +184,8 @@ describe("settings-page API through the process", () => {
       helpers: stubHelpers,
       logger,
       browser: fakeBrowser(),
+      // The real Aside CLI is never run in tests.
+      assistant: new FakeSiteAssistant(),
       repoRoot: process.cwd(),
       onboarding: {
         runtimes: new HelperRuntimes({
@@ -637,5 +640,45 @@ describe("settings-page API through the process", () => {
       json: { error: "file_unreadable" },
     });
     expect((await get("settings")).json).toMatchObject({ captchaAuto: null });
+  });
+
+  it("assistantAuto: read, saved to assistant.auto in bridge.json (keeping effort), restarts the core, refused when invalid", async () => {
+    writeEnv(`BRIDGE_PASSPHRASE='${OLD}'\n`);
+    const current = JSON.parse(readFileSync(join(root, "config", "bridge.json"), "utf8")) as object;
+    writeConfig({ ...current, assistant: { effort: "medium" } });
+    await boot();
+    expect((await get("settings")).json).toMatchObject({ assistantAuto: true, captchaAuto: true });
+    expect(cores[0]!.services.assistant.enabled).toBe(true);
+    expect(await send("PUT", "settings", { assistantAuto: true })).toEqual({
+      status: 200,
+      json: { changed: [], restarting: false, appsDisconnected: null },
+    });
+    expect(await send("PUT", "settings", { assistantAuto: "off" })).toMatchObject({
+      status: 400,
+      json: { error: "invalid", fields: { assistantAuto: "bad_value" } },
+    });
+    expect(await send("PUT", "settings", { assistantAuto: false })).toEqual({
+      status: 202,
+      json: { changed: ["assistantAuto"], restarting: true, appsDisconnected: null },
+    });
+    await settled();
+    expect(cores).toHaveLength(2);
+    expect(cores[1]!.services.config.assistant).toEqual({ auto: false, effort: "medium" });
+    expect(cores[1]!.services.assistant.enabled).toBe(false);
+    const json = JSON.parse(readFileSync(join(root, "config", "bridge.json"), "utf8")) as Record<
+      string,
+      unknown
+    >;
+    expect(json["assistant"]).toEqual({ effort: "medium", auto: false });
+    expect((await get("settings")).json).toMatchObject({ assistantAuto: false });
+    // The overview answers whether the Aside AI is available (unknown: this core was not probed).
+    expect((await get("overview")).json).toMatchObject({ assistantAvailable: null });
+
+    writeFileSync(join(root, "config", "bridge.json"), "{ not json");
+    expect(await send("PUT", "settings", { assistantAuto: true })).toMatchObject({
+      status: 409,
+      json: { error: "file_unreadable" },
+    });
+    expect((await get("settings")).json).toMatchObject({ assistantAuto: null });
   });
 });

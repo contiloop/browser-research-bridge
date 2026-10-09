@@ -47,23 +47,26 @@ browser-research-bridge/
 │           ├── 0013-reuters-as-reference-adapter.md
 │           ├── 0014-captcha-attempts-and-vendor-hosts.md
 │           ├── 0015-per-site-pool-and-no-block-cooldown.md
-│           └── 0016-quick-captcha-attempt-and-captcha-limited.md
+│           ├── 0016-quick-captcha-attempt-and-captcha-limited.md
+│           └── 0017-aside-ai-passes-checks-and-logs-in.md
 ├── src/
 │   ├── core/
 │   │   └── AGENTS.md                ← pure domain logic: query, ids, cursor, merge, outcomes, lifecycle
 │   ├── ports/
-│   │   └── AGENTS.md                ← contracts between core and adapters (browser, adapter, registry, scheduler, stores, settings store, connection tool)
+│   │   └── AGENTS.md                ← contracts between core and adapters (browser, adapter, registry, scheduler, stores, settings store, connection tool,
+│   │                                      site assistant: assistant.ts)
 │   ├── adapter-kit/
 │   │   └── AGENTS.md                ← the only runtime import site adapters may use
 │   ├── adapters/
 │   │   ├── aside/
 │   │   │   └── AGENTS.md            ← Aside REPL browser port, page-script shim, per-site pool scheduler,
-│   │   │                                  captcha solver (captcha.ts, browser:captcha-check in captcha-check.ts)
+│   │   │                                  captcha solver (captcha.ts, browser:captcha-check in captcha-check.ts),
+│   │   │                                  the Aside AI over `aside exec` (assistant.ts, instruction texts in assistant-prompts.ts)
 │   │   ├── oauth/
 │   │   │   └── AGENTS.md            ← built-in OAuth 2.1 server and bearer middleware
 │   │   ├── mcp/
 │   │   │   └── AGENTS.md            ← the five tools, search/read services, challenge coordinator (challenge.ts),
-│   │   │                                  Streamable HTTP handler
+│   │   │                                  Aside AI task coordinator (assistant-tasks.ts), Streamable HTTP handler
 │   │   ├── registry/
 │   │   │   └── AGENTS.md            ← site registration, loading, lifecycle effects, swap and removal
 │   │   ├── validation/
@@ -95,7 +98,7 @@ browser-research-bridge/
 ## Hard gates
 
 1. **Exactly five remote tools, exactly the public routes; no public side without a passphrase.** The public listener serves only `/mcp` (bearer token required) and the OAuth discovery/register/authorize/token routes; everything else is 404. The tools are `search`, `fetch`, `search_sites`, `read_documents`, `list_sites`; they reach registered sites only, and none accepts a script, file path, or command. The settings page binds `127.0.0.1` and is never tunneled. Without a valid `BRIDGE_PASSPHRASE` (12 or more characters) the public listener is never started and no connection tool is started; only the loopback settings page runs. A connection tool the program starts targets the public port only.
-2. **Credentials never leave the machine; secrets are set-only.** The access passphrase and the tunnel runtime key may be received by the local settings page and written to their files. No code path returns, shows, logs, or commits them, or hands them to the helper or to any AI. The same holds for cookies, passwords, the Aside profile, OAuth tokens, and the admin token. The instruction texts for the Aside AI and the AI install guide must make the AI stop before a key is created, before the connector is submitted, and before any passphrase is entered. Logs carry metadata only, never page content.
+2. **Credentials never leave the machine; secrets are set-only.** The access passphrase and the tunnel runtime key may be received by the local settings page and written to their files. No code path returns, shows, logs, or commits them, or hands them to the helper or to any AI. The same holds for cookies, passwords, the Aside profile, OAuth tokens, and the admin token. The instruction texts for the Aside AI and the AI install guide must make the AI stop before a key is created, before the connector is submitted, and before any passphrase is entered. The program may start the Aside AI itself only for the bounded tasks of `docs/standards.md` (pass one site's bot check, or log in to it again with the password saved in Aside, while `assistant.auto` is on); their fixed instruction texts carry no secret and no caller-supplied address, and the AI's reply is never logged, stored, or returned. Logs carry metadata only, never page content.
 3. **Site isolation.** Everything site-specific lives in `sites/<key>/`. Adding, repairing, or removing a site changes nothing outside that folder and `data/`, and the bridge's own commits touch only `sites/<key>/`.
 4. **Truthful outcomes against real sites.** A read that cannot confirm the full text returns `auth_required` or `access_denied`, never `ok` with a teaser; search never raises and never reports a login or access failure as `empty`. Adapter validation and acceptance run against the live sites with the user's real logins; a missing login, tunnel, or connector is requested from the user, never stubbed.
 5. **Verify before commit.** `npm run verify` (typecheck, lint, unit tests) exits 0 for every change; any change to a site adapter also passes `npm run site:validate -- <key>` against the live site, which rewrites its `validation.json`. Removing a site folder needs no site validation.
@@ -107,10 +110,11 @@ The complete rule set is in `docs/standards.md`.
 - Always read `docs/standards.md`, `docs/engineering-notes.md`, and the `AGENTS.md` of every module you will touch.
 - Touching OAuth, the public listener, the dashboard guards, or anything that decides who may call what: read the authentication flow and the authorization matrix in `docs/security.md` and the OAuth section of `docs/contracts.md` first.
 - Changing a tool's input, output, status values, or pagination: read `docs/contracts.md` and the search, read, and cursor sections of `docs/business-rules.md`; ChatGPT's `search`/`fetch` shapes are fixed by ChatGPT, not by this project.
+- Editing the Aside AI's adapter, its instruction texts, or its task coordinator (`src/adapters/aside/assistant*.ts`, `src/adapters/mcp/assistant-tasks.ts`): read the Aside AI assistant section of `docs/security.md`, Assistant tasks in `docs/business-rules.md`, and the Aside AI entries in `docs/engineering-notes.md`; never run the real `aside exec` in tests.
 - Editing the browser port, the shim, the captcha solver, or any page script: read the REPL shared-scope, `aside`-word, session-loss, and challenge-attempt entries in `docs/engineering-notes.md`, plus `docs/BROWSER.md`; the captcha vendor hosts live only in `CAPTCHA_VENDOR_HOSTS` (`docs/standards.md`).
 - Editing an adapter in `sites/` or anything in `src/adapter-kit/`: read `docs/ADAPTERS.md` and the validation-hash entry in `docs/engineering-notes.md`; re-run `npm run site:validate -- <key>` afterwards.
 - Changing the onboarding prompt or tools, or editing `docs/ADAPTERS.md`/`docs/BROWSER.md`: the agent reads those two files by path and its prompt cites ADAPTERS.md §12 and the tools rely on §10 (validation); keep paths and section numbers stable.
-- Changing lifecycle, health-check, scheduler, captcha-attempt, or registry behavior: read the lifecycle, browser-scheduling, challenge-attempt, and onboarding-job sections of `docs/business-rules.md`.
+- Changing lifecycle, health-check, scheduler, captcha-attempt, assistant-task, or registry behavior: read the lifecycle, browser-scheduling, challenge-attempt, assistant-task, and onboarding-job sections of `docs/business-rules.md`.
 - Touching the settings page, run-mode control, the settings store, the ChatGPT connection, or the opener (`src/adapters/dashboard/`, `src/adapters/settings/`, `src/adapters/tunnel-client/`, `src/app/{run-mode,bridge-process,chatgpt-connection,settings-page,settings,helper-check}.ts`, `Open Settings.command`, `ops/update-check.sh`): read the settings-page sections of `docs/security.md` and `docs/contracts.md`, `docs/DASHBOARD.md`, and the run-mode section of `docs/business-rules.md`; every new state-changing route needs a test that it is refused without the cookie and with a foreign `Origin`; a change to the opener or `ops/update-check.sh` must pass `bash test/ops/update-check.test.sh`.
 - Touching the Codex helper runtime or upgrading Codex: read `src/adapters/onboarding/codex-runtime.AGENTS-evidence.md`; re-run that evidence on the installed Codex, and if a restriction can no longer be enforced, ship Claude only rather than weaken it.
 - Starting, stopping, or restarting the bridge, or running anything against the real Aside browser: read `docs/operations.md` (launchd, tunnel start order); the live background service runs from this folder's working tree; never kill it with `pkill -f src/app/main.ts`.
@@ -120,7 +124,7 @@ The complete rule set is in `docs/standards.md`.
 Stop and report to the user immediately when you find:
 
 - a credential exposure: a cookie, password, OAuth token, admin token, passphrase, tunnel runtime key, or API key in a log line, tool result, API response, page, job log, commit, the helper's environment, or an instruction text for an AI;
-- a reach beyond the approved surface: a public route other than `/mcp` and the OAuth routes, a tool or page script that reaches a host outside the site's declared hosts (only the bridge's own challenge attempt may also reach the fixed `CAPTCHA_VENDOR_HOSTS`, on its tab and while it runs), a shim layer that can be bypassed, the settings page answering without the admin cookie and same-origin checks, the public listener or a connection tool started without a valid passphrase, a connection tool targeting anything but the public port, or a helper (Claude or Codex) with a tool, file, network, or command capability beyond the bridge's helper tools;
+- a reach beyond the approved surface: a public route other than `/mcp` and the OAuth routes, a tool or page script that reaches a host outside the site's declared hosts (only the bridge's own challenge attempt may also reach the fixed `CAPTCHA_VENDOR_HOSTS`, on its tab and while it runs), a shim layer that can be bypassed, the settings page answering without the admin cookie and same-origin checks, the public listener or a connection tool started without a valid passphrase, a connection tool targeting anything but the public port, or a helper (Claude or Codex) with a tool, file, network, or command capability beyond the bridge's helper tools; an Aside AI task started outside its two purposes, with `assistant.auto` off, or with a caller-supplied address, page text, or secret in its instruction, or the AI's reply in a log, response, or file;
 - an OAuth bypass: `/mcp` answering without a valid token, a token accepted for a resource the bridge does not serve, consent granted without the passphrase, or a code exchanged without a matching PKCE verifier;
 - a bridge commit, onboarding write, or adapter change outside `sites/<key>/`;
 - a read that returns `ok` with partial text, or a login or access failure reported as `empty`;

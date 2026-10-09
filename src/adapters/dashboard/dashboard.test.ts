@@ -641,6 +641,7 @@ function settingsView(patch: Partial<SettingsView> = {}): SettingsView {
     anthropicApiKey: { set: false, locked: false },
     helperRuntime: { value: "auto" },
     captchaAuto: { value: true },
+    assistantAuto: { value: true },
     asideAccount: { value: "u0", locked: false, source: "default" },
     chatgpt: null,
     oauthExtraResources: [],
@@ -845,6 +846,7 @@ describe("settings-page API: reads", () => {
       helperRuntime: { value: "auto", supported: ["claude", "codex"] },
       asideAccount: { value: "u0", locked: false },
       captchaAuto: true,
+      assistantAuto: true,
       info: INFO,
     };
     expect(await (await get(app, "/api/settings", { cookie: COOKIE })).json()).toEqual(expected);
@@ -860,6 +862,7 @@ describe("settings-page API: reads", () => {
       settingsView({
         helperRuntime: { value: null },
         captchaAuto: { value: null },
+        assistantAuto: { value: null },
         asideAccount: { value: null, locked: false, source: "config_file" },
       }),
     );
@@ -867,13 +870,16 @@ describe("settings-page API: reads", () => {
       helperRuntime: { value: unknown };
       asideAccount: { value: unknown };
       captchaAuto: unknown;
+      assistantAuto: unknown;
     };
     expect(nulls.helperRuntime.value).toBeNull();
     expect(nulls.asideAccount.value).toBeNull();
     expect(nulls.captchaAuto).toBeNull();
-    f.setView(settingsView({ captchaAuto: { value: false } }));
+    expect(nulls.assistantAuto).toBeNull();
+    f.setView(settingsView({ captchaAuto: { value: false }, assistantAuto: { value: false } }));
     expect(await (await get(app, "/api/settings", { cookie: COOKIE })).json()).toMatchObject({
       captchaAuto: false,
+      assistantAuto: false,
     });
   });
 
@@ -995,6 +1001,9 @@ describe("settings-page API: PUT settings", () => {
       [{ captchaAuto: "false" }, { captchaAuto: "bad_value" }],
       [{ captchaAuto: 0 }, { captchaAuto: "bad_value" }],
       [{ captchaAuto: null }, { captchaAuto: "bad_value" }],
+      [{ assistantAuto: "true" }, { assistantAuto: "bad_value" }],
+      [{ assistantAuto: 1 }, { assistantAuto: "bad_value" }],
+      [{ assistantAuto: null }, { assistantAuto: "bad_value" }],
     ];
     for (const [body, fields] of cases) {
       const res = await send(app, "PUT", "/api/settings", body, authed);
@@ -1258,6 +1267,93 @@ describe("settings-page API: captchaAuto", () => {
     expect(unreadable.status).toBe(409);
     expect(await unreadable.json()).toMatchObject({ error: "file_unreadable" });
     expect(f.settings.write).not.toHaveBeenCalled();
+  });
+});
+
+describe("settings-page API: assistantAuto", () => {
+  it("PUT settings passes assistantAuto through the preview and the store and restarts the core", async () => {
+    const f = fakeSource();
+    const app = makeApp(f.source);
+    const res = await send(app, "PUT", "/api/settings", { assistantAuto: false }, authed);
+    expect(res.status).toBe(202);
+    expect(await res.json()).toEqual({
+      changed: ["assistantAuto"],
+      restarting: true,
+      appsDisconnected: null,
+    });
+    expect(f.settingsPage.preview).toHaveBeenCalledWith({ assistantAuto: false });
+    expect(f.settings.write).toHaveBeenCalledWith({ assistantAuto: false });
+    expect(f.order).toEqual(["write", "restart"]);
+    await send(app, "PUT", "/api/settings", { assistantAuto: true, captchaAuto: false }, authed);
+    expect(f.settings.write).toHaveBeenLastCalledWith({ captchaAuto: false, assistantAuto: true });
+  });
+
+  it("no change and file_unreadable follow the preview", async () => {
+    const f = fakeSource();
+    const app = makeApp(f.source);
+    f.settingsPage.preview.mockReturnValueOnce({ ok: true, changed: [] });
+    const same = await send(app, "PUT", "/api/settings", { assistantAuto: true }, authed);
+    expect(same.status).toBe(200);
+    expect(await same.json()).toEqual({ changed: [], restarting: false, appsDisconnected: null });
+    f.settingsPage.preview.mockReturnValueOnce({
+      ok: false,
+      error: "file_unreadable",
+      message: "/project/config/bridge.json is not valid JSON",
+    });
+    const unreadable = await send(app, "PUT", "/api/settings", { assistantAuto: false }, authed);
+    expect(unreadable.status).toBe(409);
+    expect(f.settings.write).not.toHaveBeenCalled();
+  });
+});
+
+describe("the Aside AI on the API", () => {
+  const RECORD = {
+    purpose: "login",
+    verdict: "needs_user",
+    reason: "verification_code",
+    at: "2026-10-09T10:00:00.000Z",
+    running: false,
+  } as const;
+
+  it("GET sites carries each site's last assistant task (null when none ran or no coordinator)", async () => {
+    const { deps } = fakeDeps();
+    const bare = makeApp(deps);
+    const plain = (await (await get(bare, "/api/sites", { cookie: COOKIE })).json()) as {
+      sites: { key: string; assistant: unknown }[];
+    };
+    expect(plain.sites[0]?.assistant).toBeNull();
+
+    const views = new Map<string, typeof RECORD>([["example-news", RECORD]]);
+    const app = makeApp({
+      ...deps,
+      registry: { list: () => [site("example-news"), site("other", { hostnames: ["other.example.org"] })] },
+      assistant: { view: (key: string) => views.get(key) ?? null, available: () => true },
+    });
+    const body = (await (await get(app, "/api/sites", { cookie: COOKIE })).json()) as {
+      sites: { key: string; assistant: unknown }[];
+    };
+    expect(body.sites.map((s) => [s.key, s.assistant])).toEqual([
+      ["example-news", RECORD],
+      ["other", null],
+    ]);
+  });
+
+  it("GET overview carries assistantAvailable: the probe's answer, null before it or without a coordinator", async () => {
+    const { deps } = fakeDeps();
+    const read = async (app: ReturnType<typeof makeApp>) =>
+      (
+        (await (await get(app, "/api/overview", { cookie: COOKIE })).json()) as {
+          assistantAvailable: unknown;
+        }
+      ).assistantAvailable;
+    expect(await read(makeApp(deps))).toBeNull();
+    let available: boolean | null = null;
+    const app = makeApp({ ...deps, assistant: { view: () => null, available: () => available } });
+    expect(await read(app)).toBeNull();
+    available = false;
+    expect(await read(app)).toBe(false);
+    available = true;
+    expect(await read(app)).toBe(true);
   });
 });
 

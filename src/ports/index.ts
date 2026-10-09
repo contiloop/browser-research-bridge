@@ -11,3 +11,4 @@ export * from "./manifest.js";
 export * from "./site-store.js";
 export * from "./connection-tool.js";
 export * from "./settings-store.js";
+export * from "./assistant.js";

@@ -14,6 +14,14 @@
  * failure message, so the site card shows why). When it is captcha-limited (nothing it can act on, or
  * no solver), the second check is skipped and the first result stands with the captcha-limited
  * sentence as message and action. Scheduled checks never attempt.
+ *
+ * The Aside AI (`assistant`, the assistant task coordinator of src/adapters/mcp/assistant-tasks.ts):
+ * "Check now" first clears the site's assistant pause and hold. A scheduled check or "Check now" that
+ * finds `auth_required` starts a login task in the background (the result carries its sentence) and
+ * leaves the re-check to `confirmLogin`, which the coordinator calls after the task reported `done`:
+ * the light check once more, waiting for the site's exclusive slot within the check's own bounded wait
+ * (no idle precondition), recorded like a health check, with no captcha attempt and no new task. A
+ * check that found no place in time (busy) or a site cooling down records nothing.
  */
 import { isServingStatus } from "../core/lifecycle.js";
 import type { Outcome, SiteLifecycleStatus } from "../core/models.js";
@@ -66,6 +74,17 @@ export interface HealthChallenges {
   }>;
 }
 
+/** The assistant task coordinator as the health runner uses it (src/adapters/mcp/assistant-tasks.ts). */
+export interface HealthAssistant {
+  /** "Check now": the site's assistant pause and hold end. */
+  clearHold(key: string): void;
+  /**
+   * Starts a login task in the background when the rules allow; the sentence for the result (the AI is
+   * logging in now, or why the user must act), or null (today's action).
+   */
+  login(key: string, request: { url: string | null; trigger: string }): Promise<string | null>;
+}
+
 export interface HealthCheckerOptions {
   registry: HealthRegistry;
   scheduler: Pick<Scheduler, "isIdle" | "holders" | "cooldownUntil">;
@@ -80,6 +99,8 @@ export interface HealthCheckerOptions {
   logger?: Logger | undefined;
   /** Captcha attempts for "Check now"; absent → none. */
   challenges?: HealthChallenges | undefined;
+  /** Aside AI login tasks after a check found `auth_required`; absent → none. */
+  assistant?: HealthAssistant | undefined;
 }
 
 export interface HealthRunResult {
@@ -141,7 +162,7 @@ export class HealthChecker {
       const results: HealthRunResult[] = [];
       try {
         for (const key of this.dueSites()) {
-          results.push(await this.runOne(key, false));
+          results.push(await this.withLoginTask(await this.runOne(key, false), "health check"));
         }
       } finally {
         this.pass = null;
@@ -151,9 +172,78 @@ export class HealthChecker {
     return this.pass;
   }
 
-  /** "Check now": runs the site's check immediately if it is idle (ignores the cool-down). */
-  runNow(key: string): Promise<HealthRunResult> {
-    return this.runOne(key, true);
+  /**
+   * "Check now": clears the site's assistant pause and hold, then runs the site's check immediately if
+   * it is idle (ignores the cool-down).
+   */
+  async runNow(key: string): Promise<HealthRunResult> {
+    this.options.assistant?.clearHold(key);
+    return this.withLoginTask(await this.runOne(key, true), "check now");
+  }
+
+  /**
+   * After an Aside AI login task reported `done`: the light check once more, for a serving site that is
+   * not already being checked and not cooling down, without waiting for the site to be idle (the check
+   * waits for its exclusive slot within its own bounded wait). Recorded like a health check (a pass →
+   * `active`; `auth_required` keeps `needs_login`), except that a check that got no place in time
+   * (busy), met a cool-down, or was stopped by `signal` (core stop) records nothing. No captcha
+   * attempt, no assistant task.
+   */
+  async confirmLogin(key: string, signal?: AbortSignal): Promise<HealthRunResult> {
+    const { registry, scheduler, logger } = this.options;
+    const site = registry.get(key);
+    if (!site) return { site: key, ran: false, skipped: "site not registered" };
+    if (!site.loadable || !isServingStatus(site.status)) {
+      return { site: key, ran: false, skipped: `site not ready: ${site.status}`, status: site.status };
+    }
+    if (this.running.has(key))
+      return { site: key, ran: false, skipped: "a check is already running", status: site.status };
+    if (scheduler.cooldownUntil(key) !== null) {
+      return { site: key, ran: false, skipped: "site is cooling down", status: site.status };
+    }
+    this.running.add(key);
+    try {
+      let checked: HealthCheckOutcome;
+      try {
+        checked = await this.options.check(key, { signal, ignoreCooldown: false });
+      } catch (error) {
+        checked = errorToOutcome(error);
+      }
+      const outcome = withoutBlocked(checked);
+      if (signal?.aborted === true) {
+        return {
+          site: key,
+          ran: false,
+          skipped: "stopped",
+          status: registry.get(key)?.status ?? site.status,
+        };
+      }
+      const busy = busyMessage(outcome);
+      if (busy !== null || outcome.status === "rate_limited") {
+        const skipped = busy ?? "site is cooling down";
+        logger?.info("login confirmation skipped", { site: key, outcome: outcome.status });
+        return { site: key, ran: false, skipped, status: registry.get(key)?.status ?? site.status };
+      }
+      const after = await registry.recordHealthCheck(key, outcome);
+      logger?.info("health check finished", {
+        site: key,
+        outcome: outcome.status,
+        status: after.status,
+        onDemand: false,
+        trigger: "login confirmation",
+      });
+      return { site: key, ran: true, outcome, status: after.status };
+    } finally {
+      this.running.delete(key);
+    }
+  }
+
+  /** A check that found `auth_required` starts a login task; its sentence becomes the result's action. */
+  private async withLoginTask(result: HealthRunResult, trigger: string): Promise<HealthRunResult> {
+    const assistant = this.options.assistant;
+    if (assistant === undefined || result.outcome?.status !== "auth_required") return result;
+    const action = await assistant.login(result.site, { url: null, trigger });
+    return action === null ? result : { ...result, outcome: { ...result.outcome, action } };
   }
 
   private async runOne(key: string, onDemand: boolean): Promise<HealthRunResult> {
@@ -252,6 +342,13 @@ function isChallenge(outcome: HealthCheckOutcome): boolean {
   return (
     outcome.blocked !== undefined && isFailureStatus(outcome.status) && outcome.status !== "rate_limited"
   );
+}
+
+/** "site busy: …" / "browser busy: …" when the check got no place on the site in time; else null. */
+function busyMessage(outcome: Outcome): string | null {
+  if (outcome.status !== "timeout") return null;
+  const match = /\b(?:site|browser) busy\b.*$/.exec(outcome.message ?? "");
+  return match === null ? null : match[0];
 }
 
 function withoutBlocked(outcome: HealthCheckOutcome): Outcome {

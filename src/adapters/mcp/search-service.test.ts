@@ -9,10 +9,12 @@ import {
   sleep,
 } from "../../../test/support/mcp-fixtures.js";
 import type { FakeSiteSpec, McpWorld, WorldOptions } from "../../../test/support/mcp-fixtures.js";
+import { FakeSiteAssistant } from "../../../test/support/fake-site-assistant.js";
 import { challengeAttempt } from "../../../test/support/site-fixtures.js";
 import { DATE_POST_FILTER_NOTE } from "../../core/merge.js";
 import { OutcomeError } from "../../core/outcome.js";
 import type { AdapterSearchRequest } from "../../ports/adapter.js";
+import { ASSISTANT_WORKING_ACTIONS } from "./assistant-tasks.js";
 import { captchaLimitedAction, captchaUnsolvedAction } from "./challenge.js";
 import { SearchService } from "./search-service.js";
 
@@ -779,5 +781,119 @@ describe("SearchService: a bot check thrown by a page-script step", () => {
       message: "login wall",
     });
     expect(w.browser.challenges).toEqual([]);
+  });
+});
+
+describe("SearchService: Aside AI tasks (background)", () => {
+  const LOGIN = ASSISTANT_WORKING_ACTIONS.login;
+  const CAPTCHA = ASSISTANT_WORKING_ACTIONS.captcha;
+  const TODAY_LOGIN = "Log in to alpha in Aside, then click Check now in the dashboard";
+  const HOME = "https://alpha.example.com/";
+
+  it("a live auth_required search: the site turns needs_login and a login task starts on the page last shown", async () => {
+    const fake = new FakeSiteAssistant().hold();
+    const w = await make(
+      [
+        {
+          key: "alpha",
+          search: async () => ({
+            results: [],
+            nextCursor: null,
+            status: "auth_required",
+            message: "signed out",
+          }),
+        },
+        { key: "beta", search: async () => ok([item("beta", 1, "2026-10-04")]) },
+      ],
+      { assistant: { fake } },
+    );
+    w.browser.lastUrls.set("alpha", "https://alpha.example.com/search?q=election");
+    const out = await w.search.search({ query: "election", mode: "search" });
+    expect(out.siteStatuses).toEqual([
+      { site: "alpha", status: "auth_required", message: "signed out", action: LOGIN },
+      { site: "beta", status: "ok" },
+    ]);
+    expect(w.registry.get("alpha")?.status).toBe("needs_login");
+    await sleep(5);
+    expect(fake.tasks.map((t) => [t.site, t.purpose, t.url])).toEqual([
+      ["alpha", "login", "https://alpha.example.com/search?q=election"],
+    ]);
+    fake.release();
+    await w.assistantTasks?.settled();
+  });
+
+  it("site: naming a needs_login site starts a login task (no adapter call); unnamed searches only show a task already running", async () => {
+    const fake = new FakeSiteAssistant().hold();
+    const w = await make(
+      [
+        { key: "alpha", search: async () => ok([item("alpha", 1, "2026-10-01")]) },
+        { key: "beta", search: async () => ok([item("beta", 1, "2026-10-04")]) },
+      ],
+      { assistant: { fake } },
+    );
+    await setNeedsLogin(w, "alpha");
+    // Not named: today's action, nothing starts.
+    const unnamed = await w.search.search({ query: "election", mode: "search" });
+    expect(unnamed.siteStatuses.find((s) => s.site === "alpha")?.action).toBe(TODAY_LOGIN);
+    expect(fake.tasks).toEqual([]);
+    // Named: a login task on the homepage.
+    const named = await w.search.search({ query: "election site:alpha", mode: "search_sites" });
+    expect(named.siteStatuses).toEqual([
+      { site: "alpha", status: "auth_required", message: "login required or session expired", action: LOGIN },
+    ]);
+    expect(w.count("alpha").search).toBe(0);
+    await sleep(5);
+    expect(fake.tasks.map((t) => [t.purpose, t.url])).toEqual([["login", HOME]]);
+    // While it runs, unnamed searches show it too.
+    const meanwhile = await w.search.search({ query: "election", mode: "search" });
+    expect(meanwhile.siteStatuses.find((s) => s.site === "alpha")?.action).toBe(LOGIN);
+    fake.release();
+    await w.assistantTasks?.settled();
+  });
+
+  it("captcha-limited search: the captcha-limited failure with the working sentence; a captcha task; the log carries no sentence", async () => {
+    const blocked = {
+      results: [],
+      nextCursor: null,
+      status: "access_denied",
+      message: "captcha",
+      blocked: true,
+    };
+    const w = await make([{ key: "alpha", search: async () => blocked }], {
+      challenge: { solve: async () => challengeAttempt({ solved: false, kind: "unknown", rounds: 0 }) },
+      assistant: {},
+    });
+    const out = await w.search.search({ query: "election", mode: "search" });
+    expect(out.siteStatuses).toEqual([
+      {
+        site: "alpha",
+        status: "access_denied",
+        message: captchaLimitedAction("alpha", HOME),
+        action: CAPTCHA,
+      },
+    ]);
+    await w.assistantTasks?.settled();
+    expect(w.assistant?.tasks.map((t) => [t.purpose, t.url])).toEqual([["captcha", HOME]]);
+    expect(w.logger.lines.some((l) => l.includes("https://"))).toBe(false);
+  });
+
+  it("assistant.auto off: today's entries", async () => {
+    const w = await make(
+      [
+        {
+          key: "alpha",
+          search: async () => ({
+            results: [],
+            nextCursor: null,
+            status: "auth_required",
+            message: "signed out",
+          }),
+        },
+      ],
+      { assistant: { settings: { auto: false } } },
+    );
+    const out = await w.search.search({ query: "election", mode: "search" });
+    expect(out.siteStatuses[0]?.action).toBe(TODAY_LOGIN);
+    expect(w.assistant?.tasks).toEqual([]);
   });
 });

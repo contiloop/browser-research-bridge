@@ -18,6 +18,11 @@ import { SearchService } from "../../src/adapters/mcp/search-service.js";
 import type { SiteTaskRunner, ToolServiceDeps, ToolTunables } from "../../src/adapters/mcp/deps.js";
 import { ChallengeCoordinator, DEFAULT_CHALLENGE_SETTINGS } from "../../src/adapters/mcp/challenge.js";
 import type { ChallengeSettings } from "../../src/adapters/mcp/challenge.js";
+import {
+  AssistantTaskCoordinator,
+  DEFAULT_ASSISTANT_TASK_SETTINGS,
+} from "../../src/adapters/mcp/assistant-tasks.js";
+import type { AssistantTaskSettings, LoginConfirmation } from "../../src/adapters/mcp/assistant-tasks.js";
 import type { Clock } from "../../src/ports/clock.js";
 import type {
   AdapterContext,
@@ -30,6 +35,7 @@ import type {
   SiteAdapter,
 } from "../../src/ports/adapter.js";
 import type { DocumentRef } from "../../src/core/models.js";
+import { FakeSiteAssistant } from "./fake-site-assistant.js";
 import { MemoryLogger } from "./oauth-harness.js";
 import {
   challengeAttempt,
@@ -85,6 +91,9 @@ export interface McpWorld {
   read: ReadService;
   /** The challenge coordinator, when the world was built with `challenge`. */
   challenges: ChallengeCoordinator | null;
+  /** The assistant task coordinator and its scripted Aside AI, when the world was built with `assistant`. */
+  assistantTasks: AssistantTaskCoordinator | null;
+  assistant: FakeSiteAssistant | null;
   /** Adapter call counts for a site. */
   count(key: string): { search: number; read: number };
   cleanup(): Promise<void>;
@@ -102,6 +111,16 @@ export interface WorldOptions {
    * null: a port without it); `settings` overrides the defaults (captcha on).
    */
   challenge?: { solve?: FakeSolver | null; settings?: Partial<ChallengeSettings> };
+  /**
+   * Builds an assistant task coordinator over a `FakeSiteAssistant` (probed unless `probe: false`);
+   * `settings` overrides the defaults (on); `confirmLogin` answers login confirmations (default: none).
+   */
+  assistant?: {
+    fake?: FakeSiteAssistant;
+    settings?: Partial<AssistantTaskSettings>;
+    probe?: boolean;
+    confirmLogin?: (key: string) => Promise<LoginConfirmation>;
+  };
 }
 
 export async function makeMcpWorld(options: WorldOptions): Promise<McpWorld> {
@@ -164,6 +183,21 @@ export async function makeMcpWorld(options: WorldOptions): Promise<McpWorld> {
           logger,
           ...(options.clock ? { clock: options.clock } : {}),
         });
+  const assistant =
+    options.assistant === undefined ? null : (options.assistant.fake ?? new FakeSiteAssistant());
+  const assistantTasks =
+    options.assistant === undefined || assistant === null
+      ? null
+      : new AssistantTaskCoordinator({
+          settings: { ...DEFAULT_ASSISTANT_TASK_SETTINGS, ...options.assistant.settings },
+          assistant,
+          scheduler,
+          registry,
+          logger,
+          ...(options.clock ? { clock: options.clock } : {}),
+          ...(options.assistant.confirmLogin ? { confirmLogin: options.assistant.confirmLogin } : {}),
+        });
+  if (assistantTasks !== null && options.assistant?.probe !== false) await assistantTasks.probe();
   const runSiteTask: SiteTaskRunner = (site, taskOptions, task) =>
     runAdapterTask(runtime, site, taskOptions, task);
   const deps: ToolServiceDeps = {
@@ -174,6 +208,7 @@ export async function makeMcpWorld(options: WorldOptions): Promise<McpWorld> {
     logger,
     ...(options.clock ? { clock: options.clock } : {}),
     ...(challenges ? { challenges } : {}),
+    ...(assistantTasks ? { assistant: assistantTasks } : {}),
   };
   return {
     dir: tmp.dir,
@@ -189,8 +224,11 @@ export async function makeMcpWorld(options: WorldOptions): Promise<McpWorld> {
     search: new SearchService(deps),
     read: new ReadService(deps),
     challenges,
+    assistantTasks,
+    assistant,
     count: (key) => ({ search: calls.get(key)?.search.length ?? 0, read: calls.get(key)?.read.length ?? 0 }),
     cleanup: async () => {
+      await assistantTasks?.dispose();
       challenges?.dispose();
       await challenges?.settled();
       await tmp.cleanup();

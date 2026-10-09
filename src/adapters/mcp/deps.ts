@@ -9,6 +9,7 @@ import type { Clock } from "../../ports/clock.js";
 import type { Logger } from "../../ports/logger.js";
 import type { SiteManifest } from "../../ports/manifest.js";
 import type { SiteRegistry } from "../../ports/registry.js";
+import type { AssistantGate } from "./assistant-tasks.js";
 import type { ChallengeGate } from "./challenge.js";
 
 /** Registry surface used by the tools (implemented by `SiteRegistryService`). */
@@ -93,6 +94,11 @@ export interface ToolServiceDeps {
    * with `captcha.auto` off.
    */
   challenges?: ChallengeGate | undefined;
+  /**
+   * Aside AI tasks in the background after a blocked or `auth_required` outcome (the assistant task
+   * coordinator); absent: none, as with `assistant.auto` off.
+   */
+  assistant?: AssistantGate | undefined;
 }
 
 export function errorMessage(error: unknown): string {

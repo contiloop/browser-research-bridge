@@ -2,6 +2,8 @@
 
 Supersedes in part [0014](0014-captcha-attempts-and-vendor-hosts.md) (when an attempt runs inline and what follows it).
 
+> **Extended by [0017](0017-aside-ai-passes-checks-and-logs-in.md) (2026-10-09):** with the Aside AI on (`assistant.auto`, default), a captcha-limited call, and a background attempt that did not act, also start an Aside AI captcha task in the background; the call then answers with "The Aside AI is passing the check now; retry in a minute" as its action, and the captcha-limited message stays. Everything below still holds for the bridge's own attempt.
+
 ## Context
 
 On the first day of the live program (2026-10-08) Reuters answered three parallel ChatGPT searches with the DataDome bot check. Two things went wrong. The check interrupted the adapter's in-page API call, whose request to `geo.captcha-delivery.com` the tab filter blocked and the shim counted as the script's own, so those calls ended `adapter_error` with no captcha attempt and no "solve it in Aside" action. The calls that did get an attempt waited 57–60 s: the inline attempt ran out of its 45 s budget with `kind: "unknown", rounds: 0` (the widened reload never reached detection), and all of them re-ran into the same check. DataDome's slider lives in the vendor's cross-origin frame, which the solver cannot act on, so every such wait was spent for nothing. Decision 0014 had made an attempt inline whenever `captchaInlineMinRemainingMs` (40 s) of the call remained and re-ran the call after every attempt, including `none` and `unknown`.

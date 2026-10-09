@@ -1,6 +1,7 @@
 /**
  * Core factory: wires config → browser port, scheduler, cache, registry, validator, health timer,
- * captcha coordinator, OAuth server, MCP tool services, and the public listener. In production the run-mode controller
+ * captcha coordinator, Aside AI assistant and its task coordinator, OAuth server, MCP tool services,
+ * and the public listener. In production the run-mode controller
  * (./run-mode.ts) calls it once per core start with the configuration it just loaded, so a restart
  * always gets a new instance (`stop()` runs once); tests call it with a fake browser and stub
  * adapter helpers.
@@ -15,6 +16,7 @@ import { resolve } from "node:path";
 import type { Hono } from "hono";
 import {
   AsideBrowserPort,
+  AsideSiteAssistant,
   InMemoryScheduler,
   McpReplClient,
   stdioTransportFactory,
@@ -22,6 +24,7 @@ import {
 import { GitSiteCommitter } from "../adapters/git/index.js";
 import type { OnboardingJobService } from "../adapters/onboarding/index.js";
 import {
+  AssistantTaskCoordinator,
   ChallengeCoordinator,
   ReadService,
   SearchService,
@@ -45,6 +48,7 @@ import {
 } from "../adapters/storage/index.js";
 import { SiteValidator, createAnonymousFetcher, lightCheck } from "../adapters/validation/index.js";
 import type { AdapterHelpers } from "../ports/adapter.js";
+import type { SiteAssistant } from "../ports/assistant.js";
 import type { BrowserPort } from "../ports/browser.js";
 import { systemClock } from "../ports/clock.js";
 import type { Clock } from "../ports/clock.js";
@@ -52,6 +56,7 @@ import type { LogFields, Logger } from "../ports/logger.js";
 import type { SiteManifestSchemaOptions } from "../ports/manifest.js";
 import type { BridgeConfig } from "./config.js";
 import { HealthChecker } from "./health.js";
+import type { HealthRunResult } from "./health.js";
 import { createOnboardingJobs } from "./jobs.js";
 import type { CreateOnboardingJobsOptions } from "./jobs.js";
 import { MCP_PATH, createPublicApp, startListener } from "./public-server.js";
@@ -66,8 +71,13 @@ export interface CreateAppOptions {
   repoRoot?: string | undefined;
   /** Browser port; default: the Aside REPL port for `config.asideAccount`. */
   browser?: BrowserPort | undefined;
-  /** Aside CLI executable for the default browser port (`ASIDE_CLI`); default `aside`. */
+  /** Aside CLI executable for the default browser port and assistant (`ASIDE_CLI`); default `aside`. */
   asideCommand?: string | undefined;
+  /**
+   * The Aside AI (`aside exec`); default: `AsideSiteAssistant` for `asideCommand`, the data folder, and
+   * `assistant.effort`. Tests inject a scripted fake (the real CLI is never run in tests).
+   */
+  assistant?: SiteAssistant | undefined;
   clock?: Clock | undefined;
   /** Fetch used for OAuth Client ID Metadata Documents (default global fetch). */
   oauthFetch?: FetchLike | undefined;
@@ -96,6 +106,12 @@ export interface BridgeServices {
   health: HealthChecker;
   /** Captcha attempts after a blocked live call or "Check now" (`captcha.auto` and its tunables). */
   challenges: ChallengeCoordinator;
+  /**
+   * Aside AI tasks in the background (captcha, login) after live calls and health checks
+   * (`assistant.auto`, the Aside account, and the assistant tunables); its last task per site and the
+   * probe result feed the settings page.
+   */
+  assistant: AssistantTaskCoordinator;
   committer: GitSiteCommitter;
   oauth: OAuthServer;
   search: SearchService;
@@ -127,7 +143,10 @@ export interface StartedBridge {
 export interface StartOptions {
   /** Overrides `config.publicPort` (0 = any free port; tests). */
   publicPort?: number | undefined;
-  /** Probe the browser in the background and log whether Aside is reachable (default true). */
+  /**
+   * Probe the browser and the Aside AI's CLI in the background and log whether Aside is reachable
+   * (default true). Off, the assistant's availability stays unknown and no task starts.
+   */
   probeBrowser?: boolean | undefined;
 }
 
@@ -138,8 +157,8 @@ export interface BridgeApp {
   attach(listener: BridgeListener): void;
   start(options?: StartOptions): Promise<StartedBridge>;
   /**
-   * Graceful shutdown: timers, captcha attempts, onboarding jobs, attached listeners, public listener,
-   * browser port. Idempotent.
+   * Graceful shutdown: timers, captcha attempts, assistant tasks, onboarding jobs, attached listeners,
+   * public listener, browser port. Idempotent.
    */
   stop(): Promise<void>;
 }
@@ -224,7 +243,35 @@ export function createApp(options: CreateAppOptions): BridgeApp {
     logger,
     clock,
   });
-  const health = new HealthChecker({
+  const siteAssistant =
+    options.assistant ??
+    new AsideSiteAssistant({
+      command: options.asideCommand,
+      dataDir: resolve(config.dataDir),
+      effort: config.assistant.effort,
+      logger,
+      now: () => clock.now().getTime(),
+    });
+  // One coordinator per core: live calls and health checks share each site's single task. A login
+  // task's `done` is confirmed by the health checker's light check (built just below; the closure only
+  // runs after a task, long after construction).
+  const assistant: AssistantTaskCoordinator = new AssistantTaskCoordinator({
+    settings: {
+      auto: config.assistant.auto,
+      account: config.asideAccount,
+      taskBudgetMs: tunables.assistantTaskBudgetMs,
+      failureWindowMs: tunables.assistantFailureWindowMs,
+      pauseMs: tunables.assistantPauseMs,
+    },
+    assistant: siteAssistant,
+    scheduler,
+    registry,
+    logger,
+    clock,
+    confirmLogin: (key: string, signal: AbortSignal): Promise<HealthRunResult> =>
+      health.confirmLogin(key, signal),
+  });
+  const health: HealthChecker = new HealthChecker({
     registry,
     scheduler,
     check: lightCheck(validator),
@@ -232,6 +279,7 @@ export function createApp(options: CreateAppOptions): BridgeApp {
     clock,
     logger,
     challenges,
+    assistant,
   });
   const committer = new GitSiteCommitter({
     sitesDir: config.sitesDir,
@@ -254,7 +302,7 @@ export function createApp(options: CreateAppOptions): BridgeApp {
 
   const runSiteTask: SiteTaskRunner = (site, taskOptions, task) =>
     runAdapterTask(runtime, site, taskOptions, task);
-  const toolDeps = { registry, runSiteTask, cache, tunables, logger, clock, challenges };
+  const toolDeps = { registry, runSiteTask, cache, tunables, logger, clock, challenges, assistant };
   const search = new SearchService(toolDeps);
   const read = new ReadService(toolDeps);
   const mcp = createMcpHttpHandler({
@@ -295,6 +343,7 @@ export function createApp(options: CreateAppOptions): BridgeApp {
     validator,
     health,
     challenges,
+    assistant,
     committer,
     oauth,
     search,
@@ -326,6 +375,8 @@ export function createApp(options: CreateAppOptions): BridgeApp {
       health.stop();
       // Running captcha attempts are abandoned; the browser shutdown below closes their tabs.
       challenges.dispose();
+      // Running Aside AI tasks are stopped (the assistant stops the Aside session and its child).
+      await assistant.dispose();
       if (purgeTimer !== null) clearInterval(purgeTimer);
       await jobs.stop().catch((error: unknown) => {
         logger.warn("onboarding jobs stop failed", { error: (error as Error).message });
@@ -386,6 +437,7 @@ export function createApp(options: CreateAppOptions): BridgeApp {
       }
 
       if (startOptions.probeBrowser !== false) {
+        void assistant.probe().then((available) => logger.info("aside assistant probe", { available }));
         void browser.status().then(
           (status) => {
             if (status.reachable) logger.info("browser reachable", { account: status.account });

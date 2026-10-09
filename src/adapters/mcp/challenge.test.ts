@@ -526,6 +526,43 @@ describe("ChallengeCoordinator.background", () => {
   });
 });
 
+describe("ChallengeCoordinator.whenSettled", () => {
+  it("null at once when no attempt runs for the site (setting off included)", async () => {
+    const s = setup();
+    expect(await s.coordinator.whenSettled("alpha")).toBeNull();
+    const off = setup({ settings: { auto: false } });
+    expect(await off.coordinator.whenSettled("alpha")).toBeNull();
+  });
+
+  it("the report of the attempt in flight, once the port's work has ended", async () => {
+    const gate = deferred<ChallengeAttempt>();
+    const s = setup({ solve: () => gate.promise });
+    expect(s.coordinator.background("alpha", URL1)).toBe(true);
+    let settled: unknown = "pending";
+    const waiting = s.coordinator.whenSettled("alpha").then((r) => (settled = r));
+    await new Promise((r) => setTimeout(r, 5));
+    expect(settled).toBe("pending");
+    gate.resolve(challengeAttempt({ solved: false, kind: "unknown", rounds: 0 }));
+    await waiting;
+    expect(settled).toMatchObject({ ran: false, limited: true, kind: "unknown" });
+    expect(s.coordinator.inFlight("alpha")).toBe(false);
+  });
+
+  it("an attempt that acted reports ran; one abandoned at core stop reports that it did not act", async () => {
+    const s = setup();
+    s.coordinator.background("alpha", URL1);
+    expect(await s.coordinator.whenSettled("alpha")).toMatchObject({ ran: true, limited: false });
+    s.coordinator.dispose();
+
+    const stopped = setup({ solve: untilAborted });
+    stopped.coordinator.background("alpha", URL1);
+    await new Promise((r) => setTimeout(r, 5));
+    const pending = stopped.coordinator.whenSettled("alpha");
+    stopped.coordinator.dispose();
+    expect(await pending).toMatchObject({ limited: false });
+  });
+});
+
 describe("budget arithmetic", () => {
   const s = DEFAULT_CHALLENGE_SETTINGS;
 

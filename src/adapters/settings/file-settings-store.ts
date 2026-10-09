@@ -8,9 +8,11 @@ import { chmod, mkdir, rename, rm, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import {
   DEFAULT_ASIDE_ACCOUNT,
+  DEFAULT_ASSISTANT_AUTO,
   DEFAULT_CAPTCHA_AUTO,
   DEFAULT_HELPER_RUNTIME,
   checkChatgptSetting,
+  isAssistantAutoSetting,
   isCaptchaAutoSetting,
   isHelperRuntimeSetting,
   passphraseProblem,
@@ -101,6 +103,7 @@ export class FileSettingsStore<C> implements SettingsStore<C> {
       },
       helperRuntime: { value: json === null ? null : storedRuntime(json) },
       captchaAuto: { value: json === null ? null : storedCaptchaAuto(json) },
+      assistantAuto: { value: json === null ? null : storedAssistantAuto(json) },
       asideAccount: this.asideAccount(env, envRead, json),
       chatgpt: json === null ? null : storedChatgpt(json),
       oauthExtraResources: json === null ? null : storedExtraResources(json),
@@ -162,6 +165,7 @@ export class FileSettingsStore<C> implements SettingsStore<C> {
       change.chatgpt !== undefined ||
       change.oauthExtraResources !== undefined ||
       change.captchaAuto !== undefined ||
+      change.assistantAuto !== undefined ||
       (change.asideAccount !== undefined && !accountInEnv);
     // An unreadable .env cannot tell where the account lives, so it blocks an account change too.
     if ((needsEnv || change.asideAccount !== undefined) && envRead.text === null) {
@@ -212,6 +216,10 @@ export class FileSettingsStore<C> implements SettingsStore<C> {
     if (change.captchaAuto !== undefined && storedCaptchaAuto(json) !== change.captchaAuto) {
       configText = setJsonValue(configText, ["captcha", "auto"], change.captchaAuto);
       changed.push("captchaAuto");
+    }
+    if (change.assistantAuto !== undefined && storedAssistantAuto(json) !== change.assistantAuto) {
+      configText = setJsonValue(configText, ["assistant", "auto"], change.assistantAuto);
+      changed.push("assistantAuto");
     }
 
     if (envText !== (envRead.text ?? "")) await writeTextAtomic(this.envFile, envText, ENV_FILE_MODE);
@@ -327,6 +335,9 @@ function validate(change: SettingsChange): Partial<Record<SettingsField, Setting
   if (change.captchaAuto !== undefined && !isCaptchaAutoSetting(change.captchaAuto)) {
     fields.captchaAuto = "bad_value";
   }
+  if (change.assistantAuto !== undefined && !isAssistantAutoSetting(change.assistantAuto)) {
+    fields.assistantAuto = "bad_value";
+  }
   return fields;
 }
 
@@ -347,6 +358,16 @@ function storedCaptchaAuto(json: JsonObject): boolean | null {
   const raw = (captcha as JsonObject)["auto"];
   if (raw === undefined) return DEFAULT_CAPTCHA_AUTO;
   return isCaptchaAutoSetting(raw) ? raw : null;
+}
+
+/** `assistant.auto` as stored (absent → the default); null when the stored value is not a boolean. */
+function storedAssistantAuto(json: JsonObject): boolean | null {
+  const assistant = json["assistant"];
+  if (assistant === undefined) return DEFAULT_ASSISTANT_AUTO;
+  if (typeof assistant !== "object" || assistant === null || Array.isArray(assistant)) return null;
+  const raw = (assistant as JsonObject)["auto"];
+  if (raw === undefined) return DEFAULT_ASSISTANT_AUTO;
+  return isAssistantAutoSetting(raw) ? raw : null;
 }
 
 function storedChatgpt(json: JsonObject): ChatgptConnectionSetting | null {

@@ -26,6 +26,29 @@ export interface DashboardConfig {
   dataDir: string;
 }
 
+/**
+ * A site's last (or running) Aside AI task as `GET sites` shows it (`assistant`); kept in memory by the
+ * core's assistant task coordinator (src/adapters/mcp/assistant-tasks.ts). Codes only, never the AI's text.
+ */
+export interface DashboardAssistantRecord {
+  purpose: "captcha" | "login";
+  /** Null while the task runs. */
+  verdict: "done" | "failed" | "needs_user" | null;
+  /** The closed reason code; null while running and after `done`. */
+  reason: string | null;
+  /** ISO time the task started (running) or ended. */
+  at: string;
+  running: boolean;
+}
+
+/** The core's Aside AI task coordinator as the settings page reads it. */
+export interface DashboardAssistant {
+  /** The site's last or running task; null when none ran on this core. */
+  view(key: string): DashboardAssistantRecord | null;
+  /** The probe's answer (Aside CLI reachable); null before the first probe answered. */
+  available(): boolean | null;
+}
+
 export interface DashboardDeps {
   config: DashboardConfig;
   logger: Logger;
@@ -53,6 +76,8 @@ export interface DashboardDeps {
   /** Cache with the caching rules: clearing. */
   cache: { clearSite(site: string): Promise<void>; clearAll(): Promise<void> };
   browser: Pick<BrowserPort, "status">;
+  /** The Aside AI task coordinator; absent → `assistant: null` per site and `assistantAvailable: null`. */
+  assistant?: DashboardAssistant | undefined;
 }
 
 /** The run-mode control the settings page uses (status, restart). */
@@ -71,6 +96,8 @@ export interface PageSettingsChange {
   asideAccount?: string;
   /** `captcha.auto` in `config/bridge.json`. */
   captchaAuto?: boolean;
+  /** `assistant.auto` in `config/bridge.json`. */
+  assistantAuto?: boolean;
 }
 
 /**

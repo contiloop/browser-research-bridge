@@ -1,7 +1,7 @@
 /**
  * Rules for the settings the user can change (access passphrase, helper runtime, automatic captcha
- * handling, ChatGPT tunnel id). Shared by the configuration loader and the settings store so startup
- * and saving apply the same checks.
+ * handling, the Aside AI assistant, ChatGPT tunnel id). Shared by the configuration loader and the
+ * settings store so startup and saving apply the same checks.
  */
 
 /** Minimum passphrase length, counted in characters (code points) as startup counts them. */
@@ -15,6 +15,26 @@ export const DEFAULT_ASIDE_ACCOUNT = "u0";
 
 /** `config/bridge.json` → `captcha.auto` (no environment override); on unless set to false. */
 export const DEFAULT_CAPTCHA_AUTO = true;
+
+/**
+ * `config/bridge.json` → `assistant.auto` (no environment override): whether the bridge may ask the
+ * Aside AI to pass a human check or log in again for a site; on unless set to false.
+ */
+export const DEFAULT_ASSISTANT_AUTO = true;
+
+/** The effort names `aside exec --effort` accepts (`config/bridge.json` → `assistant.effort`). */
+export const ASSISTANT_EFFORTS = [
+  "off",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+  "ultrabrowse",
+] as const;
+export type AssistantEffort = (typeof ASSISTANT_EFFORTS)[number];
+export const DEFAULT_ASSISTANT_EFFORT: AssistantEffort = "low";
 
 /** Why the configuration cannot start the core. */
 export const CONFIG_PROBLEM_CODES = ["passphrase_missing", "passphrase_too_short", "config_invalid"] as const;
@@ -30,6 +50,16 @@ export function isHelperRuntimeSetting(value: unknown): value is HelperRuntimeSe
 /** `captcha.auto` is a boolean; anything else (including the strings "true"/"false") is refused. */
 export function isCaptchaAutoSetting(value: unknown): value is boolean {
   return typeof value === "boolean";
+}
+
+/** `assistant.auto` is a boolean; anything else (including the strings "true"/"false") is refused. */
+export function isAssistantAutoSetting(value: unknown): value is boolean {
+  return typeof value === "boolean";
+}
+
+/** `assistant.effort` is exactly one of {@link ASSISTANT_EFFORTS} (case and spaces matter). */
+export function isAssistantEffort(value: unknown): value is AssistantEffort {
+  return typeof value === "string" && (ASSISTANT_EFFORTS as readonly string[]).includes(value);
 }
 
 export function isTunnelId(value: unknown): value is string {

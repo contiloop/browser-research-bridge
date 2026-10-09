@@ -14,7 +14,10 @@
  * - a blocked read (block or captcha page) gets one challenge attempt on its URL (a native id: the page
  *   the adapter last showed, else the homepage) and one re-run (`callWithChallenge`, ./live-call.ts);
  *   at most one attempt per site and tool call: the refs of one `read_documents` call that meet the
- *   challenge while it runs join it and re-run, later ones do not start another.
+ *   challenge while it runs join it and re-run, later ones do not start another;
+ * - the Aside AI (./assistant-tasks.ts, through `callWithChallenge`): an `auth_required` read starts a
+ *   login task in the background, a blocked read the own attempt could not act on a captcha task; the
+ *   item's action is then the AI's sentence.
  */
 import { finalizeDocument } from "../../core/assemble.js";
 import { parseRef, resolveSiteByHostname, toAdapterRef } from "../../core/ids.js";
@@ -90,6 +93,7 @@ export class ReadService {
       logger: deps.logger,
       clock: deps.clock ?? systemClock,
       challenges: deps.challenges,
+      assistant: deps.assistant,
     };
   }
 

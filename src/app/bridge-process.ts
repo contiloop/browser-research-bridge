@@ -1,7 +1,8 @@
 /**
  * The bridge process: the settings page (dashboard listener, started once, loopback only) plus the
  * core under run-mode control. The page's source carries the run-mode control, the settings store,
- * the settings-page support (`settings-page.ts`, with the `captchaAuto` preview added), the ChatGPT
+ * the settings-page support (`settings-page.ts`, with the `captchaAuto` and `assistantAuto` previews
+ * added), the ChatGPT
  * connection service, the persisted helper check (`helper-check.ts` over `data/helper-check.json`,
  * whose automatic check is scheduled from the core-started hook and cancelled from the
  * core-stopping hook), and "Copy passphrase" (`copyPassphraseToClipboard`). Order: settings-page
@@ -23,7 +24,7 @@ import { HelperChecks } from "./helper-check.js";
 import type { RunningListener } from "./public-server.js";
 import { RunModeController } from "./run-mode.js";
 import { createSettingsPageSupport } from "./settings-page.js";
-import { copyPassphraseToClipboard, previewCaptchaAuto } from "./settings.js";
+import { copyPassphraseToClipboard, previewAssistantAuto, previewCaptchaAuto } from "./settings.js";
 import type { BridgeSettingsStore } from "./settings.js";
 
 export interface StartBridgeProcessOptions {
@@ -107,7 +108,10 @@ export async function startBridgeProcess(options: StartBridgeProcessOptions): Pr
   const support = createSettingsPageSupport({ store, fallback: options.chatgptTargetFallback });
   const settingsPage: SettingsPageSupport = {
     ...support,
-    preview: (change) => previewCaptchaAuto(store.read(), change, support.preview(change)),
+    preview: (change) => {
+      const view = store.read();
+      return previewAssistantAuto(view, change, previewCaptchaAuto(view, change, support.preview(change)));
+    },
   };
   const source: DashboardSource = {
     logger,

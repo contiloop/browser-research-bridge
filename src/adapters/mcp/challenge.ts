@@ -139,6 +139,12 @@ export interface ChallengeGate {
   join(key: string, url: string | null, options?: ChallengeAttemptOptions): Promise<ChallengeReport> | null;
   /** Starts a background attempt unless one is in flight for the site; true when one was started. */
   background(key: string, url: string | null): boolean;
+  /**
+   * The report of the site's attempt in flight once it has ended (the port's work included), or null
+   * at once when none runs. Joins nothing and starts nothing; never rejects. The assistant's captcha
+   * task waits for it, so it starts only after the bridge's own attempt is known.
+   */
+  whenSettled(key: string): Promise<ChallengeReport | null>;
 }
 
 /** Where an attempt runs when a tool call meets a challenge with `remainingMs` of its budget left. */
@@ -310,6 +316,18 @@ export class ChallengeCoordinator implements ChallengeGate {
     this.options.logger.info("captcha attempt started in the background", { site: key });
     this.start(key, this.challengeUrl(key, url), this.settings.attemptBudgetMs, "background");
     return true;
+  }
+
+  whenSettled(key: string): Promise<ChallengeReport | null> {
+    const flight = this.flights.get(key);
+    if (flight === undefined) return Promise.resolve(null);
+    return flight.promise.then(
+      async (report) => {
+        await flight.done;
+        return report;
+      },
+      () => null,
+    );
   }
 
   /** Resolves when every attempt in flight has ended (tests, shutdown). */

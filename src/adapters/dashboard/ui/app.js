@@ -7,13 +7,15 @@
  *
  * Layout rules: Getting started is the home and starts with one "what to do next" sentence and its
  * one action; each explanation is at most two sentences, with longer background behind "More";
- * developer detail is behind "Details"; statuses are plain words on a coloured badge. */
+ * developer detail is behind "Details" (including a site's last Aside AI task); statuses are plain
+ * words on a coloured badge. */
 /* global document, window, fetch, EventSource, navigator, localStorage, crypto, setTimeout, clearTimeout, setInterval */
 import { DICTIONARIES, t } from "./i18n.js";
 import { label } from "./labels.js";
 import { COMMANDS, LINKS, asideText, loginTarget, loginText } from "./instructions.js";
 import {
   asideAccountOf,
+  assistantDetailParts,
   blockKind,
   chatgptSubsteps,
   firstOpenStep,
@@ -334,6 +336,8 @@ const data = {
   jobs: null,
   clients: null,
   cache: null,
+  /** `GET /api/overview` while the core runs (the settings page reads `assistantAvailable` from it). */
+  overview: null,
 };
 let loadedOnce = false;
 let browserLoading = false;
@@ -372,14 +376,21 @@ async function refresh() {
   data.settings = settings;
   data.chatgpt = chatgpt;
   if (coreRunning()) {
-    const [sites, jobs, clients] = await Promise.all([load("/sites"), load("/jobs"), load("/oauth/clients")]);
+    const [sites, jobs, clients, overview] = await Promise.all([
+      load("/sites"),
+      load("/jobs"),
+      load("/oauth/clients"),
+      load("/overview"),
+    ]);
     data.sites = sites?.sites ?? null;
     data.jobs = jobs?.jobs ?? null;
     data.clients = clients?.clients ?? null;
+    data.overview = overview;
   } else {
     data.sites = null;
     data.jobs = null;
     data.clients = null;
+    data.overview = null;
     data.helper = null;
     data.cache = null;
     data.browser = null;
@@ -851,25 +862,29 @@ function accountForm() {
   };
 }
 
-/** Settings → "Solve captchas automatically" (`captchaAuto`), saved with a restart like the others. */
-function captchaForm() {
-  const box = h("input", { type: "checkbox", id: "cap-auto", role: "switch" });
+/**
+ * Settings → an on/off setting given flat in `GET /api/settings` (`captchaAuto`, `assistantAuto`), saved
+ * with `PUT /api/settings { [field]: boolean }` and a restart like the others. `extra` is shown under the
+ * note (`{ root, update() }`).
+ */
+function switchForm({ field, id, explain, label, note, extra }) {
+  const box = h("input", { type: "checkbox", id, role: "switch" });
   let dirty = false;
   box.addEventListener("change", () => {
     dirty = true;
     markSave(save, true);
   });
-  const unknown = h("p", { class: "muted small", hidden: true }, tx("cap.unknown"));
+  const unknown = h("p", { class: "muted small", hidden: true }, tx("set.switchUnknown"));
   const fieldError = h("p", { class: "field-error", hidden: true });
   const msg = h("div", { hidden: true });
   const save = button(
     tx("common.save"),
     () =>
       saveSettings(
-        { captchaAuto: box.checked },
+        { [field]: box.checked },
         {
           msg,
-          fieldEls: { captchaAuto: fieldError },
+          fieldEls: { [field]: fieldError },
           onAccepted: () => {
             dirty = false;
             markSave(save, false);
@@ -881,9 +896,10 @@ function captchaForm() {
   const root = h(
     "div",
     { class: "component" },
-    h("p", { class: "muted" }, tx("cap.explain")),
-    h("div", { class: "check-row switch-row" }, box, h("label", { for: "cap-auto" }, tx("cap.switch")), save),
-    h("p", { class: "note small" }, tx("cap.note")),
+    h("p", { class: "muted" }, explain),
+    h("div", { class: "check-row switch-row" }, box, h("label", { for: id }, label), save),
+    h("p", { class: "note small" }, note),
+    extra?.root,
     unknown,
     fieldError,
     msg,
@@ -892,14 +908,48 @@ function captchaForm() {
     root,
     update(settings) {
       // An older program without the setting: the switch stays hidden.
-      root.hidden = !settings || !Object.prototype.hasOwnProperty.call(settings, "captchaAuto");
+      root.hidden = !settings || !Object.prototype.hasOwnProperty.call(settings, field);
       if (root.hidden) return;
-      const value = settings.captchaAuto;
+      const value = settings[field];
       if (!dirty) {
         box.checked = value === true;
         box.indeterminate = value !== true && value !== false;
       }
       unknown.hidden = value === true || value === false;
+      extra?.update();
+    },
+  };
+}
+
+/** The "Restart the program" button: restarts and waits for the program to run again. */
+function restartButton(className) {
+  return button(
+    tx("restart.button"),
+    async () => {
+      await send("/restart", "POST", {});
+      await waitForRestart();
+    },
+    className,
+  );
+}
+
+/**
+ * Under the Aside AI switch: when the Aside AI's command-line tool did not answer the program's probe
+ * (`GET /api/overview` `assistantAvailable === false`), how to sign it in (`aside login`, with a copy
+ * button) and a restart, after which the program probes again. Hidden while unknown (null) or available.
+ */
+function assistantAvailability() {
+  const root = h(
+    "div",
+    { class: "stack", hidden: true },
+    h("p", { class: "warn" }, tx("ai.unavailable")),
+    codeLine(COMMANDS.asideLogin),
+    h("div", { class: "row" }, restartButton("secondary")),
+  );
+  return {
+    root,
+    update() {
+      root.hidden = data.overview?.assistantAvailable !== false;
     },
   };
 }
@@ -1482,7 +1532,21 @@ function buildShell() {
   ui = {
     passphrase: passphraseForm(),
     runtime: runtimeForm(),
-    captcha: captchaForm(),
+    captcha: switchForm({
+      field: "captchaAuto",
+      id: "cap-auto",
+      explain: tx("cap.explain"),
+      label: tx("cap.switch"),
+      note: tx("cap.note"),
+    }),
+    assistant: switchForm({
+      field: "assistantAuto",
+      id: "ai-auto",
+      explain: tx("ai.explain"),
+      label: tx("ai.switch"),
+      note: tx("ai.note"),
+      extra: assistantAvailability(),
+    }),
     account: accountForm(),
     addSite: addSiteForm(),
     helper: helperBox(),
@@ -1558,18 +1622,7 @@ function buildShell() {
     "div",
     { class: "component" },
     h("p", { class: "muted" }, tx("restart.explain")),
-    h(
-      "div",
-      { class: "row" },
-      button(
-        tx("restart.button"),
-        async () => {
-          await send("/restart", "POST", {});
-          await waitForRestart();
-        },
-        "secondary",
-      ),
-    ),
+    h("div", { class: "row" }, restartButton("secondary")),
   );
 
   const sections = {
@@ -1614,6 +1667,8 @@ function buildShell() {
       ui.slots.settingsHelper,
       h("h3", {}, tx("cap.title")),
       ui.captcha.root,
+      h("h3", {}, tx("ai.title")),
+      ui.assistant.root,
       h("h3", {}, tx("lang.title")),
       h(
         "div",
@@ -1806,18 +1861,7 @@ function renderBanner() {
       ),
       passphrase
         ? h("p", {}, h("a", { href: "#start" }, tx("error.pointer.passphrase")))
-        : h(
-            "div",
-            { class: "row" },
-            button(
-              tx("restart.button"),
-              async () => {
-                await send("/restart", "POST", {});
-                await waitForRestart();
-              },
-              "primary",
-            ),
-          ),
+        : h("div", { class: "row" }, restartButton("primary")),
       status.problem?.message
         ? disclosure(
             "banner-problem",
@@ -2069,9 +2113,22 @@ function siteCard(site, compact) {
       [tx("job.d.blockKind"), job?.state === "awaiting_user" ? lb("blockKind", blockKind(job)) : null],
       [tx("conn.details.message"), job?.lastFailure ?? job?.reason ?? null],
       [tx("site.d.runtime"), job?.runtime ? lb("helperRuntime", job.runtime) : null],
+      [tx("site.d.aiTask"), assistantLine(site)],
       [tx("site.d.cache"), site.cache ? `${site.cache.entries} · ${formatBytes(site.cache.bytes)}` : null],
     ]),
   );
+}
+
+/** The Details line of the site's last Aside AI task: what for, how it ended, why, when; null without one. */
+function assistantLine(site) {
+  const parts = assistantDetailParts(site).map((part) =>
+    part.key !== undefined
+      ? tx(part.key)
+      : part.time !== undefined
+        ? when(part.time)
+        : lb(part.set, part.value),
+  );
+  return parts.length > 0 ? parts.join(" · ") : null;
 }
 
 function openLogFromAnywhere(jobId) {
@@ -2204,6 +2261,7 @@ function renderConnection() {
 function renderSettings() {
   ui.runtime.update(data.settings);
   ui.captcha.update(data.settings);
+  ui.assistant.update(data.settings);
   ui.account.update(data.settings);
   renderIf(ui.cacheBox, [data.cache, data.status?.mode], () => {
     if (!coreRunning() || !data.cache) return [h("p", { class: "muted" }, tx("cache.off"))];

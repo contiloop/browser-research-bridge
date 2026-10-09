@@ -2,6 +2,7 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { FakeSiteAssistant } from "../../test/support/fake-site-assistant.js";
 import { stubHelpers } from "../../test/support/mcp-fixtures.js";
 import { MemoryLogger } from "../../test/support/oauth-harness.js";
 import {
@@ -25,11 +26,16 @@ afterEach(async () => {
 });
 
 async function makeBridge(
-  options: { bridgeJson?: Record<string, unknown>; solveChallenge?: FakeSolver } = {},
+  options: {
+    bridgeJson?: Record<string, unknown>;
+    solveChallenge?: FakeSolver;
+    assistant?: FakeSiteAssistant;
+  } = {},
 ): Promise<{
   bridge: BridgeApp;
   logger: MemoryLogger;
   browser: ReturnType<typeof fakeBrowser>;
+  assistant: FakeSiteAssistant;
 }> {
   const tmp = await makeTempDir("brb-app-");
   cleanup = tmp.cleanup;
@@ -45,8 +51,10 @@ async function makeBridge(
   });
   const logger = new MemoryLogger();
   const browser = fakeBrowser({ solveChallenge: options.solveChallenge });
-  bridge = createApp({ config, helpers: stubHelpers, logger, browser, repoRoot: process.cwd() });
-  return { bridge, logger, browser };
+  // The real Aside CLI is never run in tests: the Aside AI is a scripted fake.
+  const assistant = options.assistant ?? new FakeSiteAssistant();
+  bridge = createApp({ config, helpers: stubHelpers, logger, browser, assistant, repoRoot: process.cwd() });
+  return { bridge, logger, browser, assistant };
 }
 
 describe("createApp", () => {
@@ -176,5 +184,84 @@ describe("createApp", () => {
     await bridge.services.challenges.settled();
     expect(aborted).toBe(true);
     expect(bridge.services.challenges.background("alpha", null)).toBe(false);
+  });
+
+  describe("the Aside AI coordinator", () => {
+    it("is built from assistant.auto, the Aside account, and the assistant tunables", async () => {
+      const { bridge } = await makeBridge({
+        bridgeJson: {
+          asideAccount: "u3",
+          tunables: {
+            assistantTaskBudgetMs: 90_000,
+            assistantFailureWindowMs: 300_000,
+            assistantPauseMs: 60_000,
+          },
+        },
+      });
+      const { assistant } = bridge.services;
+      expect(assistant.enabled).toBe(true);
+      expect(assistant.settings).toEqual({
+        auto: true,
+        account: "u3",
+        taskBudgetMs: 90_000,
+        failureWindowMs: 300_000,
+        pauseMs: 60_000,
+      });
+    });
+
+    it("assistant.auto false turns the tasks off", async () => {
+      const { bridge } = await makeBridge({ bridgeJson: { assistant: { auto: false } } });
+      expect(bridge.services.assistant.enabled).toBe(false);
+      expect(await bridge.services.assistant.login("alpha", { url: null, trigger: "fetch" })).toBeNull();
+    });
+
+    it("no probe when the core starts without probing (tests): availability stays unknown", async () => {
+      const quiet = await makeBridge();
+      await quiet.bridge.start({ publicPort: 0, probeBrowser: false });
+      expect(quiet.assistant.probes).toBe(0);
+      expect(quiet.bridge.services.assistant.available()).toBeNull();
+    });
+
+    it("probes the assistant at core start, with the browser probe", async () => {
+      const probed = await makeBridge();
+      await probed.bridge.start({ publicPort: 0 });
+      for (let i = 0; i < 100 && probed.bridge.services.assistant.available() === null; i++)
+        await new Promise((r) => setTimeout(r, 5));
+      expect(probed.assistant.probes).toBe(1);
+      expect(probed.bridge.services.assistant.available()).toBe(true);
+    });
+
+    it("core stop disposes the coordinator: a running task is stopped through its signal", async () => {
+      const fake = new FakeSiteAssistant().hold();
+      const { bridge } = await makeBridge({ assistant: fake });
+      await bridge.start({ publicPort: 0, probeBrowser: false });
+      await bridge.services.assistant.probe();
+      expect(await bridge.services.assistant.login("alpha", { url: null, trigger: "fetch" })).toBe(
+        "The Aside AI is logging in now; retry in a minute",
+      );
+      for (let i = 0; i < 200 && fake.held.length === 0; i++) await new Promise((r) => setTimeout(r, 5));
+      expect(fake.held).toHaveLength(1);
+      const signal = fake.tasks[0]!.signal!;
+      await bridge.stop();
+      expect(signal.aborted).toBe(true);
+      expect(bridge.services.assistant.enabled).toBe(false);
+    });
+
+    it("a login task's done is confirmed by the health checker (the light check), not by the AI's word", async () => {
+      const { bridge } = await makeBridge();
+      await bridge.start({ publicPort: 0, probeBrowser: false });
+      const { assistant, registry, health } = bridge.services;
+      await assistant.probe();
+      const confirmed: string[] = [];
+      const original = health.confirmLogin.bind(health);
+      health.confirmLogin = async (key) => {
+        confirmed.push(key);
+        return original(key);
+      };
+      await registry.recordHealthCheck("alpha", { status: "auth_required", message: "login wall" });
+      await assistant.login("alpha", { url: null, trigger: "fetch" });
+      await assistant.settled();
+      expect(confirmed).toEqual(["alpha"]);
+    });
   });
 });

@@ -4,25 +4,35 @@
  * `config/bridge.example.json`). Refuses to produce a config without a valid passphrase.
  *
  * Dependency-free on purpose (Node built-ins, the pure settings rules of `src/core/settings.ts`, and
- * the shared captcha defaults of `src/core/defaults.ts`) so the composition root can call it first.
+ * the shared captcha and assistant defaults of `src/core/defaults.ts`) so the composition root can call
+ * it first.
  */
 import { readFileSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
 import {
+  DEFAULT_ASSISTANT_FAILURE_WINDOW_MS,
+  DEFAULT_ASSISTANT_PAUSE_MS,
+  DEFAULT_ASSISTANT_TASK_BUDGET_MS,
   DEFAULT_CAPTCHA_ATTEMPT_BUDGET_MS,
   DEFAULT_CAPTCHA_DETECT_BUDGET_MS,
   DEFAULT_CAPTCHA_RERUN_RESERVE_MS,
 } from "../core/defaults.js";
 import {
+  ASSISTANT_EFFORTS,
   DEFAULT_ASIDE_ACCOUNT,
+  DEFAULT_ASSISTANT_AUTO,
+  DEFAULT_ASSISTANT_EFFORT,
   DEFAULT_CAPTCHA_AUTO,
   DEFAULT_HELPER_RUNTIME,
   HELPER_RUNTIME_SETTINGS,
   MIN_PASSPHRASE_LENGTH,
   checkChatgptSetting,
+  isAssistantAutoSetting,
+  isAssistantEffort,
   isCaptchaAutoSetting,
   isHelperRuntimeSetting,
   passphraseProblem,
+  type AssistantEffort,
   type ChatgptConnectionSetting,
   type ConfigProblemCode,
   type HelperRuntimeSetting,
@@ -64,6 +74,12 @@ export interface Tunables {
   captchaDetectBudgetMs: number;
   /** Tool-call budget kept back for re-running the call after a solved captcha. */
   captchaRerunReserveMs: number;
+  /** Time one Aside AI task (pass a human check, log in again) may take before it is stopped. */
+  assistantTaskBudgetMs: number;
+  /** Window in which repeated Aside AI failures for a site are counted. */
+  assistantFailureWindowMs: number;
+  /** How long Aside AI tasks for a site pause after repeated failures. */
+  assistantPauseMs: number;
   consecutiveAdapterErrorsToDegrade: number;
   healthCheckIntervalSeconds: number;
   minReadChars: number;
@@ -108,6 +124,13 @@ export interface BridgeConfig {
   captcha: {
     /** `config/bridge.json` → `captcha.auto` (default true; no environment override). */
     auto: boolean;
+  };
+  /** The Aside AI assistant (`aside exec`) that passes a human check or logs in again for a site. */
+  assistant: {
+    /** `config/bridge.json` → `assistant.auto` (default true; no environment override). */
+    auto: boolean;
+    /** `config/bridge.json` → `assistant.effort`: one of Aside's effort names (default `low`; no environment override). */
+    effort: AssistantEffort;
   };
   /** Locations of external executables; each defaults to the name on `PATH`. */
   executables: {
@@ -162,6 +185,9 @@ export const DEFAULT_TUNABLES: Readonly<Tunables> = Object.freeze({
   captchaAttemptBudgetMs: DEFAULT_CAPTCHA_ATTEMPT_BUDGET_MS,
   captchaDetectBudgetMs: DEFAULT_CAPTCHA_DETECT_BUDGET_MS,
   captchaRerunReserveMs: DEFAULT_CAPTCHA_RERUN_RESERVE_MS,
+  assistantTaskBudgetMs: DEFAULT_ASSISTANT_TASK_BUDGET_MS,
+  assistantFailureWindowMs: DEFAULT_ASSISTANT_FAILURE_WINDOW_MS,
+  assistantPauseMs: DEFAULT_ASSISTANT_PAUSE_MS,
   consecutiveAdapterErrorsToDegrade: 3,
   healthCheckIntervalSeconds: 86_400,
   minReadChars: 200,
@@ -223,6 +249,7 @@ const TOP_LEVEL_KEYS = new Set([
   "oauth",
   "chatgpt",
   "captcha",
+  "assistant",
   "tunables",
 ]);
 
@@ -291,6 +318,7 @@ export function loadConfig(options: LoadConfigOptions = {}): BridgeConfig {
   const captchaAuto = captchaRaw["auto"] === undefined ? DEFAULT_CAPTCHA_AUTO : captchaRaw["auto"];
   if (!isCaptchaAutoSetting(captchaAuto)) throw new ConfigError("captcha.auto must be a boolean");
   const captcha = { auto: captchaAuto };
+  const assistant = assistantSetting(json["assistant"]);
   const executables = {
     tunnelClient: envValue("TUNNEL_CLIENT_BIN") ?? "tunnel-client",
     codex: envValue("CODEX_BIN") ?? "codex",
@@ -350,6 +378,7 @@ export function loadConfig(options: LoadConfigOptions = {}): BridgeConfig {
     onboarding,
     chatgpt,
     captcha,
+    assistant,
     executables,
     oauth,
     tunables,
@@ -428,6 +457,18 @@ function helperRuntime(value: unknown): HelperRuntimeSetting {
     throw new ConfigError(`onboarding.runtime must be one of ${HELPER_RUNTIME_SETTINGS.join(", ")}`);
   }
   return value;
+}
+
+/** `assistant` from the config file only: `{ auto?: boolean, effort?: one of Aside's effort names }`. */
+function assistantSetting(value: unknown): BridgeConfig["assistant"] {
+  const raw = objectOrEmpty(value, "assistant");
+  const auto = raw["auto"] === undefined ? DEFAULT_ASSISTANT_AUTO : raw["auto"];
+  if (!isAssistantAutoSetting(auto)) throw new ConfigError("assistant.auto must be a boolean");
+  const effort = raw["effort"] === undefined ? DEFAULT_ASSISTANT_EFFORT : raw["effort"];
+  if (!isAssistantEffort(effort)) {
+    throw new ConfigError(`assistant.effort must be one of ${ASSISTANT_EFFORTS.join(", ")}`);
+  }
+  return { auto, effort };
 }
 
 function chatgptSetting(value: unknown): ChatgptConnectionSetting | null {

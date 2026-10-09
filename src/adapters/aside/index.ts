@@ -1,4 +1,4 @@
-/** Aside browser adapter: BrowserPort + Scheduler implementations. */
+/** Aside browser adapter: BrowserPort + Scheduler + SiteAssistant implementations. */
 export * from "./defaults.js";
 export { AsideBrowserPort } from "./port.js";
 export type { AsideBrowserPortOptions } from "./port.js";
@@ -37,3 +37,19 @@ export type { ExtraHost } from "./hosts.js";
 export { describeViolations, scanPageScript } from "./script-scan.js";
 export type { ScanViolation } from "./script-scan.js";
 export { checkPageScript, shadowParams } from "./shim.js";
+export {
+  ASSISTANT_WORK_DIR,
+  AsideSiteAssistant,
+  assistantEnvironment,
+  parseAssistantResult,
+} from "./assistant.js";
+export type { AsideSiteAssistantOptions } from "./assistant.js";
+export {
+  buildAssistantInstruction,
+  captchaInstruction,
+  instructionHostnames,
+  instructionLoginUrl,
+  instructionSiteUrl,
+  loginInstruction,
+} from "./assistant-prompts.js";
+export type { CaptchaInstructionInput, LoginInstructionInput } from "./assistant-prompts.js";

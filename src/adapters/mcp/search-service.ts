@@ -12,7 +12,10 @@
  * - every live outcome is fed back into the site lifecycle (`rate_limited` → cool-down; `blocked` does not cool down);
  * - a blocked site (block or captcha page) gets one challenge attempt per call, on the page the
  *   adapter's session last showed (its search page; else the site's homepage), and one re-run
- *   (`callWithChallenge`, ./live-call.ts).
+ *   (`callWithChallenge`, ./live-call.ts);
+ * - the Aside AI (./assistant-tasks.ts): a live `auth_required` or a blocked site the own attempt could
+ *   not act on starts a task in the background (./live-call.ts); a `needs_login` site named with
+ *   `site:` starts a login task, and an unnamed one only shows a running task's or the hold's sentence.
  *
  * `search()` never throws: a failing site contributes zero results and its status entry.
  */
@@ -173,6 +176,7 @@ export class SearchService {
       logger: deps.logger,
       clock: deps.clock ?? systemClock,
       challenges: deps.challenges,
+      assistant: deps.assistant,
     };
   }
 
@@ -197,7 +201,12 @@ export class SearchService {
     const sites = this.deps.registry.list();
     const plan = planSearchTargets(sites, request.sites);
     const unknown = new Set(plan.unknown);
-    const lifecycleEntries = plan.statuses.filter((s) => !unknown.has(s.site));
+    const views = new Map(sites.map((s) => [s.key, s]));
+    const lifecycleEntries = await this.withAssistantActions(
+      plan.statuses.filter((s) => !unknown.has(s.site)),
+      views,
+      (request.sites ?? []).length > 0 && built.hasTerms,
+    );
     const unknownEntries = plan.statuses.filter((s) => unknown.has(s.site));
     const assemble = (entries: readonly SiteStatusEntry[]): SiteStatusEntry[] => [
       ...[...lifecycleEntries, ...entries].sort(bySite),
@@ -229,7 +238,7 @@ export class SearchService {
     const ctx: CallContext = {
       request,
       targets: new Set(targets),
-      views: new Map(sites.map((s) => [s.key, s])),
+      views,
       nonSearched: lifecycleEntries.map((e) => e.site),
       chainQuery: searchCacheKey({ ...request, cursor: null }),
       deadline,
@@ -268,6 +277,29 @@ export class SearchService {
       .filter((t) => !run.searched.includes(t))
       .map((site): SiteStatusEntry => ({ site, status: "empty", message: NO_MORE_RESULTS_MESSAGE }));
     return respond(start.page, [...run.entries, ...exhausted], run);
+  }
+
+  /**
+   * `needs_login` entries and the Aside AI: a site the caller named (`site:`) starts a login task in
+   * the background (when the rules allow) and its entry carries the AI's sentence; an entry of a site
+   * not named only shows a task already working on it, or the hold sentence. Otherwise today's entry.
+   */
+  private async withAssistantActions(
+    entries: SiteStatusEntry[],
+    views: ReadonlyMap<string, RegisteredSite>,
+    named: boolean,
+  ): Promise<SiteStatusEntry[]> {
+    const assistant = this.live.assistant;
+    if (assistant === undefined || !assistant.enabled) return entries;
+    return Promise.all(
+      entries.map(async (entry) => {
+        if (views.get(entry.site)?.status !== "needs_login") return entry;
+        const action = named
+          ? await assistant.login(entry.site, { url: null, trigger: "search" })
+          : assistant.currentAction(entry.site);
+        return action === null ? entry : { ...entry, action };
+      }),
+    );
   }
 
   /**

@@ -1,0 +1,17 @@
+{
+  "key": "nytimes",
+  "name": "The New York Times",
+  "hostnames": ["www.nytimes.com"],
+  "extraAllowedHosts": ["samizdat-graphql.nytimes.com", "myaccount.nytimes.com"],
+  "loginUrl": "https://myaccount.nytimes.com/auth/login",
+  "requiresLogin": true,
+  "timezone": "America/New_York",
+  "capabilities": { "search": true, "read": true, "dateFilter": true, "pagination": true },
+  "sampleQuery": "inflation",
+  "sampleReadUrl": "https://www.nytimes.com/2026/10/08/business/mortgage-rates-housing-prices.html",
+  "gatedSampleUrl": "https://www.nytimes.com/2026/10/01/business/bond-yields-10-year-treasury.html",
+  "minReadChars": 1000,
+  "minIntervalMs": 2500,
+  "createdBy": "agent",
+  "version": 1
+}
